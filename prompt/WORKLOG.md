@@ -8,6 +8,40 @@
 
 ---
 
+## 2026-06-02 11:29 +0200 — Commit all WIP + rebase dev branches onto upstream, bump engine
+
+**Status:** committed (submodules pushed; parent committed locally).
+
+**Commits.**
+- `core` insitu-cache `233850f4` — "insitu-cache: calibration memory model + timing knobs".
+- `pulp` insitu-cache `3d15e5d` — "insitu-cache: calibration + microbench testbench targets".
+- parent `1e0586a` — docs/reports/worklog/rebase-tooling; parent `e1c7342` — submodule pointer bumps.
+
+**Rebase / upstream pull.**
+- Synced the `core` fork master from real upstream `gvsoc/gvsoc-core` (fast-forward
+  `455488f8→26c86fd4`, +5 commits); `pulp` fork master already current.
+- Rebased both `insitu-cache` branches onto `origin/master` via
+  `scripts/rebase_dev_branches.sh` — **no conflicts** (core replayed 3 commits onto the
+  5 new upstream ones). Force-with-lease pushed: core `671a27a5→233850f4` (forced),
+  pulp `0d3625d→3d15e5d` (fast-forward).
+- **Bumped `engine` `a8c57439→a6d92918`** — required: upstream core's new `fst_dumper`
+  uses `Signal::description_set` (engine `3a6dd2dc`) and `memory_v3` advertises the
+  `IoV2Sync` signature (engine `a6d92918`). gvrun unchanged (current).
+- Gotcha: `make all` runs `git submodule update` which resets submodules to the
+  parent-recorded SHAs — so the engine bump must be recorded in the parent (or use
+  `make build`, which skips checkout) before building. Verified with `make build`.
+
+**Verification.** `make build` of insitu_cache_calib / microbench / spatz / rv64 — clean
+(116 targets, 0 errors; `fst_dumper` + `memory_v3` compile against the bumped engine).
+Calibration metrics unchanged post-rebase: cold miss = MemLatency+17, warm hit 10,
+write 8, RAW 7, cold-stream throughput 0.0188. Commit messages verified free of any
+co-author / tool attribution. Parent submodule pointers == pushed remote SHAs.
+
+**Note.** Parent (`main`) committed locally, not pushed (per the submodules-only push
+preference). `.claude/` left untracked.
+
+---
+
 ## 2026-06-02 10:47 +0200 — Close calib performance gaps: write path, forwarding buffer, writeback overlap
 
 **Status:** uncommitted. Builds clean (calib + microbench + spatz:use_insitu_cache=True);
