@@ -17,6 +17,15 @@ This repo is a top-level "SDK" that aggregates several git submodules into a sin
 
 The repo's own `core/CMakeLists.txt` is empty (0 bytes) before `git submodule update` — if a clean-looking tree appears empty, the submodules likely aren't checked out.
 
+The `core` and `pulp` submodules are pointed at the user's forks
+(`Aquaticfuller/gvsoc-core` and `Aquaticfuller/gvsoc-pulp`). Both forks use
+`master` as the default branch and have a long-lived `insitu-cache` dev
+branch. **When the user asks to "rebase the dev branches", "pull from
+upstream/main", or "update from main", see `prompt/rebase_dev_branches_runbook.md`
+and use `scripts/rebase_dev_branches.sh`** — that script captures the safe
+procedure (recovery SHAs, dirty-tree handling, conflict-abort, force-with-
+lease push, parent submodule-pointer bump).
+
 ## Build system
 
 Top-level `Makefile` wraps CMake. The main build flow:
@@ -89,7 +98,56 @@ DRAMSys is optional. One-shot setup: `source dramsys_pushbutton_ETHenv.sh` (ETH 
 
 A cycle-approximate GVSoC model of the CachePool InSitu L1 data cache lives in
 `core/models/cache/insitu/`. **Full user-facing documentation:
-[`core/models/cache/insitu/README.md`](core/models/cache/insitu/README.md).** Summary:
+[`core/models/cache/insitu/README.md`](core/models/cache/insitu/README.md).**
+
+**Architecture-spec docs** (in `prompt/`):
+- `insitu_cache_architecture_v2.md` — **current** RTL (rebased tree at
+  `/usr/scratch/fenga1/zexifu/manyRVData/ManyRVData_rebase/working_dir/insitu-cache/`).
+  Single wide cache + N→1 coalescer, partition-flushable wrapper, three coalescer
+  styles. **Read this first.**
+- `insitu_cache_architecture.md` — legacy v1 RTL (4-controller + interco) that the
+  initial GVSoC model was built against. Retained for the per-line-state-machine /
+  FSM-state details that still apply.
+
+### Tracking new RTL revisions (procedure)
+
+When the user says "the RTL has updated, please update our model" or equivalent:
+
+1. **Re-read the RTL** under `/usr/scratch/fenga1/zexifu/manyRVData/ManyRVData_rebase/working_dir/insitu-cache/`
+   (or the rebased tree they point at). Files of interest in priority order:
+   - `src/insitu_cache/insitu_cache_top.sv` (parameters, port list)
+   - `src/insitu_cache/insitu_cache_pkg.sv` (line states, types)
+   - `src/cachepool/cachepool_cache_ctrl.sv` (per-SoC controller — the integration
+     point; parameter defaults here matter more than the cache_top defaults)
+   - `src/insitu_cache/insitu_cache_tcdm_wrapper.sv` and the
+     `_partitionable_flushable.sv` variant (SPM + flush mechanism)
+   - `src/coalesce_unit/par_coalescer/par_coalescer_top.sv` (the new coalescer)
+   - `src/insitu_cache/insitu_cache_decoder.sv` and `_encoder.sv` (hit/miss logic
+     and LRU/state transitions)
+2. **Don't modify** anything under that tree — it's read-only RTL reference.
+3. **Update `prompt/insitu_cache_architecture_v2.md`** with: any new parameter
+   defaults, new module additions, new control signals (`cache_sync_insn`,
+   `bank_depth_for_SPM`, etc.), new latency knobs. The §0 delta table is the
+   most important section to keep current.
+4. **Update `core/models/cache/insitu/insitu_cache_config.py`** to mirror new
+   knobs. Default values should track the latest CachePool ctrl defaults (not
+   the cache_top defaults, which are different).
+5. **Wire the C++ side** in `insitu_cache_controller.cpp`: read the new
+   properties via `get_js_config()->get_child_*`, gate behaviour appropriately
+   (e.g. `if (write_through_mode_) issue_write_through(req);`). Phase A can
+   keep these as simple gates; full-topology refactors go to Phase B.
+6. **Regression smoke**:
+   `make all TARGETS="insitu_cache_microbench spatz:use_insitu_cache=True insitu_cache_tb"`
+   then run `gvsoc --target=insitu_cache_microbench run` and confirm the 7
+   `[CALIB_REPORT]` lines change in expected directions (e.g. flipping defaults
+   should change cycle counts by small predictable deltas).
+7. **Document the round** in a follow-up report under `prompt/` (see
+   `upstream_updates_implementation_report.md` as a template).
+
+The RTL location and the GVSoC repo location are tracked in
+`~/.claude/projects/.../memory/rtl_readonly.md`.
+
+### Summary of the model:
 
 - `insitu_cache_controller.{cpp,py}` — one cache controller (tag array, MSHR, hit/miss,
   hash-or-LRU victim selection, eviction, refill, write-through hook).
@@ -141,6 +199,67 @@ Python ≥ 3.10 for `str | None` syntax. If the default `python3` is 3.9, shim i
 Needed pip packages for Python 3.12: `typing_extensions prettytable rich pexpect
 pycryptodome ppk2_api pyelftools psutil lz4 setuptools<81 numpy pandas matplotlib mako
 hjson jsonref`.
+
+## Development log (for weekly reports)
+
+**Standing convention (user request):** maintain a running dev log so weekly
+reports are easy to assemble. This mirrors the convention in the RTL repo
+(`ManyRVData_rebase/CLAUDE.md`).
+
+- **Log file:** `prompt/WORKLOG.md` — newest entries at top. (The GVSoC repo
+  keeps all its narrative docs/reports under `prompt/`, so the worklog lives
+  there alongside the `weekly_report_*.md` and architecture docs.)
+- **When to append:** every time we make a meaningful code/model/config/test
+  modification, and **always when we make a git commit** (across any of the
+  submodules — `core`, `pulp`, `engine`, `gvrun`, or the parent). Add the entry
+  as part of the same step as the commit (don't batch it for later).
+- **What to record (in detail):**
+  - **Date + time** of the change/commit (absolute, e.g. `2026-06-01 19:40 +0200`).
+  - **Commit hash + subject** per repo touched (if committed); note
+    "uncommitted/staged" otherwise. Remember submodule SHAs change independently
+    from the parent pointer bump.
+  - **Files touched** (paths).
+  - **What** was done and **why** (root cause / motivation), enough to recall
+    the work months later without re-reading the diff.
+  - **Verification** — how it was tested (targets built, microbench / calib
+    numbers, pass/fail, regression smoke).
+  - Link related reports under `prompt/` and any open follow-ups.
+- **Goal:** at week's end, the weekly report (`prompt/weekly_report_<date>.md`)
+  is assembled by reading `WORKLOG.md` + `git log` across submodules, not by
+  reconstructing from memory.
+
+## Calibrating the model against the RTL standalone testbench
+
+The RTL side ships a standalone performance-calibration testbench around one
+`cachepool_cache_ctrl` (coalescer + Snitch bypass + `insitu_cache_tcdm_wrapper`)
+driven by a deterministic fixed-latency refill responder. Its design, the
+**trace + result CSV interchange formats**, the **memory-model algorithm** (as
+portable pseudocode), and the **RTL reference numbers** are documented under
+`/usr/scratch/fenga1/zexifu/manyRVData/ManyRVData_rebase/reports/cache_calib/`:
+`PLAN.md`, `TRACE_SPEC.md`, `CALIB_IMPLEMENTATION.md`, `REPORT.md`,
+`results_memlat{10,50,100,200}.csv`, `traces/sample.trace` (+ `.rtl.csv`).
+
+**The GVSoC side reproduces this** so the two engines can run the *same* trace
+through the *same* memory-timing model and we diff the per-access `latency`
+column. GVSoC-side pieces:
+
+- `core/models/cache/insitu/insitu_calib_mem.{cpp,py}` — the fixed-latency,
+  **serializing** refill responder (`MemLatency` / `BeatGap` / `AcceptEvery`),
+  the GVSoC twin of `refill_mem_model.sv`. Serialization is modelled with a
+  `mem_busy_until` cyclestamp (synchronous-OK path), which reproduces the RTL's
+  "at most one outstanding line-refill" miss-throughput behaviour.
+- `pulp/insitu_cache_calib/` — the calibration target: a trace-replay driver
+  (`calib_driver.{cpp,py}`) that ingests `port,rw,addr,size,delay`, honours the
+  per-port file-order + concurrent-port semantics, stamps `t_issue`/`t_resp`,
+  and emits the per-access + aggregate CSVs in the shared schema.
+- `make_cachepool_512_calib_config()` in `insitu_cache_config.py` — one
+  controller, 5 ports, 4-way × 256-set (= 64 KiB), matching the RTL DUT geometry.
+
+Reference numbers to match (config 512): **warm read-hit = 10 cyc isolated /
+7 cyc streaming**, **cold read-miss = MemLatency + 17 cyc**, **miss throughput
+serialized** (≈ 1/(MemLatency+17), not divided by accept depth), **single-port
+hit ceiling ≈ 0.86 acc/cyc**. Full comparison + current gaps:
+`prompt/insitu_cache_calib_report.md`.
 
 ## Architecture notes
 
