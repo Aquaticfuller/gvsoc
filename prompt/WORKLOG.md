@@ -8,6 +8,136 @@
 
 ---
 
+## 2026-06-03 04:30 +0200 — Calibration check vs REPORT_BL1.md (20-phase BurstLength=1)
+
+**Status:** assessment only (no code change). Doc-only update (calib report §9.1).
+
+**Result — partially calibrated.** Ran every GVSoC trace in wide mode @ML50 vs the RTL
+`REPORT_BL1.md` 20-phase table:
+- ✅ **Matches:** all hit/write/RAW latencies+throughputs (warm hit 10, warm write 8, RAW 7,
+  warm_stream 0.877 vs 0.865, warm_write_stream 0.478 vs 0.489) — the report's "unchanged"
+  invariant holds; cold-miss latency ML+13 exact across the sweep; memory-traffic structure
+  (cold_stream rd=64, coal_cold rd=32, evict rd=2048/wr=1024) on every miss phase;
+  cold_stream max_outstanding=32 (requester-bound).
+- ⚠ **Over-predicts wide-mode miss throughput:** cold_stream 0.41 vs 0.243 (1.7×),
+  coal_cold 0.65 vs 0.467 (1.4×, out 128 vs 56), evict 0.49 vs 0.177 (2.8×, out 32 vs 4).
+- ❌ coal_warm 0.06 vs 3.282 — pre-existing input-coalescer gap (not BL-related).
+
+**Root cause:** GVSoC bounds outstanding by the per-port budget (32) with flat per-access
+latency (63); RTL bounds by cache-internal resources that differ per access type (MSHR
+accept ~56, write-allocate accept ~4) AND inflates latency under load (→100/82/98). So
+GVSoC pegs at the ~0.5 plateau for every miss-heavy phase; RTL varies 0.18–0.47. Closing it
+needs the cache-occupancy model (deferred refill + per-resource caps + under-load latency)
+— the recurring Phase-B item (calib report §5(7)/§9.1).
+
+**Files touched.** `prompt/insitu_cache_calib_report.md` (§9.1).
+
+---
+
+## 2026-06-03 20:27 +0200 — Occupancy model: close wide-mode miss throughput (cold_stream/coal_cold/evict)
+
+**Status:** committed — core `6347ea65`, pulp `f80254b` (pushed); parent committed locally.
+This commit also carries the 2026-06-03 03:45 wide-refill experiment work (same files).
+Builds clean; default + spatz provably unchanged.
+
+**Context.** §9.1 showed GVSoC over-predicts wide-mode miss-heavy *throughput* (inline
+resolution → flat 63-cyc latency, no contention; only the per-port budget bound). Ran a
+research+design multi-agent workflow (7 agents) to ground the fix in the RTL resource
+structure, then implemented a **simpler** mechanism than the proposed event-pool rewrite.
+
+**What was done (all gated behind new `defer_refills`, default False = inline = spatz path):**
+- `insitu_cache_controller`: `refill_resp_handler` serializes refill *completion* cycles via
+  a monotonic cyclestamp `refill_drain_busy_until_` (+`refill_drain_cycles` per completion;
+  refill_lat REPLACED, no double-count) → queued-miss latency inflates under load → the
+  driver's slot-deferral paces issues → install-rate-bound throughput + latency ramp.
+  `issue_eviction` advances the same cyclestamp (+folded penalty) so writebacks share the
+  pipeline (evict ≈ ½ read-miss rate). Reset in reset(); knobs read in ctor; mirrored in
+  controller.py.
+- New config knobs (no-op defaults): `defer_refills` + `refill_drain_cycles` (these two
+  produce the entire effect). Calib wide block (`__init__.py`) sets defer_refills=True,
+  refill_drain_cycles=3 (env `INSITU_CALIB_REFILL_DRAIN`); make_cachepool_512_config (spatz)
+  keeps defaults. (An adversarial-review workflow found 3 further knobs I'd added for a
+  pool/DENIED approach — `max_outstanding_refills`/`writeback_outstanding`/
+  `model_backpressure_denied` — were DEAD; removed them + factored the two cyclestamp
+  advances into one `reserve_install_pipe()` helper.)
+- `gen_traces.py`: cold_stream_long (already added) for the plateau.
+
+**Calibration vs RTL BL1 (@ML50):** cold_stream 0.254 (RTL 0.243), coal_cold 0.494 (0.467),
+evict_dirty 0.166 (0.177), evict_wb 0.166 (0.178), cold_miss isolated 63 (=ML+13), lat ramp
+63/95/125 (RTL 63/100/130). **All four miss-heavy throughputs within ~7%** (was 1.4–2.8×
+over). Sweep: coal_cold ≤6%, cold_stream ≤10% (24% @ML10 — fixed drain can't match RTL's
+flat install-cap at low ML).
+
+**No regression:** default (BL4) calib unchanged (cold miss ML+17, cold_stream 0.0188, warm
+hit 10, write 8/0.478, RAW 7, coal mem_rd 32); wide hits/writes unchanged; `spatz:use_insitu_
+cache=True` builds (93 targets); microbench identical. Spatz-safe by construction
+(defer_refills=False → inline path verbatim, no new non-OK).
+
+**Verification.** Adversarial-review workflow (3 agents: C++ correctness + spatz-safety +
+synthesis) → **GO-WITH-FIXES → GO**: confirmed no latency double-count, monotonic+reset
+cyclestamp, head-of-line unaffected, defer_refills=False path byte-identical, no new non-OK
+on any path. Applied its must-fix (removed 3 dead knobs) + nit (helper). Post-fix: all
+numbers unchanged, builds clean (100 targets).
+
+**Residuals (secondary):** per-phase max_outstanding + latency *distributions* (coal_cold
+out 128 vs 56, evict out 32 vs 4) would need an explicit per-resource pool/event model
+(future phase). Throughputs + latencies match. See calib report §10.
+
+**Files touched.** `core/models/cache/insitu/insitu_cache_config.py`,
+`insitu_cache_controller.{cpp,py}`, `pulp/insitu_cache_calib/__init__.py`,
+`prompt/insitu_cache_calib_report.md` (§10).
+
+---
+
+## 2026-06-03 03:45 +0200 — Wide single-beat refill throughput experiment (mirror RTL)
+
+**Status:** committed (with the occupancy round) — core `6347ea65`, pulp `f80254b`.
+Builds clean; default-config calibration fully preserved.
+
+**Context.** Mirrors `ManyRVData_rebase/reports/cache_calib/THROUGHPUT_EXPERIMENT.md`
+(+ `char_bl1/*.csv`): RTL `refill_data_width=512` ⇒ BurstLength=1, misses pipeline (no
+single-outstanding gate), deep memory queue; the binding limit becomes the requester's
+32-outstanding budget (Little's law plateau ≈ 32/(ML+13) ≈ 0.5). RTL cold_stream jumps
+0.018 → 0.243 (64-burst).
+
+**What was done (toggle `INSITU_CALIB_WIDE_REFILL=1`; default config untouched).**
+- `insitu_calib_mem`: new `serialize_refills` (default True) + `max_outstanding` (default 8)
+  knobs. When False, refill reads run concurrently (no `mem_busy_until` one-at-a-time).
+- `calib_driver`: a request now holds its per-port outstanding slot until the response
+  returns (deferred slot-free via an inflight-completion multimap), so `outstanding_budget=32`
+  genuinely binds (`max_outstanding` reads 32, not the prior artifactual 1). This is the
+  §3 requirement. Verified non-regressive for the default config.
+- `__init__.py`: `INSITU_CALIB_WIDE_REFILL` → refill_beat=cache_line (single beat),
+  serialize_refills=False, max_outstanding=64, and miss_penalty=9 (cold miss ML+17→ML+13).
+- `gen_traces.py`: added `cold_stream_long` (512 lines) to show the sustained plateau.
+
+**Calibration (wide config) vs RTL bl1:**
+- cold miss isolated = **ML+13** (23/63/113/213) ✅ exact across the sweep.
+- mem_rd = **64** (one refill/miss) ✅; max_outstanding = **32** (ML≥50) ✅.
+- **sustained plateau** (512-line stream, ML50) = **0.49** ≈ doc's `32/63 ≈ 0.5` ✅ —
+  matches the doc's Little's-law plateau (the actual stated limit).
+- 64-line burst throughput = 0.41 @ML50 (RTL 0.243) — over; the doc labels 0.243 a
+  fill/drain short-burst artifact and computes the true plateau as ~0.5, which GVSoC hits.
+  The residual is RTL's under-load latency inflation (lat_avg 100 vs my 63) from
+  cache-internal miss-handling serialization — the same cache-occupancy gap as the
+  calib report §5(7). Without the driver budget the wide config would run unbounded
+  (~1/cyc); with it, bounded to ~0.5 — the doc's requirement is met.
+
+**Verification.** `make build TARGETS=insitu_cache_calib` clean. **Default (serialized)
+config fully preserved:** cold miss ML+17, cold_stream 0.0188, warm hit 10, write 8/0.478,
+RAW 7, coal mem_rd 32, evict 0.0189/1024, microbench unchanged (max_outstanding now 32 vs
+prior 1, no throughput change). Shared controller/config NOT touched this round
+(miss_penalty=9 is a per-instance runtime override in the calib target) → spatz unaffected.
+
+**Files touched.** `core/models/cache/insitu/insitu_calib_mem.{cpp,py}`,
+`pulp/insitu_cache_calib/{calib_driver.cpp,__init__.py,gen_traces.py}`,
+`prompt/insitu_cache_calib_report.md` (§9).
+
+**Follow-up.** Exact 64-burst match (0.243) needs a cache-occupancy model that inflates
+the under-load round-trip — the recurring deferred item (calib report §5(7)).
+
+---
+
 ## 2026-06-02 11:29 +0200 — Commit all WIP + rebase dev branches onto upstream, bump engine
 
 **Status:** committed (submodules pushed; parent committed locally).

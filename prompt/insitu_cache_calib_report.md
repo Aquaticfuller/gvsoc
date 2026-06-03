@@ -243,3 +243,159 @@ multi-port hit rate), forwarding-buffer same-row forward, and writeback/refill
 overlap on the shared refill port. None are new — they're the same backlog as §5.
 
 New traces: run any with `INSITU_CALIB_TRACE=<name> gvsoc --target=insitu_cache_calib run`.
+
+## 9. Wide single-beat refill throughput experiment (2026-06-03)
+
+Mirrors `ManyRVData_rebase/reports/cache_calib/THROUGHPUT_EXPERIMENT.md`. The RTL
+experiment sets `refill_data_width = cacheline (512)` ⇒ **BurstLength=1**: a line miss
+is one memory transaction and **misses pipeline** (no single-outstanding-refill gate),
+with a deep (64) memory queue. The binding limit then becomes the **requester's
+32-outstanding-load budget** (Little's law → plateau ≈ 32/(MemLatency+13) ≈ 0.5 @ML50).
+RTL throughput jumps ~13× (0.018 → 0.243 for the 64-line burst).
+
+**GVSoC reconfig (toggle: `INSITU_CALIB_WIDE_REFILL=1`):**
+- `insitu_calib_mem`: `serialize_refills=False` (refills concurrent, no `mem_busy_until`
+  one-at-a-time) + `max_outstanding=64`; `refill_beat_bytes = cache_line (64)` ⇒ single beat.
+- `calib_driver`: a request now **holds its per-port outstanding slot until the response
+  returns** (deferred slot-free), so the `outstanding_budget=32` actually binds
+  (`max_outstanding` reads 32, not 1). This is the property §3 says the model must have.
+- wide-config `miss_penalty_cycles=9` ⇒ cold miss = MemLatency+13 (single-beat removes the
+  multi-beat tail; +17 → +13).
+
+**Calibration (wide config) vs RTL bl1:**
+
+| Metric | GVSoC | RTL bl1 | |
+|---|---|---|---|
+| cold miss isolated, ML 10/50/100/200 | 23/63/113/213 | 23/63/113/213 | ✅ exact (=ML+13) |
+| mem_rd (64-line stream) | 64 | 64 | ✅ one refill/miss |
+| max_outstanding (ML≥50) | 32 | 32 | ✅ budget binds |
+| **sustained plateau** (512-line stream, ML50) | **0.49** | doc's `32/63 ≈ 0.5` | ✅ matches Little's-law plateau |
+| 64-line burst throughput, ML50 | 0.41 | 0.243 | ⚠ over (see below) |
+| serialized→wide jump (cold_stream ML50) | 0.0188 → 0.41 (≈22×) | 0.018 → 0.243 (≈13×) | ✅ qualitative |
+
+**On the 64-burst residual (0.41 vs 0.243).** The doc itself labels 0.243 a "short
+64-access burst dominated by fill/drain" and computes the *true* sustained plateau as
+`32/63 ≈ 0.5`. GVSoC's 512-line stream gives **0.49** — i.e. it matches the doc's
+**Little's-law plateau** (the actual stated limit). The RTL 64-burst is lower because,
+under load, RTL's per-access latency inflates (lat_avg 100 / max 130 vs the isolated 63)
+from cache-internal miss-handling serialization; GVSoC's per-miss latency stays ~63
+(no load inflation), so its short burst is less fill/drain-suppressed. Reproducing the
+RTL's exact 64-burst number would need a cache-occupancy model that inflates the
+under-load round-trip — the same deferred item as §5(7). The **doc's requirement —
+"model the 32-outstanding limit or you over-predict" — is met**: without the driver's
+budget binding, the wide config would run unbounded (~1/cyc); with it, throughput is
+bounded to the ~0.5 plateau.
+
+**Default (serialized, BurstLength=4) config is fully preserved** — the driver's
+outstanding-budget change doesn't bind tighter than the existing per-phase limits:
+cold miss ML+17, cold_stream 0.0188, warm hit 10, write 8 / 0.478, RAW 7, coal mem_rd 32,
+evict 0.0189/1024, microbench all unchanged (`max_outstanding` now reads 32 instead of
+the prior artifactual 1, with no throughput change).
+
+### 9.1 Full BL1 calibration check (vs REPORT_BL1.md, 2026-06-03)
+
+Ran every phase GVSoC has a trace for, in wide mode, @ML50, vs the RTL `REPORT_BL1.md`
+20-phase table:
+
+| phase | GVSoC (wide) | RTL BL1 | verdict |
+|---|---|---|---|
+| warm_hit_latency | 10 | 10 | ✅ |
+| warm_hit_thrupt (tail) | 0.877 | 0.865 | ✅ |
+| warm_write_latency | 8 | 8 | ✅ |
+| warm_write_thrupt (tail) | 0.478 | 0.489 | ✅ |
+| raw_same_word | 7 | 7 | ✅ |
+| coal_warm_4port | 0.061 | 3.282 | ❌ input-coalescer gap (not BL-related; §5(6)) |
+| cold_miss_latency (ML 10/50/100/200) | 23/63/113/213 | 23/63/113/213 | ✅ exact |
+| cold_miss_thrupt_1p | thr 0.41, lat 63/63/63, out 32, rd 64 | thr 0.243, lat 63/100/130, out 32, rd 64 | rd/out ✅; **thr over** |
+| coal_cold_4port | thr 0.65, out 128, rd 32, wr 0 | thr 0.467, out 56, rd 32, wr 32 | rd ✅; **thr over, out over** |
+| evict_dirty_fill | thr 0.49, rd 2048, wr 1024 | thr 0.177, rd 2047, wr 1054 | traffic ✅; **thr 2.8× over** |
+| evict_wb_miss_stream | thr 0.50, rd 2048, wr 1024 | thr 0.178, rd 2049, wr 1026 | traffic ✅; **thr 2.8× over** |
+
+**Verdict — partially calibrated.** Well-calibrated on: all hit/write/RAW latencies +
+throughputs (the report's "unchanged" invariant holds — the wide path doesn't touch
+them), cold-miss latency (ML+13 exact across the sweep), and memory-traffic *structure*
+(mem_rd/mem_wr match on every miss/coalesce/evict phase). **Over-predicts wide-mode
+miss-heavy throughput**: cold_stream 0.41 vs 0.243 (1.7×), coal_cold 0.65 vs 0.467
+(1.4×), evict 0.49 vs 0.177 (2.8×).
+
+**Root cause (one gap, several symptoms).** GVSoC bounds outstanding by the per-port
+requester budget (32) and keeps per-access latency **flat** (63), whereas RTL bounds it
+by **cache-internal resources that differ per access type** — cold_stream out=32 (✅,
+requester-bound, so this one matches on `out`), coal_cold out=56, evict out=4 — *and*
+inflates per-access latency under load (cold_stream 63→100, coal_cold→82, evict_wb→98).
+So GVSoC's throughput pegs at the ~0.5 budget/latency plateau for every miss-heavy phase,
+while RTL's varies (0.18–0.47) by the binding cache resource. The cold_stream case is the
+mildest (the doc itself calls RTL's 0.243 a fill/drain artifact and the true plateau ~0.5,
+which GVSoC matches); coal_cold/evict diverge more because their RTL limits (shared MSHR
+accept depth ~56; write-allocate accept depth ~4) are real and unmodelled.
+
+**To close it:** a cache-occupancy model — deferred refill resolution with per-resource
+outstanding caps (MSHR depth, write-info FIFO, accept FIFO) and under-load latency
+inflation. This is the recurring Phase-B item (§5(7)); it would replace the inline-resolve
++ per-port-budget approximation that suffices for latency/traffic but not wide-mode
+miss bandwidth.
+
+## 10. Occupancy model — closing wide-mode miss throughput (2026-06-03)
+
+§9.1 found GVSoC over-predicted wide-mode miss-heavy *throughput* (cold_stream 0.41,
+coal_cold 0.65, evict 0.49) because misses resolved inline (flat 63-cyc latency, no
+contention). The fix models the cache's near-serial refill-install pipeline as an
+**occupancy resource** — but, after a research+design pass, via a small **gated
+cyclestamp** rather than the heavier event-pool rewrite (same effect, far less risk).
+
+**Mechanism (all gated behind `defer_refills`, default False = unchanged inline path):**
+- `refill_resp_handler`: refill *completion* cycles are serialized by a monotonic
+  cyclestamp `refill_drain_busy_until_` advancing `refill_drain_cycles` per completion
+  (`completion = max(now+refill_lat, busy+drain); refill_lat = completion-now` — replaces,
+  no double-count). A queued miss's completion (hence the requester-visible
+  `t_resp = t_issue + full_latency`) is pushed out under load → the driver's slot-deferral
+  paces issues → miss throughput is install-rate-bound, and per-access latency *ramps*
+  (no longer flat). The isolated/head-of-line miss is unaffected (cyclestamp in the past).
+- `issue_eviction`: a dirty writeback advances the **same** cyclestamp by
+  `drain + folded_evict_penalty` (refills + writebacks share the install pipeline) → a
+  write-allocate-with-eviction stream runs ~half the read-miss rate.
+
+**Knobs (defaults no-op → Spatz/default untouched; calib wide sets them):** `defer_refills`
+(F/**T**) and `refill_drain_cycles` (0/**3**) — these two produce the entire effect. The
+wide toggle (`INSITU_CALIB_WIDE_REFILL=1`) sets `defer_refills=True, refill_drain_cycles=3`
+(override via `INSITU_CALIB_REFILL_DRAIN`). (An earlier draft also added
+`max_outstanding_refills` / `writeback_outstanding` / `model_backpressure_denied` for a
+pool/DENIED approach; an adversarial-review workflow found them **dead** — the cyclestamp
+alone reproduces the numbers — so they were removed rather than ship unenforced
+backpressure semantics that would mislead a future editor about Spatz safety.)
+
+**Calibration vs RTL BL1 (@ML50; sweep in parens):**
+
+| phase | GVSoC | RTL BL1 | |
+|---|---|---|---|
+| cold_miss isolated (ML 10/50/100/200) | 23/63/113/213 | 23/63/113/213 | ✅ exact |
+| cold_stream_1p thr (10/50/100/200) | 0.302/0.254/0.201/0.123 | 0.243/0.243/0.183/0.118 | ✅ ≤10% (24% @ML10) |
+| coal_cold_4port thr (10/50/100/200) | 0.585/0.494/0.414/0.313 | 0.618/0.467/0.431/0.322 | ✅ ≤6% |
+| evict_dirty_fill thr @ML50 | 0.166 | 0.177 | ✅ 6% |
+| evict_wb_miss_stream thr @ML50 | 0.166 | 0.178 | ✅ 7% |
+| cold_stream lat @ML50 | 63/95/125 | 63/100/130 | ✅ ramp matches |
+
+All four miss-heavy throughputs now match within ~7% at ML=50 (was 1.4–2.8× over). The one
+soft spot is cold_stream at ML=10 (0.30 vs 0.24): a single fixed drain rate can't perfectly
+reproduce the RTL's hard install-pipeline cap that stays *flat* 0.243 for ML≤50; D=3 is the
+best single-knob fit across the sweep.
+
+**Preserved (no regression):** default (serialized BL4) calib unchanged — cold miss ML+17,
+cold_stream 0.0188, warm hit 10, write 8/0.478, RAW 7, coal mem_rd 32; wide-mode
+hits/writes/RAW unchanged; `spatz:use_insitu_cache=True` builds clean; microbench identical.
+Spatz-safe **by construction**: `defer_refills=False` ⇒ the inline path runs verbatim, no
+new non-OK status anywhere (FpuLsu/AraVlsu would fatal on it).
+
+**Residuals (secondary, not throughput):** per-phase `max_outstanding` and latency
+*distributions* still differ (coal_cold out 128 vs 56; evict out 32 vs 4) — those would need
+an explicit per-resource pool/event model (a future phase). The headline per-phase
+*throughputs* and latencies are matched.
+
+**Adversarial verification:** a review workflow (C++ correctness + spatz-safety + a synthesis
+verdict) returned **GO-WITH-FIXES** → resolved to **GO**. It confirmed: no latency
+double-count (refill_lat is replaced, paid once), the cyclestamp is monotonic + reset per
+run, the head-of-line miss is unaffected, the `defer_refills=False` path is byte-identical,
+and **no new non-OK status is reachable on any path** (the Spatz fatal-on-non-OK hazard is
+not introduced). Its one must-fix — three dead knobs advertising unimplemented backpressure —
+was applied (removed), and the two cyclestamp advances were factored into one
+`reserve_install_pipe()` helper. Post-fix rebuild: all numbers unchanged, builds clean.
