@@ -53,22 +53,31 @@ latency unmasked a small accept-ceiling over-prediction (RTL accepts ~0.955/cyc,
 `insitu_cache_controller.{py,cpp}` (gradient + last_read_hit_cycle_). pulp:
 `insitu_cache_calib/gen_traces.py` + `traces/bw_hit_gap*.trace`.
 
-**Open (Change B, attempted + reverted → deferred with finding):** outstanding *distributions*
-— coal_cold out 128 vs 56 (and lat 146 vs RTL 82), evict out 32 vs 4. Throughputs already
-match. I implemented a gated in-flight **read accept-depth cap** (`max_inflight_reads`,
-completion-cycle multiset, DENY when full, default-OFF, defer_refills-only; calib=56) and
-measured it: cold_stream/evict held, but **coal_cold regressed** (thr 0.496→0.183, lat
-146→250). Reverted. **Root cause (the useful finding):** the cap throttles the same-line
-cold *followers*, but those followers are themselves the bug — under inline refill resolution
-the line goes VALID immediately, so the followers become independent VALID-hits that
-**serialize on `set_busy` (same set)** instead of merging into the one refill. They complete
-late, never retire, keep the cap full, and starve throughput. RTL instead MSHR-merges them
-(1 refill serves N, all complete together at ready_cycle ≈ 82). So both the out *count* and
-the inflated *latency* trace to the same thing: cold same-line followers must ride the refill
-(stay PEND until it lands), which the inline-resolution model can't express. The faithful fix
-is a **deferred-completion path** (line stays READ_PEND until a scheduled refill-done event,
-followers MSHR-merge) — a real Phase-B refactor of the controller's miss path, not an accept
-cap. cold_stream's match (32/95/0.254, requester-bound) is the regression tripwire for it.
+**Open (Change B — THREE approaches tried + reverted → confirmed needs a structural refactor):**
+outstanding *distributions* — coal_cold out 128 vs 56 (and lat 146 vs RTL 82), evict out 32
+vs 4. Throughputs already match. Empirically ruled out the incremental fixes (all gated
+default-OFF, defer_refills-only, cold_stream/evict held throughout):
+  1. **Accept-depth cap** (`max_inflight_reads`=56, completion-multiset, DENY-when-full):
+     coal_cold regressed 0.496→0.183 (lat→250). The capped same-line followers serialize on
+     `set_busy` (they "hit" the inline-VALID-but-not-ready line), complete late, never retire
+     → cap stuck → throughput starved.
+  2. **Ride-the-refill** (a not-ready read hit skips `set_busy`, completes at ready_cycle):
+     barely moved coal_cold (lat 146→142, out still 128) — proving the latency floor is the
+     *drain backlog depth* (128 in flight), not `set_busy`.
+  3. **Cap + ride-the-refill combined:** still regressed (0.214 / lat 234 / out 85) — the
+     DENY/retry churn without faster refills.
+**Structural conclusion:** the `refill_drain_cycles` cyclestamp serves DOUBLE duty — it sets
+both the miss *throughput* AND the spread-out `ready_cycle`s (hence the latency). cold_stream
+relies on it for throughput (0.254); coal_cold inherits its deep backlog as latency (146).
+RTL instead gets coal_cold's throughput from the **cache accept depth** (≈56) with **fast
+pipelined refills** (→ lat 82). Matching all of {thr, lat, out} therefore needs a real
+occupancy refactor that DECOUPLES the throughput limiter (refill+writeback rate / accept
+depth) from the per-access latency (refill completion) — i.e. a deferred-completion miss path
+(line stays READ_PEND until a scheduled refill-done event; followers MSHR-merge), which is
+exactly the "heavy event-pool" deliberately avoided in the §10 occupancy model. cold_stream's
+match (32/95/0.254, requester-bound) is the regression tripwire any such refactor must hold.
+**Decision pending:** high effort + regression risk for a diagnostic-out + one-phase-latency
+gain, when all throughputs already match — so left for an explicit go-ahead.
 
 ---
 
