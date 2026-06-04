@@ -501,8 +501,17 @@ single-port hit throughput (gap0/warm_stream ~0.91 vs RTL 0.865: model accepts ~
 ~0.955). It is a separate sub-cycle accept-rate item; gap≥1 (below the ceiling) matches
 exactly.
 
-**Remaining:** Change B — outstanding *distributions* (coal_cold out 128 vs 56, evict out 32
-vs 4). Throughputs match; closing the out count needs a per-resource accept-depth cap that
-binds under the inline-refill path (a deferred-completion counter — Phase-B). A shared read
-accept-depth ≈56 (cold_stream's 32 stays under it) + a write accept-depth ≈4 is the likely
-shape and would also pull coal_cold's over-inflated per-access latency toward RTL ~90.
+**Change B — outstanding distributions (attempted, reverted, deferred).** coal_cold out 128 vs
+56 (and per-access latency 146 vs RTL 82), evict out 32 vs 4; throughputs already match. A
+gated in-flight read accept-depth cap (`max_inflight_reads`=56, completion-cycle multiset,
+DENY-when-full, defer_refills-only) was implemented and measured: cold_stream/evict held but
+**coal_cold regressed** (thr 0.496→0.183, lat 146→250), so it was reverted. The measurement
+pinpointed the real cause: under inline refill resolution the refilled line goes VALID
+immediately, so cold same-line *followers* become independent VALID-hits that serialize on
+`set_busy` (same set) rather than MSHR-merging into the single refill. They complete late,
+never retire from the cap, and starve throughput. RTL instead merges them (one refill serves
+N, all complete together at ready_cycle ≈ 82). Both the out count *and* the inflated latency
+therefore require a **deferred-completion path** — the line stays `READ_PEND` until a
+scheduled refill-done event and followers MSHR-merge — not an accept cap. That is a Phase-B
+refactor of the miss path; cold_stream's exact match (32 / 95 / 0.254, requester-bound) is
+the regression tripwire any such refactor must preserve.

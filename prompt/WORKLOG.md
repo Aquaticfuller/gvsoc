@@ -53,12 +53,22 @@ latency unmasked a small accept-ceiling over-prediction (RTL accepts ~0.955/cyc,
 `insitu_cache_controller.{py,cpp}` (gradient + last_read_hit_cycle_). pulp:
 `insitu_cache_calib/gen_traces.py` + `traces/bw_hit_gap*.trace`.
 
-**Open (Change B, deferred):** outstanding *distributions* — coal_cold out 128 vs 56, evict
-out 32 vs 4. Throughputs match; this is the per-resource accept-depth cap. A shared read
-accept-depth ≈56 (cold_stream's 32 stays under it) + a write accept-depth ≈4 could close it
-AND pull coal_cold's over-inflated latency down, but it needs the outstanding count to bind
-under the inline-resolution path (a deferred-completion counter, not a self-decrementing one)
-— hence still Phase-B.
+**Open (Change B, attempted + reverted → deferred with finding):** outstanding *distributions*
+— coal_cold out 128 vs 56 (and lat 146 vs RTL 82), evict out 32 vs 4. Throughputs already
+match. I implemented a gated in-flight **read accept-depth cap** (`max_inflight_reads`,
+completion-cycle multiset, DENY when full, default-OFF, defer_refills-only; calib=56) and
+measured it: cold_stream/evict held, but **coal_cold regressed** (thr 0.496→0.183, lat
+146→250). Reverted. **Root cause (the useful finding):** the cap throttles the same-line
+cold *followers*, but those followers are themselves the bug — under inline refill resolution
+the line goes VALID immediately, so the followers become independent VALID-hits that
+**serialize on `set_busy` (same set)** instead of merging into the one refill. They complete
+late, never retire, keep the cap full, and starve throughput. RTL instead MSHR-merges them
+(1 refill serves N, all complete together at ready_cycle ≈ 82). So both the out *count* and
+the inflated *latency* trace to the same thing: cold same-line followers must ride the refill
+(stay PEND until it lands), which the inline-resolution model can't express. The faithful fix
+is a **deferred-completion path** (line stays READ_PEND until a scheduled refill-done event,
+followers MSHR-merge) — a real Phase-B refactor of the controller's miss path, not an accept
+cap. cold_stream's match (32/95/0.254, requester-bound) is the regression tripwire for it.
 
 ---
 
