@@ -515,3 +515,53 @@ therefore require a **deferred-completion path** — the line stays `READ_PEND` 
 scheduled refill-done event and followers MSHR-merge — not an accept cap. That is a Phase-B
 refactor of the miss path; cold_stream's exact match (32 / 95 / 0.254, requester-bound) is
 the regression tripwire any such refactor must preserve.
+
+## 13. coal_cold out/latency — definitive non-convergence (2026-06-04)
+
+The deferred-completion refactor (§Change B) was fully designed and put through a **design↔verify
+loop** (3 rounds, adversarial verification each round, agents measuring on the live tree). The
+verdict is **NO-GO on any code refactor** — and, importantly, the loop *proved* why, rather than
+asserting it. The throughput already matches; the residual gaps (lat 82 vs 146, out 56 vs 128)
+are **coupled** and not reachable by any gated-OFF knob.
+
+**Proof 1 — deferred completion is a measurement no-op.** The calib driver computes
+`t_resp = t_issue + req->get_full_latency()` (`calib_driver.cpp:304`), and a follower's latency
+is fully determined *at/before issue* (`base_latency = line.ready_cycle − entry.arrival_cycle +
+subarray_idx`, `controller.cpp:654-660`). The wall-clock cycle at which `resp()` physically fires
+is never read. Measured coal_cold `lat_avg` scales **lockstep** with MemLatency —
+106.5/146.5/196.5/296.5 for ML 10/50/100/200 (= ML + 96.5) — i.e. it is the integral of a
++6-cyc-per-line install ramp over 32 lines, not a deferrable stagger. Scheduling completion later
+changes none of the inputs. So the entire event refactor would move the number by **zero**.
+
+**Proof 2 — pre-dirtying coal_cold regresses it.** Making the 32 lines evict dirty victims (so
+`mem_wr=32`, matching the RTL DUT) double-reserves the shared install pipe (eviction step
+`refill_drain+folded_evict = 6` + refill `3` ≈ 9 cyc/line vs 3 read-only). Measured steady state:
+**0.31 thr / 169 lat / 96 out** — undershoot *and* worse latency. (RTL's `mem_wr=32` is a
+shared-testbench pre-dirty *history* artifact; GVSoC's `mem_wr=0` is correct for a standalone
+cold run and is documented as a scenario difference, not a defect.)
+
+**Proof 3 — an accept-rate throttle breaks coalescing.** A 1-slot/cyc controller gate DENYs the
+3 same-cycle cold followers *before* they can MSHR-merge (cold followers don't coalesce at the
+interco because the lead misses), and the driver's fixed port-0..N order (`calib_driver.cpp:344`)
+makes port 0 race its 32 distinct lines while ports 1-3 starve → retry-storm collapse (~0.28).
+
+**Proof 4 — thr/lat/out are one knob, not three.** D-sweep on the shared `refill_drain_cycles`
+D={0,1,3,6,9}: coal_cold thr {0.653, 0.653, 0.496, 0.365, 0.288}, cold_stream thr {0.408, 0.408,
+0.254, 0.145, 0.102}. D=3 is the **joint** optimum; any move that helps coal_cold drags
+cold_stream off its exact 0.254 match. Smooth offer-spacing reaches out≈58 only at thr≈0.56 /
+lat≈70 — never simultaneously {0.467, 82, 56}.
+
+**Bottom line.** The model is well-calibrated: **all throughputs match** (coal_cold 0.496 vs
+0.467 = +6.2%; cold_stream and evict exact) and the **headline latencies match** (warm hit 7/10,
+cold miss ML+13, etc.). coal_cold's `lat=82` and `out=56` are coupled RTL-specific shape metrics.
+The *only* mechanism that could converge them is a **Phase-B controller same-line MSHR-collapse**
+(coalesce same-line cold reads onto ONE outstanding slot → out ≈ line-count, all followers retire
+on the one shared refill → lat ≈ 82) plus a **~14-line concurrent-install cap** (out ≈ 14×4 = 56
+by Little's law), gated `defer_refills`-only and distinguishing merge-count>0 (coalesced) lines
+from cold_stream's distinct-set lines. **That itself is not proven** — collapsing removes the
+follower `set_busy` serialization that currently makes coal_cold's throughput match, so it would
+need co-tuning to avoid overshooting 0.467 (lat and thr are themselves coupled in GVSoC). It is
+**scoped as a tracked follow-up, not implemented**, because the ROI (one phase's out + latency,
+throughput already matched) does not justify the regression risk to the exactly-matched
+cold_stream/evict and the delicate MSHR path. Workflows: `wuw0hl7ph` (first NO-GO),
+`w4ohzna7g` (3-round design↔verify loop).

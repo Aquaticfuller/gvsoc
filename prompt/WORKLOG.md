@@ -101,6 +101,35 @@ the corrected design has not been re-verified. Given all throughputs already mat
 is one phase's diagnostic out-count + latency, this is parked for an explicit decision rather
 than barrelling past the NO-GO. Full analysis: workflow `wuw0hl7ph` output.
 
+## 2026-06-04 (later) — coal_cold occupancy refactor: design↔verify loop → NO-GO on code, doc deliverable
+
+**User direction:** "do the occupancy refactor" → then "re-verify, then implement." So I ran a
+3-round design↔verify loop (workflow `w4ohzna7g`, agents measuring on the live tree). Final
+verdict **GO-WITH-FIXES = NO-GO on any code refactor; GO only on documentation**. The loop
+*proved* (not asserted) the refactor is futile/harmful:
+
+- **Deferred completion is a measurement no-op.** `t_resp = t_issue + get_full_latency()`
+  (calib_driver.cpp:304); follower latency is determined at issue (controller.cpp:654-660).
+  coal_cold lat = ML+96.5 lockstep (106.5/146.5/196.5/296.5) — a +6-cyc/line install ramp tail,
+  not a deferrable stagger. Deferring `resp()` moves the metric by zero.
+- **Pre-dirty regresses:** measured 0.31 thr / 169 lat / 96 out (double-reserves the install pipe).
+- **Accept-throttle breaks coalescing:** DENYs cold followers before MSHR-merge; port-0 race.
+- **thr/lat/out are one coupled knob:** D-sweep D={0,1,3,6,9} → coal_cold {0.653,0.653,0.496,
+  0.365,0.288}, cold_stream {0.408,0.408,0.254,0.145,0.102}; D=3 is the joint optimum.
+
+**Decision:** did NOT implement any refactor (no ClockEvent / finish_refill / accept-throttle /
+new knob; even the "optional" miss_fifo=64 bump omitted — verified inert: in wide mode the memory
+returns OK synchronously so miss_fifo never fills, peak ~1). **Landed only docs:** calib report
+§13 (the four proofs + the Phase-B scoping) + a gen_traces.py comment warning not to pre-dirty
+coal_cold. The model stays well-calibrated: all throughputs + headline latencies match;
+coal_cold lat/out are coupled RTL-shape residuals whose only convergent fix is a Phase-B
+controller same-line MSHR-collapse + ~14-line install cap (scoped, unproven, not implemented).
+
+**Spatz/inline byte-identity:** trivially held — no model code (.cpp/.py) changed; the
+gen_traces.py edit is comment-only (traces byte-identical after regen). **Files:** core: none;
+pulp: `insitu_cache_calib/gen_traces.py` (comment); parent: `prompt/insitu_cache_calib_report.md`
+§13, `prompt/WORKLOG.md`.
+
 ---
 
 ## 2026-06-04 — Phase-B input par-coalescer: close coal_warm (0.06 → 3.12 acc/cyc)
