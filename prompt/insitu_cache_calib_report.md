@@ -399,3 +399,61 @@ and **no new non-OK status is reachable on any path** (the Spatz fatal-on-non-OK
 not introduced). Its one must-fix — three dead knobs advertising unimplemented backpressure —
 was applied (removed), and the two cyclestamp advances were factored into one
 `reserve_install_pipe()` helper. Post-fix rebuild: all numbers unchanged, builds clean.
+
+## 11. Input par-coalescer — closing coal_warm (2026-06-04)
+
+The last headline mismatch was **coal_warm** (4 VLSU ports reading the *same line* every
+cycle): GVSoC 0.06 vs RTL 3.282 acc/cyc. The RTL input `par_coalescer` merges those same-cycle
+same-line narrow reads into **one** wide cache lookup and splits the wide response back to
+each port — so N words to one line cost ~one bank access (≈4× the single-port hit rate).
+
+**Where it lives — the interco, not the controller.** A controller-internal merge cannot
+close the gap: `insitu_cache_interco`'s `output_busy_until` serializes the 4 same-cycle
+requests (it advances ~4/cyc while the clock advances 1/cyc), pinning throughput at ~1/cyc
+no matter what the controller does. The merge therefore lives at the interco — the per-cycle
+arbitration point. The **first** read of a line in a cycle forwards normally (consumes one
+accept slot, does the real hit/miss lookup); same-cycle **followers** to the same line
+inherit its latency and are served without re-forwarding or re-consuming a slot.
+
+Gated, default-OFF knobs on `InsituCacheIntercoConfig`:
+- `enable_input_coalesce` (False) — master gate.
+- `cache_line_bytes` (64) — line granularity for same-line grouping.
+- `coalesce_max_latency` (-1 = no limit) — **only** a forwarded read whose latency is
+  warm-hit-sized (calib sets ≈16) seeds the merge window. This is what keeps **coal_cold**
+  honest: a cold line refilled inline returns OK but with a *refill-sized* latency (≈60), so
+  its same-cycle followers do **not** coalesce — they fall through to the controller's MSHR
+  merge (drain-paced), leaving cold-miss-stream throughput and mem_rd=32 intact.
+
+Two subtleties the first build exposed and fixed:
+1. The coal_warm trace preloaded via **port 0**, so port 0 entered the measured phase ~32 cyc
+   behind ports 1–3 and never shared a cycle with them — only 3 of 4 ports merged. Fixed by
+   preloading via the **scalar port (4)** so the four VLSU ports stay cycle-aligned.
+2. Without `coalesce_max_latency`, inline-refilled cold lines coalesced as hits and
+   **coal_cold** rose 0.49 → 0.65. The threshold restores 0.49.
+
+**Result (ML50):**
+
+| phase     | GVSoC before | GVSoC after | RTL    | note                          |
+|-----------|--------------|-------------|--------|-------------------------------|
+| coal_warm | 0.06         | **3.122**   | 3.282  | −4.8%; latency flat 10 (RTL 7)|
+| coal_cold | 0.494        | **0.494**   | 0.467  | mem_rd=32 preserved           |
+
+Every other phase is **byte-identical** (warm_stream 0.877, warm_write 8.0/0.478,
+raw_same_word 7.0, cold_miss wide 63, cold_stream wide 0.254, evict mem_wr 1024); the
+microbench's 7 CALIB_REPORT lines are unchanged. **Spatz-safe by construction:** a pure
+same-cycle latency adjustment on the already-inline-OK hit path — never holds a request,
+defers a response, returns non-OK, or touches `IoReq::get_args()`. Default-OFF;
+`make_cachepool_512_config` (spatz + microbench) leaves it off, so their published trees
+gain only the three default-valued properties and their behaviour is unchanged.
+
+**Scalar bypass — deferred.** The RTL scalar "~60 cyc" is the *isolated* cold-miss latency,
+which the model already matches (`cold_miss_isolated` = 63–67). The sample trace's idx11=175
+is memory-refill contention (port 0 issues four serializing misses at the same instant) that
+the RTL would also exhibit — not a cache-path artifact. A dedicated bypass would only trim
+mixed-trace contention, governed by memory-arbitration details, on a synthetic trace; it is
+not a headline metric, so it is left for a later round.
+
+**Remaining (unchanged from §10):** occupancy per-resource *distributions* (coal_cold out
+128 vs 56; evict out 32 vs 4 — throughputs match, only out/lat *shape* differs); coal_warm
+latency 10 vs RTL 7 (hit-pipelining depth); real flush/sync FSM; multi-entry fwd buffer;
+per-SoC variants; full spatz runtime validation.

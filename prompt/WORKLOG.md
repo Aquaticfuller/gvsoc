@@ -8,6 +8,56 @@
 
 ---
 
+## 2026-06-04 — Phase-B input par-coalescer: close coal_warm (0.06 → 3.12 acc/cyc)
+
+**Status:** implemented + verified (regression-clean); ready to commit (core + pulp).
+
+**What.** Modelled the RTL input `par_coalescer` as a **same-cycle, same-line read-HIT merge
+inside `insitu_cache_interco`** (the per-cycle arbitration point), default-OFF. The first
+read of a line in a cycle forwards normally; same-cycle followers to the same line inherit
+its latency and do **not** re-consume the per-output accept slot — so N VLSU words to one
+line cost ~one bank access (RTL: ~4× the single-port hit rate). New gated knobs on
+`InsituCacheIntercoConfig`: `enable_input_coalesce` (False), `cache_line_bytes` (64),
+`coalesce_max_latency` (-1). The calib config sets them (coalesce on, threshold = hit+7 ≈ 16).
+
+**Why the interco, not the controller (overrode the design's first pick).** A controller-only
+merge can't close the gap: the interco's `output_busy_until` serializes the 4 same-cycle
+reqs (grows 4/cyc while `now` grows 1/cyc), capping throughput at ~1/cyc regardless of the
+controller. Merging at the interco removes that serialization at its source.
+
+**Two fixes the first build exposed:**
+1. *Only 3 of 4 ports merged.* The coal_warm trace preloaded via **port 0**, so port 0
+   entered the measured phase ~32 cyc behind ports 1–3 (its preload tail) → it never shared
+   a cycle with them. Fix: preload via the **scalar port (4)** so all four VLSU ports stay
+   cycle-aligned. (gen_traces.py)
+2. *coal_cold regressed 0.49 → 0.65.* The inline refill makes a cold line VALID immediately,
+   so cold same-cycle followers were wrongly merged as warm hits. Fix: `coalesce_max_latency`
+   — only a forwarded read whose latency is warm-hit-sized (≤16) seeds the window; a
+   refill-sized "hit" (≥60) does not, so cold followers fall through to the MSHR-merge path.
+
+**Result (ML50):** coal_warm **0.06 → 3.122** acc/cyc (RTL 3.282, −4.8%), latency flat 10
+(RTL 7 — the known hit-pipelining residual). coal_cold held at **0.494** (RTL 0.467),
+mem_rd=32. **All other phases byte-identical** (warm_stream 0.877, warm_write 8.0/0.478,
+raw_same_word 7.0, cold_miss wide 63, cold_stream wide 0.254, evict mem_wr 1024). Spatz/
+microbench no-op proven: build clean; microbench 7 CALIB_REPORT lines unchanged; merge
+gated off (`make_cachepool_512_config` leaves `enable_input_coalesce`=False).
+
+**Spatz-safe by construction.** Pure same-cycle latency adjustment on the already-inline-OK
+hit path: never holds a req, never defers a resp, never returns non-OK, never touches
+`IoReq::get_args()`. Default-OFF; only the calib config flips it.
+
+**Scalar bypass — deferred (low value).** The RTL scalar "~60" is the *isolated* cold-miss
+latency, which the model **already** matches (`cold_miss_isolated` = 63–67). The sample
+trace's idx11=175 is *memory-refill contention* (port 0 issues 4 serializing misses at the
+same instant) that RTL would also show; it is not a cache-path issue. Modeling the bypass
+precisely is a memory-arbitration refinement on a synthetic trace, not a headline metric.
+
+**Files.** core: `insitu_cache_config.py` (interco knobs + calib wiring),
+`insitu_cache_interco.{py,cpp}` (merge logic). pulp: `insitu_cache_calib/gen_traces.py`
+(coal_warm preload via scalar port).
+
+---
+
 ## 2026-06-03 04:30 +0200 — Calibration check vs REPORT_BL1.md (20-phase BurstLength=1)
 
 **Status:** assessment only (no code change). Doc-only update (calib report §9.1).
