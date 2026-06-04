@@ -457,3 +457,52 @@ not a headline metric, so it is left for a later round.
 128 vs 56; evict out 32 vs 4 — throughputs match, only out/lat *shape* differs); coal_warm
 latency 10 vs RTL 7 (hit-pipelining depth); real flush/sync FSM; multi-entry fwd buffer;
 per-SoC variants; full spatz runtime validation.
+
+## 12. Streaming read-hit pipelining — closing the 10-vs-7 latency (2026-06-04)
+
+A warm read hit costs **10 cyc isolated** but **7 cyc streaming** in the RTL, both
+MemLatency-independent (REPORT.md §3.1; the 7/7/10 CSV signature on every streaming hit
+phase). The model charged a flat 10 for every hit. The 3-cycle difference is pure pipeline
+fill/drain of three decoupling registers on the coalescer↔wrapper loop (coalescer req-spill,
+resp-spill, rsp_spliter/output-FIFO): an isolated access fills them in series; a back-to-back
+stream keeps them continuously occupied so they add zero incremental latency.
+
+**Model — a per-controller warmth gradient** (`streaming_hit_latency_cycles`, default -1 =
+OFF). In the VALID read-hit branch the base latency is
+
+    base = streaming + min(hit_latency − streaming, cycles_since_last_read_hit)
+
+anchored on `last_read_hit_cycle_` (updated on every read hit). One register drains per idle
+cycle, so the fill cost grows with the gap and saturates at the full depth. The calib config
+sets `streaming_hit_latency_cycles = hit_latency − 3` (=6 → interco 1 + 6 = 7). READ hits
+only — writes, forwarded reads, and MSHR-drain responses keep their own latency. The interco
+coalescer replicates the first reader's latency to followers, so **coal_warm follows to 7
+with no interco change**.
+
+**Verification (ML50).** Added `bw_hit_gap{0,1,2,3,7}` traces (single-port resident reads,
+varying injection gap):
+
+| gap | GVSoC tail-lat | RTL | GVSoC thr | RTL thr |
+|-----|----------------|-----|-----------|---------|
+| 0   | **7**          | 7   | 0.909     | 0.865   |
+| 1   | **8**          | 8   | 0.476     | 0.467   |
+| 2   | **9**          | (9) | 0.323     | —       |
+| 3   | **10**         | 10  | 0.244     | 0.243   |
+| 7   | **10**         | 10  | 0.124     | 0.124   |
+
+Latencies exact across the sweep; gap≥1 throughputs exact. warm_stream latency 10→7;
+coal_warm latency 10→7 (7/7/7), throughput 3.12→3.37 (RTL 3.28, +2.7%). Misses unchanged
+(cold_miss 67/63, cold_stream 0.254, coal_cold 0.496); writes/RAW unchanged (8/7).
+Spatz/microbench byte-identical (knob OFF; microbench 7 lines unchanged) — spatz-safe (pure
+inline-OK latency adjustment).
+
+**Residual.** The now-correct latency unmasks a ~5.7% over-prediction of the *saturation*
+single-port hit throughput (gap0/warm_stream ~0.91 vs RTL 0.865: model accepts ~1.0/cyc, RTL
+~0.955). It is a separate sub-cycle accept-rate item; gap≥1 (below the ceiling) matches
+exactly.
+
+**Remaining:** Change B — outstanding *distributions* (coal_cold out 128 vs 56, evict out 32
+vs 4). Throughputs match; closing the out count needs a per-resource accept-depth cap that
+binds under the inline-refill path (a deferred-completion counter — Phase-B). A shared read
+accept-depth ≈56 (cold_stream's 32 stays under it) + a write accept-depth ≈4 is the likely
+shape and would also pull coal_cold's over-inflated per-access latency toward RTL ~90.

@@ -8,6 +8,60 @@
 
 ---
 
+## 2026-06-04 (later) — Streaming read-hit pipelining: latency 10 → 7
+
+**Status:** implemented + verified (regression-clean); committed — core `edfc99d2`,
+pulp `2282baa` (local; not pushed).
+
+**What.** Modelled the RTL read-hit pipeline fill/drain so a streaming hit costs 7 cyc and
+an isolated hit 10 (both MemLatency-independent). New gated knob
+`InsituCacheControllerConfig.streaming_hit_latency_cycles` (default -1 = OFF). In the VALID
+read-hit branch of `insitu_cache_controller.cpp`, base latency =
+`streaming + min(hit_latency-streaming, cycles_since_last_read_hit)` — a per-controller
+warmth gradient anchored on `last_read_hit_cycle_`. The calib config sets it to
+`hit_latency-3` (=6 → interco(1)+6 = 7 streaming). READ hits only (writes, forwarded reads,
+and MSHR-drain responses keep their own latency).
+
+**Why a gradient, not a binary warm/cold.** The RTL has three decoupling registers
+(coalescer req-spill, resp-spill, rsp_spliter/output-FIFO) that drain 1/cycle when idle, so
+the latency rises smoothly with the injection gap. The design workflow's RTL grounding
+(`wbkqdkn9u`) surfaced the exact gap-sweep: gap0→7, gap1→8, gap3→10, gap7→10. The gradient
+reproduces all of it; a binary model would give only 7 or 10.
+
+**RTL grounding (workflow `wbkqdkn9u`, 3 agents).** Parallel RTL-report reader + RTL-hit-path
+reader + synthesis. Mechanism confirmed: isolated 10 = end-to-end fill of every registered
+stage; streaming 7 = steady-state once the three decoupling registers stay occupied; both
+config-fixed, MemLatency-independent (REPORT.md §3.1, CHARACTERIZATION.md §3, the 7/7/10 CSV
+signature). The synthesis also scoped the outstanding-distribution gap (Change B) as a
+deferred per-resource occupancy item.
+
+**Verification (ML50, target insitu_cache_calib).** Added `bw_hit_gap{0,1,2,3,7}` traces to
+verify the gradient — GVSoC tail latency 7/8/9/10/10 **exact** vs RTL; gap≥1 throughputs also
+exact (gap1 0.476 vs 0.467, gap3 0.244 vs 0.243, gap7 0.124 vs 0.124). warm_stream latency
+10→7; coal_warm latency 10→7 (7/7/7) and throughput 3.12→3.37 (RTL 3.28, +2.7%, closer in
+abs). Misses unchanged (cold_miss 67/63, cold_stream 0.254, coal_cold 0.496); writes/RAW
+unchanged (8/7). **Spatz/microbench no-op:** build clean; microbench 7 CALIB_REPORT lines
+byte-identical (hit_repeat_r4 1.98). **Spatz-safe:** pure inline-OK latency adjustment, knob
+default-OFF.
+
+**Honest residual.** With the latency now correct (7), the *saturation* single-port hit
+throughput reads ~0.91 (warm_stream/bw_hit_gap0) vs RTL 0.865 (~5.7% over) — the correct
+latency unmasked a small accept-ceiling over-prediction (RTL accepts ~0.955/cyc, model
+~1.0). Separate sub-cycle accept-rate item; gap≥1 (below the ceiling) matches exactly.
+
+**Files.** core: `insitu_cache_config.py` (+streaming_hit_latency_cycles, calib wiring),
+`insitu_cache_controller.{py,cpp}` (gradient + last_read_hit_cycle_). pulp:
+`insitu_cache_calib/gen_traces.py` + `traces/bw_hit_gap*.trace`.
+
+**Open (Change B, deferred):** outstanding *distributions* — coal_cold out 128 vs 56, evict
+out 32 vs 4. Throughputs match; this is the per-resource accept-depth cap. A shared read
+accept-depth ≈56 (cold_stream's 32 stays under it) + a write accept-depth ≈4 could close it
+AND pull coal_cold's over-inflated latency down, but it needs the outstanding count to bind
+under the inline-resolution path (a deferred-completion counter, not a self-decrementing one)
+— hence still Phase-B.
+
+---
+
 ## 2026-06-04 — Phase-B input par-coalescer: close coal_warm (0.06 → 3.12 acc/cyc)
 
 **Status:** implemented + verified (regression-clean); ready to commit (core + pulp).
