@@ -79,6 +79,28 @@ match (32/95/0.254, requester-bound) is the regression tripwire any such refacto
 **Decision pending:** high effort + regression risk for a diagnostic-out + one-phase-latency
 gain, when all throughputs already match — so left for an explicit go-ahead.
 
+**2026-06-04 — deferred-completion design workflow (`wuw0hl7ph`, 4 agents) → adversarial NO-GO.**
+Ground (exact RTL timing + GVSoC event API) → design the event-scheduled deferred-completion
+miss path → adversarial verify. Verdict **NO-GO**, two fatal flaws, both confirmed empirically:
+  - *miss_fifo throttle:* the calib config inherits `miss_fifo_depth=4`; moving its decrement
+    to event-fire time would clamp coal_cold to 4 outstanding → collapse (attempt #1 redux).
+    Fixable (raise the depth).
+  - *writeback-pairing throughput is false for the GVSoC trace:* coal_cold_4port is read-only,
+    32 distinct lines into a 1024-entry cache → every miss lands in an INVALID way → **mem_wr=0**
+    (VERIFIED: `[CALIB_MEM] mem_rd=32 mem_wr=0`). RTL coal_cold has **mem_wr=32** because the
+    shared RTL TB's sets were pre-dirtied by earlier phases. So GVSoC and RTL coal_cold are
+    DIFFERENT scenarios. The current GVSoC throughput match (0.496 vs 0.467) is an *artifact* of
+    the followers' `set_busy` serialization (≈ RTL's writeback drain by coincidence). Removing
+    that serialization — the very thing the deferred-completion fix does to cut latency — would
+    make throughput OVERSHOOT to ~0.9 unless real writebacks pair.
+**Net:** the faithful fix needs THREE things together — (1) regenerate coal_cold to pre-dirty
+its 32 sets so writebacks fire (mem_wr=32, replicating the RTL TB state); (2) the
+deferred-completion event path (followers MSHR-merge → latency ~82); (3) raise miss_fifo_depth
++ reset/event hygiene. That is substantial trace surgery + a risky MSHR-path event refactor, and
+the corrected design has not been re-verified. Given all throughputs already match and the gap
+is one phase's diagnostic out-count + latency, this is parked for an explicit decision rather
+than barrelling past the NO-GO. Full analysis: workflow `wuw0hl7ph` output.
+
 ---
 
 ## 2026-06-04 — Phase-B input par-coalescer: close coal_warm (0.06 → 3.12 acc/cyc)
