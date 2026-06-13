@@ -8,6 +8,39 @@
 
 ---
 
+## 2026-06-08 (later) — Phase-B fix #1: pipelined-bank set_busy (real-kernel hit-inflation)
+
+**Status:** fix #1 implemented + verified (ready to commit). Fix #3 attempted + reverted. Fixes
+#2/#4 scoped. Driven by the real-kernel alignment finding (`insitu_cache_realkernel_alignment_2026-06-12.md`).
+
+**Fix #1 (APPLIED) — `bank_accept_cycles` (default 1).** The per-set `set_busy_until_` stamp now
+advances by the bank ACCEPT interval (pipelined, 1 cyc) instead of the full hit latency, so
+back-to-back accesses to a hot/reused set pipeline rather than serialize. This was the #1 cause of
+the real-kernel per-access latency over-prediction (hot-set serialization on multi-port reuse).
+Result: meanΔ vs RTL — fmatmul M32 +61→**+27**, fft +73→**+35**, fmatmul M128 +85→**+63** (big
+wins); gemv +77→+76 (neutral); fdotp +71→+75 (slight). **Synthetic calib + microbench fully
+unchanged** (the stamp only fires under same-set contention, which the synthetic distinct-set/
+coalesced phases avoid) — warm hit 10, streaming 7, cold-miss ML+17/+13, cold_stream 0.254,
+coal_cold 0.496, coal_warm 3.37, microbench 7 lines identical. So fix #1 is a strict improvement
+with no regression.
+
+**Fix #3 (single-outstanding-refill backpressure) — ATTEMPTED, REVERTED.** A cache-side gate
+(DENY a new miss while a refill is outstanding) backfired (gemv/fdotp miss latency +400-600).
+Root cause: the gate stalls misses but not hits, so a replayed hit to a not-yet-refilled line
+runs ahead and waits — but in the RTL the *core* stalled on that line's miss. **Open-loop trace
+replay can't reproduce the core's data-dependency stall when the cache's miss-timing differs.**
+Same wall as the coal_cold deferred-completion NO-GO. Machinery removed.
+
+**Fixes #2/#4 scoped** (structural coalescer, scalar bypass) — secondary; neither addresses the
+gemv/fdotp refill-cascade residual (which is partly inherent to open-loop replay). Left as clean
+follow-ups.
+
+**Files.** core: `insitu_cache_config.py` (+bank_accept_cycles), `insitu_cache_controller.{py,cpp}`
+(pipelined set_busy). pulp: `insitu_cache_calib/__init__.py` (INSITU_CALIB_COALESCE_MAX_LAT debug
+knob from the discriminator). parent: `insitu_cache_realkernel_alignment_2026-06-12.md` §8.
+
+---
+
 ## 2026-06-08 (later) — Alignment check vs RTL run_2026-06-12 → ALIGNED-CONFIRMED
 
 **Status:** assessment only (doc update: calib report §14). No code change.
