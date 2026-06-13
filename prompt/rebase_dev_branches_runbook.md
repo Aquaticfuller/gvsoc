@@ -160,3 +160,5 @@ git -C core reflog insitu-cache | head -10
 | Date | core pre→post | pulp pre→post | Upstream master tips | Conflicts |
 |---|---|---|---|---|
 | 2026-04-21 | 75eadf74 → 671a27a5 | 7fe2cb8 → 0d3625d | core 455488f8, pulp abcddd6 | none |
+| 2026-06-02 | 671a27a5 → 233850f4 | 0d3625d → 3d15e5d | core 26c86fd4 (+5), pulp abcddd6 | none; engine→a6d92918 |
+| 2026-06-08 | edfc99d2 → 9364002e | cd04829 → b8d08e4 | core 6ca5e8f9 (+15), pulp 4319260 (+7) | none; engine→5863c25e; new elfutils-dev build dep (scripts/setup_elfutils_headers.sh) |

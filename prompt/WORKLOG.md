@@ -10,9 +10,8 @@
 
 ## 2026-06-08 — Pull upstream: rebase dev branches + engine bump + elfutils build dep
 
-**Status:** rebased + build-verified + parent committed locally. **Dev-branch force-push to the
-forks DEFERRED** (it would publish the 06-04 commits the user asked to keep local — awaiting
-go-ahead). Recovery SHAs: core `edfc99d2`, pulp `cd04829`, engine `a6d92918`.
+**Status:** rebased + build-verified + parent committed locally + **dev branches pushed to the
+forks** (`--force-with-lease`). Recovery SHAs: core `edfc99d2`, pulp `cd04829`, engine `a6d92918`.
 
 **What.** Pulled the latest upstream into both dev branches.
 - Synced fork views from real `gvsoc/gvsoc-{core,pulp}` (fetch upstream): core/master 15
@@ -42,8 +41,9 @@ the stale parent pointers — so the parent pointer bump below must precede any 
 (new) + `CLAUDE.md` (elfutils build-env note) + this log. Submodule working trees: rebased
 (content of the cache files unchanged → objects identical → calib unaffected).
 
-**Open:** force-push core/pulp `insitu-cache` to the forks (`--force-with-lease`) — publishes
-the rebase + the 06-04 commits; awaiting go-ahead. Parent `main` stays local per the
+**Pushed (2026-06-08):** core `insitu-cache` `6347ea65→9364002e` (forced), pulp `f80254b→b8d08e4`
+(forced); fork `master` refs fast-forwarded to upstream (core `26c86fd4→6ca5e8f9`, pulp
+`abcddd6→4319260`). Remote == local verified. Parent `main` stays local per the
 submodules-only-push preference.
 
 ---
