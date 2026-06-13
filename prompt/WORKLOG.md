@@ -8,6 +8,38 @@
 
 ---
 
+## 2026-06-13 — Phase-B fix #4 (scalar bypass) + fix #2 (same-cycle MSHR-drain coalescing)
+
+**Status:** committed in `core` `49c377d9` (continuation of the real-kernel alignment work; fix #1
+was pushed earlier as `37982db9`). Both are RTL-faithful refinements with marginal real-trace
+impact; the dominant gemv/fdotp residual remains the open-loop refill cascade (not a cache-model
+fix — see `insitu_cache_realkernel_alignment_2026-06-12.md` §6/§8).
+
+**Fix #4 (APPLIED) — scalar bypass port.** The Snitch scalar request goes through the RTL 2:1
+`reqrsp_xbar`, not the VLSU coalescer: a read hit returns ~3 cy and doesn't contend for the per-set
+bank. New `controller.scalar_bypass_port` / `scalar_hit_latency_cycles`, fed by an
+`interco.forward_initiator` knob that tags each forwarded req with its input-port index (via
+`IoReq::set_initiator(int)`, V1 io.hpp). All three default OFF → Spatz path byte-identical; calib
+DUT sets port=4, latency=3. Trims the scalar-port Δ but it's a minor fraction of each kernel mean.
+
+**Fix #2 (APPLIED) — same-cycle MSHR-drain coalescing.** The `par_coalescer` merges same-cycle
+same-line reads into one entry, so they retire together. `fsm_drain_mshr` now advances the
+per-subarray stagger only when a pending reader's `arrival_cycle` differs from the previous one,
+not once per reader. Correct RTL behaviour but **zero measured impact** on these traces (few
+same-cycle same-line readers survive to the drain). Kept as a harmless refinement.
+
+**Result (mean per-access latency Δ vs RTL):** fmatmul M32 +27.0→**+26.5**, fft +34.7→**+34.6**,
+fdotp +75.0 (flat), gemv +76.1 (flat). **Synthetic regression fully unchanged** — microbench 7
+lines, cold_stream wide 0.254, evict wide 0.166, warm_stream 7/7, coal_cold 0.496, warm_hit 10,
+cold_miss 67.
+
+**Files.** core (`49c377d9`): `insitu_cache_config.py` (+scalar_bypass_port, +scalar_hit_latency_cycles,
++interco.forward_initiator; calib config wires port=4/lat=3), `insitu_cache_controller.{py,cpp}`
+(is_scalar branch + arrival-cycle-aware drain stagger), `insitu_cache_interco.{py,cpp}`
+(forward_initiator tagging). parent: `insitu_cache_realkernel_alignment_2026-06-12.md` §8, this log.
+
+---
+
 ## 2026-06-08 (later) — Phase-B fix #1: pipelined-bank set_busy (real-kernel hit-inflation)
 
 **Status:** fix #1 implemented + verified (ready to commit). Fix #3 attempted + reverted. Fixes

@@ -128,7 +128,7 @@ impact for the first time.
 
 ---
 
-## 8. Phase-B fixes — applied / attempted (2026-06-08)
+## 8. Phase-B fixes — applied / attempted (2026-06-08 fix #1/#3; 2026-06-13 fix #4/#2)
 
 ### Fix #1 — pipelined-bank `set_busy` (APPLIED, kept)
 New `bank_accept_cycles` knob (default 1): the per-set bank-busy stamp now advances by the bank
@@ -169,9 +169,33 @@ regenerates injection from data dependencies, or (b) the heavy deferred-completi
 (repeatedly NO-GO). It is the recurring hard residual, now understood to be partly inherent to
 open-loop replay.
 
-### Fixes #2 (structural coalescer) and #4 (scalar bypass) — scoped, not applied
-Both are secondary: the discriminator showed relaxing the coalescer does not move the dominant
-residual, and the scalar offset (after fix #1) is a small fraction of the per-kernel mean. They
-would trim the per-port `+1/port` MSHR-drain ordering and the scalar `7→3`/`67→60` offsets
-(helping the hit-bound kernels modestly) but neither addresses the gemv/fdotp refill cascade.
-Left as clean follow-ups.
+### Fix #4 — scalar bypass port (APPLIED, kept)
+The Snitch scalar request goes through the RTL 2:1 `reqrsp_xbar`, not the VLSU coalescer: a read
+hit returns in ~3 cy and does not contend for the per-set bank. Modelled with a new
+`controller.scalar_bypass_port` / `scalar_hit_latency_cycles` pair, fed by an
+`interco.forward_initiator` knob that tags each forwarded request with its input-port index. All
+three default OFF (Spatz path byte-identical); the calib DUT sets port=4, latency=3. Effect on the
+real traces is small — the scalar-port Δ is trimmed but it is a minor fraction of each kernel's
+mean (after fix #1 the dominant residual is VLSU refill timing, not the scalar). Synthetic
+regression fully unchanged.
+
+### Fix #2 — same-cycle MSHR-drain coalescing (APPLIED, kept)
+The `par_coalescer` merges same-cycle same-line reads into one entry, so they retire together. The
+drain loop now advances the per-subarray stagger only when a pending reader arrived in a *later*
+cycle than the previous one, rather than once per pending reader. This is the correct RTL behaviour
+but **zero measured impact** on these traces (the per-controller trace files rarely have multiple
+same-cycle same-line readers surviving to the MSHR drain). Kept as a harmless, RTL-faithful
+refinement; clearly noted as non-moving on the current dataset.
+
+### Result with fix #1 + #4 + #2 (mean per-access latency Δ, cycles)
+| kernel | meanΔ #1 only | meanΔ #1+#4+#2 |
+|---|---|---|
+| fmatmul M32 | +27.0 | **+26.5** |
+| fft M1024 | +34.7 | **+34.6** |
+| fdotp M8192 | +75.0 | +75.0 |
+| gemv M512 | +76.1 | +76.1 |
+
+Fixes #4/#2 are correct refinements that nudge the hit/scalar-bound kernels and leave the
+memory-latency-bound ones (gemv, fdotp) untouched — consistent with §6/§7: the gemv/fdotp residual
+is the open-loop refill cascade, **not** a pure cache-model defect. No further pure-cache fix is
+expected to move it; closing it needs a closed-loop injection model (a) above.
