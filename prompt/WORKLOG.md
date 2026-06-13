@@ -8,6 +8,51 @@
 
 ---
 
+## 2026-06-13 (later) — Phase-B fix #5: per-cycle output arbitration (THE hit-latency lever)
+
+**Status:** committed — core `6362b3da`, pulp `f0706bc` (local; not yet pushed). This is the
+big real-kernel alignment result: it closes 85–97% of the per-access latency gap on 4 of 5
+kernels. Driven by taking the §6 "fix the hit-path serialization" item.
+
+**Diagnosis.** A latency-component discriminator (env-gate each queue-wait term, re-measure fft —
+whose misses align so shared paths are isolable) pinned the residual on the **interco output
+arbitration**, NOT the per-set bank: removing the bank wait moved fft by 0.1 cy; removing the
+output wait collapsed it +36.7 → +3.9. This overturned the prior abstract hypothesis (set_busy)
+*and* the §8 "gemv is inherent cascade" conclusion.
+
+**Root cause.** `output_busy_until_` was a monotonic per-output busy-until cyclestamp — it
+accumulates across cycles, modelling sustained 1/cyc backpressure. Correct for CLOSED-LOOP (Spatz:
+the core stalls on the returned latency) but DOUBLE-COUNTS in open-loop replay, where the trace's
+t_issue already encodes the RTL's cross-cycle backpressure → ~+33 cy phantom hit inflation.
+
+**Fix.** New `per_cycle_output_arb` interco mode: reset the accept counter each cycle, serialize
+only genuinely same-cycle requests (`output_accept_width`/cyc, default 1). Mode tracks the trace's
+**injection semantics**: default accumulate (Spatz + max-rate synthetic phases that rely on
+accumulate backpressure for saturated throughput); per-cycle for real-kernel replay (opt-in via
+`INSITU_CALIB_PER_CYCLE_ARB=1`, set by the replay tool).
+
+**Result (clean sequential before→after, mean Δ vs RTL):** fmatmul M32 26.5→**3.9**, fft 34.6→
+**3.2**, fmatmul M128 62.7→**6.4**, gemv 76.1→**2.6**, fdotp 75.0→**21.1**. Hit Δ now +0.3…+4.5
+on EVERY kernel. fdotp's hit path is exact (+0.3); its whole residual is the miss-path cascade
+(+62.7, unchanged) = the inherent open-loop limit. gemv → +2.6 proves it was a model defect, not
+inherent.
+
+**No regression.** Accumulate `else`-branch is byte-identical to the original → synthetic phases
+(coal_cold 0.4961, evict 0.1659, warm_hit 10, cold_miss 67) and closed-loop microbench (7 lines:
+3.88/3.73/1.98/3.70/3.73/2.05/3.73) provably unchanged (they never set the env knob).
+
+**Methodology note.** gvsoc writes `gvsoc_config.json` into the cwd, so concurrent replay
+processes sharing one cwd race on it (±0.3 cy nondeterminism). All numbers from strictly
+sequential runs (verified reproducible).
+
+**Files.** core `6362b3da`: `insitu_cache_config.py` (+per_cycle_output_arb, +output_accept_width;
+calib config left at default + comment), `insitu_cache_interco.{cpp,py}` (two-mode arbitration).
+pulp `f0706bc`: `insitu_cache_calib/__init__.py` (env knob). parent:
+`insitu_cache_realkernel_alignment_2026-06-12.md` §9 + §8 NB + resolution banner, this log,
+`weekly_report_2026-06-15.md`.
+
+---
+
 ## 2026-06-13 — Phase-B fix #4 (scalar bypass) + fix #2 (same-cycle MSHR-drain coalescing)
 
 **Status:** committed in `core` `49c377d9` (continuation of the real-kernel alignment work; fix #1

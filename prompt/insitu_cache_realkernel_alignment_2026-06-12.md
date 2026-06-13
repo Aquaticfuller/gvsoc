@@ -1,6 +1,13 @@
 # GVSoC ↔ CachePool RTL — Real-Kernel Trace Alignment (dataset `replay_batch_2026-06-12`)
 
-**Date:** 2026-06-08.  
+> **RESOLUTION (2026-06-13, see §9):** the headline gap below is now largely **closed**. The
+> dominant residual was the interco's monotonic output-arbitration double-counting the RTL
+> backpressure in open-loop replay (NOT the per-set bank, NOT an inherent cascade for gemv). The
+> per-cycle-arbitration fix brings mean per-access Δ to **+2.6…+6.4 cy on 4 kernels** (hit Δ
+> +0.3…+4.5 everywhere); only fdotp retains a large residual (+21.1), entirely on the miss path —
+> the genuine open-loop memory-latency cascade. §§1–8 are the investigation as it unfolded.
+
+**Date:** 2026-06-08 (investigation); 2026-06-13 (§9 fix).  
 **Dataset:** `ManyRVData_rebase/reports/cache_calib/replay_batch_2026-06-12/` — per-controller
 cache request traces captured from 5 real kernels on the integrated 16-core CachePool cluster
 (`cachepool_fpu_512`, Burst=4, cache IP `93d1c11`), with the RTL's per-access answers in
@@ -196,6 +203,53 @@ refinement; clearly noted as non-moving on the current dataset.
 | gemv M512 | +76.1 | +76.1 |
 
 Fixes #4/#2 are correct refinements that nudge the hit/scalar-bound kernels and leave the
-memory-latency-bound ones (gemv, fdotp) untouched — consistent with §6/§7: the gemv/fdotp residual
-is the open-loop refill cascade, **not** a pure cache-model defect. No further pure-cache fix is
-expected to move it; closing it needs a closed-loop injection model (a) above.
+memory-latency-bound ones (gemv, fdotp) untouched. **NB (superseded by §9):** at this point we
+believed the gemv residual was the open-loop refill cascade. The §9 re-measurement disproves that
+for gemv — it was a pure-model defect (interco output arbitration) and IS fixable.
+
+## 9. Fix #5 — per-cycle output arbitration (APPLIED, the big lever) — 2026-06-13
+
+A latency-component discriminator (env-gating each queue-wait term and re-measuring fft, whose
+misses align so the shared paths are isolable) pinned the dominant residual on the **interco
+output arbitration**, not the per-set bank (removing the bank wait changed fft by 0.1 cy; removing
+the output wait collapsed it from +36.7 to +3.9).
+
+**Root cause.** `output_busy_until_` was a *monotonic* per-output busy-until cyclestamp: under
+sustained streaming it runs tens of cycles ahead of `now`, charging every request a growing
+queue-wait. That models cross-cycle 1/cyc backpressure — correct for CLOSED-LOOP (Spatz, where the
+core actually stalls on the returned latency) but **double-counted in open-loop replay**: the
+trace's `t_issue` already encodes the RTL's cross-cycle backpressure (the core was throttled when
+the cache couldn't accept), so re-applying it inflates hit latency ~+33 cy.
+
+**Fix.** Add a second arbitration mode, `per_cycle_output_arb` (interco): reset the accept counter
+each cycle and serialize only genuinely *same-cycle* requests (`output_accept_width` per cycle,
+default 1) — which the trace's per-access latency *does* reflect. The mode is selected by the
+trace's **injection semantics**, not the DUT:
+- **default (accumulate)** — closed-loop (Spatz) and the synthetic phase traces, which inject at
+  max rate and rely on accumulate-mode backpressure for their saturated-throughput metrics.
+- **per-cycle** — real-kernel replay (opt-in via `INSITU_CALIB_PER_CYCLE_ARB=1`), pre-throttled
+  `t_issue`.
+
+**Result (clean sequential before→after, mean / hit / miss Δ vs RTL):**
+
+| kernel | base mean (hit/miss) | fix mean (hit/miss) | gap closed |
+|---|---|---|---|
+| fmatmul M32 | 26.5 (26.8/23.1) | **3.9** (3.3/9.8) | 85% |
+| fft M1024 | 34.6 (36.7/3.3) | **3.2** (4.1/−10.8) | 91% |
+| fmatmul M128 | 62.7 (65.1/42.9) | **6.4** (4.5/21.7) | 90% |
+| gemv M512 | 76.1 (104.1/16.7) | **2.6** (0.9/6.1) | 97% |
+| fdotp M8192 | 75.0 (81.3/62.2) | **21.1** (0.3/62.7) | 72% |
+
+The hit Δ collapses to **+0.3…+4.5** on every kernel. gemv (the worst) → +2.6 **proves** §8's
+"inherent cascade" attribution wrong — it was the interco arbitration. fdotp's hit path is now
+exact (+0.3); its entire residual is the **miss-path** memory-latency cascade (+62.7, unchanged) —
+the genuine open-loop limit (§6 fix (a), needs a closed-loop injection model). The mixed-sign
+small miss deltas on the other kernels (−10.8…+21.7) are the new dominant — but minor — error.
+
+**No regression:** the accumulate `else`-branch is byte-identical to the original code, so the
+synthetic phases (coal_cold 0.4961, evict 0.1659, warm_hit 10, cold_miss 67, …) and the closed-loop
+microbench (7 lines unchanged) are provably untouched — they never set the env knob.
+
+> Methodology note: gvsoc writes `gvsoc_config.json` into the working dir, so concurrent replay
+> processes sharing one cwd race on it (±0.3 cy of nondeterminism). All numbers above are from
+> strictly **sequential** runs (verified reproducible).
