@@ -8,6 +8,46 @@
 
 ---
 
+## 2026-06-08 — Pull upstream: rebase dev branches + engine bump + elfutils build dep
+
+**Status:** rebased + build-verified + parent committed locally. **Dev-branch force-push to the
+forks DEFERRED** (it would publish the 06-04 commits the user asked to keep local — awaiting
+go-ahead). Recovery SHAs: core `edfc99d2`, pulp `cd04829`, engine `a6d92918`.
+
+**What.** Pulled the latest upstream into both dev branches.
+- Synced fork views from real `gvsoc/gvsoc-{core,pulp}` (fetch upstream): core/master 15
+  behind, pulp/master 7 behind, both 0 ahead (clean ff).
+- Rebased `insitu-cache` onto `upstream/master` in each: **no conflicts** — all 6 core + 7 pulp
+  cache commits replayed. core `edfc99d2→9364002e`, pulp `cd04829→b8d08e4`. Local `master`
+  refs fast-forwarded to upstream.
+- **Engine bump `a6d92918→5863c25e`** (origin/main, +15): required — upstream core
+  `iss/iss_v2/riscv.py` now calls `Component.add_libraries(['dw','elf'])`, added to the engine
+  in `a3d410b4`. (Error before bump: `'SnitchFast' object has no attribute 'add_libraries'`.)
+- **New upstream build dep — elfutils headers.** Upstream `e1346286/33945126` made the ISS
+  trace resolve PC→symbol via libdw (`<elfutils/libdwfl.h>` + `add_libraries(['dw','elf'])`).
+  The host (AlmaLinux 8) has the runtime libs but not `elfutils-devel`, no passwordless sudo.
+  Resolved without sudo: `scripts/setup_elfutils_headers.sh` dnf-downloads the matching
+  `elfutils-devel-0.190` RPM into gitignored `third_party/elfutils-devel/`, extracts the headers,
+  and makes the missing `libdw.so` link symlink. Build exports `CPATH` (include) + `LIBRARY_PATH`
+  (link). Documented in CLAUDE.md "Build environment". (User-approved: provide elfutils-dev.)
+
+**Verification.** `make build TARGETS="insitu_cache_calib insitu_cache_microbench
+spatz:use_insitu_cache=True rv64"` clean (exit 0) with `CPATH`/`LIBRARY_PATH` set. Calibration
+**byte-identical post-rebase**: warm hit 10, cold miss 67 (BL4) / 63 (wide), coal_cold wide
+0.496 (mem_rd 32), cold_stream wide 0.254, coal_warm 3.37/lat 7, microbench hit_repeat_r4 1.98.
+Used `make build` (NOT `make all`, which would `git submodule update` and reset the rebase to
+the stale parent pointers — so the parent pointer bump below must precede any `make all`).
+
+**Files / pointers.** parent: submodule bumps core/pulp/engine + `scripts/setup_elfutils_headers.sh`
+(new) + `CLAUDE.md` (elfutils build-env note) + this log. Submodule working trees: rebased
+(content of the cache files unchanged → objects identical → calib unaffected).
+
+**Open:** force-push core/pulp `insitu-cache` to the forks (`--force-with-lease`) — publishes
+the rebase + the 06-04 commits; awaiting go-ahead. Parent `main` stays local per the
+submodules-only-push preference.
+
+---
+
 ## 2026-06-04 (later) — Streaming read-hit pipelining: latency 10 → 7
 
 **Status:** implemented + verified (regression-clean); committed — core `edfc99d2`,

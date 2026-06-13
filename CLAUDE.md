@@ -200,6 +200,19 @@ Needed pip packages for Python 3.12: `typing_extensions prettytable rich pexpect
 pycryptodome ppk2_api pyelftools psutil lz4 setuptools<81 numpy pandas matplotlib mako
 hjson jsonref`.
 
+**elfutils headers (since the 2026-06 upstream pull).** Upstream's ISS now resolves trace
+PC→symbol at runtime via libdw (`core/models/cpu/iss*/src/trace.cpp` includes
+`<elfutils/libdwfl.h>`; `riscv.py` calls `add_libraries(['dw','elf'])`, which needs engine
+`Component.add_libraries()` — engine ≥ `a3d410b4`, i.e. the bumped engine pointer). The ETH
+cluster ships the runtime libs (`libdw.so.1`/`libelf.so.1`) but **not** `elfutils-devel`, and
+there's no passwordless sudo. Provide the headers + the missing `libdw.so` link symlink
+**without sudo** via `scripts/setup_elfutils_headers.sh` (dnf-downloads the matching
+`elfutils-devel` RPM into the gitignored `third_party/elfutils-devel/` and extracts just the
+headers). Then export what it prints before building:
+`eval "$(scripts/setup_elfutils_headers.sh --env)"` → sets `CPATH` (include search) and
+`LIBRARY_PATH` (link search). Without these, the iss targets fail to compile
+(`elfutils/libdwfl.h: No such file`) / link (`cannot find -ldw`).
+
 ## Development log (for weekly reports)
 
 **Standing convention (user request):** maintain a running dev log so weekly
