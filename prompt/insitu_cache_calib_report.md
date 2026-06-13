@@ -565,3 +565,42 @@ need co-tuning to avoid overshooting 0.467 (lat and thr are themselves coupled i
 throughput already matched) does not justify the regression risk to the exactly-matched
 cold_stream/evict and the delicate MSHR path. Workflows: `wuw0hl7ph` (first NO-GO),
 `w4ohzna7g` (3-round design↔verify loop).
+
+## 14. Alignment check vs RTL `run_2026-06-12` (post-upstream-pull, 2026-06-08 tree)
+
+Re-verified the model against the **latest** RTL reference,
+`ManyRVData_rebase/reports/cache_calib/run_2026-06-12` (BurstLength=1; DUT `93d1c11`). The RTL
+run's own REPORT.md states it is **cycle-identical to the Jun-3 `char_bl1` baseline across all 20
+phases × 4 MemLatency points (0 mismatches)** — the committed RTL timing-opt batch is
+performance-neutral, so the reference numbers are unchanged from those the model was calibrated
+to. This is therefore a *post-upstream-pull re-confirmation*, not a new calibration. Verdict
+(independent GVSoC re-measure + RTL re-parse + adversarial audit, workflow `wwvh8r7bx`):
+**ALIGNED-CONFIRMED — every number reproduced on both sides; no regression from the pull.**
+
+GVSoC wide mode (`INSITU_CALIB_WIDE_REFILL=1` = Burst=1), per-phase vs RTL:
+
+| phase | GVSoC | RTL | Δ |
+|---|---|---|---|
+| warm_hit isolated lat | 10 | 10 | exact |
+| streaming hit lat (warm_stream/bw_hit_gap0/coal_warm) | 7 | 7 | exact |
+| warm_write isolated / raw_same_word lat | 8 / 7 | 8 / 7 | exact |
+| cold_miss latency, L10/50/100/200 | 23/63/113/213 | 23/63/113/213 | exact (ML+13) |
+| coal_warm thr / lat | 3.37 / 7 | 3.28 / 7 | +2.6% / exact |
+| bw_hit gap1/3/7 thr | 0.478/0.244/0.125 | 0.467/0.243/0.124 | ≤2% |
+| bw_hit gap latency gradient (gap0/1/2/3/7) | 7/8/9/10/10 | 7/8/–/10/10 | exact (gap2 = unvalidated interp) |
+| warm_write_stream thr | 0.478 | 0.489 | −2.2% |
+| cold_stream thr, L10/50/100/200 | 0.302/0.254/0.201/0.123 | 0.243/0.243/0.183/0.118 | +24% @L10, ≤10% L≥50 |
+| coal_cold thr, L10/50/100/200 | 0.587/0.496/0.416/0.314 | 0.618/0.467/0.431/0.322 | ≤6.2% across sweep |
+| coal_cold mem_rd / evict mem_rd,wr | 32 / 2048,1024 | 32 / 2047,1054 | match |
+| evict_dirty thr | 0.166 | 0.177 | −6% |
+
+**Residuals (all pre-documented in §10–§13 / WORKLOG — none introduced by the pull):**
+saturation single-port hit ceiling (~0.91 vs 0.865, gap≥1 exact); coal_cold per-access latency
+(ML+96 vs RTL ML+28) and peak-outstanding (GV ~128 vs RTL ramp 28/56/88/128) — the coupled
+NO-GO item (§13); evict outstanding (32 vs 4) and write-allocate latency (GV writes 190 / reads
+285 vs RTL 18 / 98 — write-early-ack-on-miss + miss-latency inflation, §9.1/§10); cold_stream
+low-ML bank-contention plateau (+24% @L10). **Coverage gaps** (RTL phases with no GVSoC trace,
+not model issues): `bw_hit_1/2/3port` port-scaling (0.615/0.762/0.828), `mshr_depth_1p`
+(128-access). **Trace-scenario artifact:** GVSoC coal_warm/coal_cold `mem_rd` counts the
+standalone preload and coal_cold `mem_wr=0` (RTL `mem_wr=32` is its shared-TB pre-dirty history,
+§13). The 2026-06-08 upstream pull left the calibration byte-identical (WORKLOG 2026-06-08).

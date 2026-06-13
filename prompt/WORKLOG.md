@@ -8,6 +8,33 @@
 
 ---
 
+## 2026-06-08 (later) — Alignment check vs RTL run_2026-06-12 → ALIGNED-CONFIRMED
+
+**Status:** assessment only (doc update: calib report §14). No code change.
+
+**What.** Verified the model still works post-upstream-pull and re-checked alignment against the
+latest RTL reference `ManyRVData_rebase/reports/cache_calib/run_2026-06-12` (BurstLength=1, DUT
+`93d1c11`). Model smoke + full wide-mode sweep ran clean. The RTL run's REPORT.md states it is
+**cycle-identical to the Jun-3 char_bl1 baseline (0 mismatches, 20 phases × 4 ML)** — the RTL
+timing-opt batch is performance-neutral, so the reference is unchanged from the calibration
+baseline; this is a post-pull re-confirmation.
+
+**Result — ALIGNED-CONFIRMED** (independent GVSoC re-measure + RTL re-parse + adversarial audit,
+workflow `wwvh8r7bx`, 3 agents). Every number reproduced exactly on both sides. Throughputs +
+headline latencies match within tolerance: warm hit 10, streaming 7, write 8, RAW 7, cold-miss
+ML+13 exact across the sweep; coal_warm 3.37 vs 3.28; coal_cold thr ≤6.2% across the full ML
+sweep; cold_stream ≤10% (L≥50); evict ~6%; memory traffic matches. All divergences are the
+**pre-documented residuals** (saturation hit ceiling, coal_cold latency/out shape, evict out +
+write-allocate latency, cold_stream low-ML plateau) — **none introduced by the 2026-06-08 pull**
+(calib byte-identical). Coverage gaps (no model issue): `bw_hit_1/2/3port`, `mshr_depth_1p` have
+no GVSoC trace. Audit nits (cosmetic): a "≤6%" bucket header understated 4 cells (in-line figures
+correct); CLAUDE.md's ML+17 cold-miss headline is the Burst=4 default (Burst=1 here is ML+13, as
+the calib report already notes). Full table: calib report §14.
+
+**Files.** `prompt/insitu_cache_calib_report.md` (§14), `prompt/WORKLOG.md`.
+
+---
+
 ## 2026-06-08 — Pull upstream: rebase dev branches + engine bump + elfutils build dep
 
 **Status:** rebased + build-verified + parent committed locally + **dev branches pushed to the
