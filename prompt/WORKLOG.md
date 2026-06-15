@@ -8,6 +8,45 @@
 
 ---
 
+## 2026-06-15 20:59 +0200 — Phase-2 increment 1: per-core controller cardinality (gated, default-off)
+
+**Status:** committed — core `d821214b`, pulp `b88f878` (pushed force-with-lease to forks); parent
+pointer bumped locally. First Phase-2 (topology) step. Approach from a 3-strategy design workflow +
+adversarial review (verdict GO-WITH-FIXES); chose Strategy 1 (per-core cardinality first).
+
+**Why pivot from Phase-1 front-end increments:** after inc1 (par_coalescer), the remaining P1
+front-end micro-steps were found to be open-loop-neutral and/or topology-entangled (response-split is
+a no-op since the RTL splits in ~1 cyc; scalar-bypass/single-wide need the per-core structure;
+miss-coalesce duplicates the controller MSHR). The design workflow verified the model's address
+routing is ALREADY RTL-faithful, and the model is wrong in two separable ways: (1) cardinality
+(num_controllers fixed at 4 vs RTL one-cache-per-core), (2) one monolithic arbitration domain vs RTL's
+per-port-class xbars. Phase-2 fixes these and unlocks closed-loop cycle comparison (the real goal).
+
+**What (inc1).** `InsituCacheTileConfig.controllers_track_cores` (default **False**). When on, the
+cluster site (`snitch_cluster.py`) sets `num_controllers = nb_core` — one L1 cache per core (RTL
+`NumL1CacheCtrl = NumCores`, `cachepool_pkg.sv:121`), instead of the factory's fixed 4. Power-of-two
+`nb_core` asserted (the interco routes by `(addr>>dynamic_offset)&(num_outputs-1)`). No `.cpp` change —
+routing/wide-split/tile-loop already handle `num_outputs>1` generically.
+
+**Files:** core `models/cache/insitu/insitu_cache_config.py` (flag field); pulp
+`pulp/snitch/snitch_cluster/snitch_cluster.py` (set num_controllers when flag on, power-of-two guard).
+
+**Verification (full build+install):**
+- Default-off (committed): fmatmul-M32 3.9, coal_cold 0.4961, vfadd 15/15 cyc=58001 — byte-identical
+  (calib uses a separate single-controller factory; flag read only at the cluster site).
+- Flag-on @nb_core=2 (temp flip in the production factory, then reverted): interco elaborates
+  **N=10 M=2** (2 per-core controllers, `ctrl_0`+`ctrl_1`), vfadd **retval=0** (passes). Cycle count
+  unchanged at 58001 because vfadd isn't bank-contention-bound — a correctness test, not a
+  discriminating benchmark; the topology effect needs a contention kernel + the RTL reference.
+
+**Caveats / follow-ups:** per-controller capacity is NOT yet RTL-scaled (total tile capacity tracks
+controller count) → Phase-2 inc3. The diffable closed-loop number needs (a) the per-port-class xbars
+(inc2), (b) capacity scaling (inc3), and (c) an **RTL single-tile reference cycle count** (`cachepool_1t.mk`,
+BurstLength=4 regime) — which requires an RTL sim run (outside this environment; flagged as inc0, a
+user/RTL-sim task). Structure map: `prompt/insitu_cache_structure_map_2026-06-15c.md`.
+
+---
+
 ## 2026-06-15 20:22 +0200 — Phase-1 increment 1: structural par_coalescer (gated, default-off)
 
 **Status:** committed — core `040fdef3` (pushed force-with-lease to fork); parent pointer bumped
