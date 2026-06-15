@@ -8,6 +8,69 @@
 
 ---
 
+## 2026-06-15 14:17 +0200 — Closed-loop Spatz bring-up: cache runs vfadd end-to-end; open-loop regression fixed
+
+**Status:** committed — core `3d712809`, pulp `d8abb08` (pushed force-with-lease to forks;
+parent pointer bumped locally, not pushed). Files: core `models/cache/insitu/{insitu_cache_controller.cpp,
+insitu_cache_controller.py,insitu_cache_interco.cpp,insitu_cache_config.py,insitu_cache_tile.py}`,
+pulp `pulp/snitch/snitch_cluster/snitch_cluster.py`.
+
+**What.** Made the InSitu cache work CLOSED-LOOP on `--target=spatz --target-property
+use_insitu_cache=True` — `examples/spatz/test-riscvTests-vfadd` now PASSES all 15 TCs
+(`retval=0, cycles=58001`), where it previously hung at boot.
+
+**Why it hung (4-bug cascade, all fixed; gated to the cluster config):**
+1. *No data modelling* — cache was a pure timing overlay; every load returned garbage → program
+   derailed into a bogus HTIF syscall (router livelock). Added per-line `line_data_` flat store +
+   `exchange_line_data()` (serve reads / apply writes / install refills), all gated behind
+   `carry_data_ = inline_sync_miss_ || functional_writethrough_`.
+2. *Write-back invisible to HTIF backdoor* — `functional_writethrough`: every write also pushes its
+   real bytes straight to backing memory (via the evict port) so the ISS/HTIF backdoor reader sees
+   them.
+3. *Refill-address rewrite deadlock* — `wide_axi` rewrites the refill req addr in place
+   (subtract remove_offset); `refill_resp_handler` re-decoded set/tag from the mutated addr → never
+   matched the pending line → MSHR never drained. Fixed: stash `pending_refill_addr_`.
+4. *LSU synchronous-slave protocol* — spatz uses the **v1 ISS** (`iss/`, NB_OUTSTANDING off); all 3
+   snitch LSUs accept only synchronous `IO_REQ_OK` (PENDING/DENIED fatal; re-entrant resp() aborts).
+   `inline_sync_miss`: misses that resolve synchronously complete INLINE (return OK like a hit, no
+   park/resp); write-commit backpressure → ADDED LATENCY instead of DENIED.
+
+**The actual data bug (not DMA/flush):** wide-access spanning. The interco interleaves controllers
+at 4-byte granularity (`dynamic_offset=2`, bits[3:2] WITHIN the line), so an 8-byte memcpy store
+routed wholesale to ctrl0 left ctrl1's copy of the upper word stale. Fix: interco now SPLITS an
+access crossing the granule, routing each byte-range to its owning controller (gated
+`num_outputs_>1` → calib with `num_outputs=1` is byte-identical). vfadd is cache-unaware, so the
+split alone fixes it. A flush/invalidate (`flush_all()` + `i_FLUSH` ports, tile `i_FLUSH(ctrl)`) is
+implemented cache-side but DORMANT (not wired to the cluster L1D peripheral) — kept for future
+cache-aware DMA-staging kernels.
+
+**Open-loop regression — ROOT-CAUSED & FIXED (this was the commit blocker).** The uncommitted work
+regressed calib (fmatmul M32 +3.9→+7.5, coal_cold 0.4961→0.6531) deterministically. Cause:
+`make_cachepool_512_config()` (the shared base factory) set `inline_sync_miss=True` /
+`functional_writethrough=True`, and the open-loop calib config DERIVES from it
+(`make_cachepool_512_calib_config()` → `cfg = make_cachepool_512_config()`), inheriting the flags.
+With `inline_sync_miss=True` the calib miss path took the inline-completion branch that stamps
+`refill_lat` directly and never calls `reserve_install_pipe`, so the `defer_refills` occupancy
+serialization (§10) was bypassed → miss throughput/latency inflated to the pre-occupancy numbers.
+(The earlier inspection-bisect was blind because the *installed* `.py` under `install/generators/`
+was never refreshed during quick `.so`-only rebuilds — the run always saw the stale True flags.)
+**Fix (Option B):** the two flags are DRIVER/integration flags, not cache geometry — removed them
+from the base factory (left at field default False, so calib/conventional/legacy all inherit the
+calibrated path) and set them explicitly at the closed-loop cluster site (`snitch_cluster.py`,
+which always needs them: the LSU protocol requires a synchronous slave + functional coherence).
+
+**Verification (clean full build `make all TARGETS="insitu_cache_calib spatz:use_insitu_cache=True"`):**
+- Open-loop calib: fmatmul M32 mean Δ **3.9** (hit +3.3), coal_cold wide @ML50 **0.4961** — both
+  exactly the fix #5 targets.
+- Closed-loop: vfadd all 15 TCs PASSED, `retval=0 cycles=58001`.
+- No temp diagnostics left in the C++; `defer_refills=False` (Spatz default) path untouched.
+
+Related: `prompt/insitu_cache_calib_report.md §10` (occupancy model), `[[insitu-cache-closedloop-state]]`,
+`[[insitu-cache-gap-state]]`. Open follow-up: closed-loop cycle comparison vs RTL needs geometry
+reconciliation (GVSoC spatz ≈ 4-core vs RTL 16-core CachePool traces).
+
+---
+
 ## 2026-06-13 (later) — Phase-B fix #5: per-cycle output arbitration (THE hit-latency lever)
 
 **Status:** committed — core `6362b3da`, pulp `f0706bc` (local; not yet pushed). This is the
