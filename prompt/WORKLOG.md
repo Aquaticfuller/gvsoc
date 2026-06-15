@@ -8,6 +8,83 @@
 
 ---
 
+## 2026-06-15 20:22 +0200 — Phase-1 increment 1: structural par_coalescer (gated, default-off)
+
+**Status:** committed — core `040fdef3` (pushed force-with-lease to fork); parent pointer bumped
+locally. First implementation step of the dev-plan Phase 1 (structural per-core cache refactor).
+Approach chosen via a 3-strategy design workflow + adversarial calibration/Spatz-safety review; user
+picked "build P1 at the par_coalescer."
+
+**What.** Added `InsituCacheParCoalescer` (`insitu_cache_par_coalescer.{cpp,py}`) — a standalone
+per-controller front-end that is the structural extraction of the interco's inline
+`enable_input_coalesce` window: same-cycle/same-line read merge (followers inherit the leader's warm-
+hit latency, return OK, no re-forward, no accept slot) + output-accept arbitration + interco_latency.
+Gated by `InsituCacheTileConfig.use_structural_coalescer` (default **False**). When on, the interco
+becomes a pure address router via a new `defer_to_coalescer` flag (skips merge+arb+latency, just
+routes), and the tile inserts one par_coalescer between each interco output and its controller.
+
+**Why this placement.** The merge and the output-arb must move *together* (a merged follower must not
+consume an interco accept slot); so the interco's per-output body was relocated wholesale into the
+coalescer, fed by a route-only interco — reproducing the calibrated numbers by construction.
+
+**Files:** core `models/cache/insitu/`: `insitu_cache_par_coalescer.{cpp,py}` (new),
+`insitu_cache_interco.{cpp,py}` (defer_to_coalescer router gate), `insitu_cache_config.py`
+(`InsituCacheParCoalescerConfig` + tile `use_structural_coalescer` + interco `defer_to_coalescer`),
+`insitu_cache_tile.py` (structural wiring). No pulp change.
+
+**Verification (full build+install of calib + spatz):**
+- Default-off (committed): fmatmul-M32 mean-Δ **3.9**, coal_cold wide@ML50 **0.4961**, vfadd **15/15
+  cyc=58001** — byte-identical (interco path unchanged; component not instantiated).
+- Structural-on (temp flip in calib, then reverted): **all 19 calib traces' per-access latency
+  byte-IDENTICAL** to the default interco-merge path (verified by CSV diff; incl. the coal_warm
+  same-line VLSU tail = 124×7-cyc + 4×10-cyc merged hits). Proves the extraction is faithful — the
+  par_coalescer merge == the interco merge, exactly.
+
+**Open-loop payoff:** none expected, and none seen — by design (the dominant residual is already
+fixed/inherent; see the design-workflow finding). The value is *structural foundation* for the
+remaining Phase-1 increments and eventual closed-loop fidelity. Structure map:
+`prompt/insitu_cache_structure_map_2026-06-15b.md`. Plan: `prompt/insitu_cache_dev_plan_2026-06-15.md`.
+
+---
+
+## 2026-06-15 (later) — RTL deep-read: microarch/arch reference rewrite + gap analysis + dev plan
+
+**What.** Did a complete, verified deep read of the CachePool InSitu cache RTL (IP + cachepool
+integration, ~22k lines) and produced three docs. Driven by a 15-agent workflow (10 parallel RTL/
+model readers → 3 synthesis agents → 2 adversarial verifiers that re-checked claims against source;
+both verifiers returned **high accuracy**). No code changed — docs only.
+
+**Files (prompt/):**
+- `insitu_cache_architecture_v2.md` — **rewritten** (471→635 lines) as the authoritative RTL
+  microarchitecture+architecture reference. Tracked file (shows `M`); old version recoverable via git.
+  Added §0.1 "Verified resolutions" capturing the 8 fact-check corrections (WordWidth=32 active not 64;
+  L1BankFactor=2 hardcoded; config-512 geometry 1024/256/128/64KiB; refill burst is a line-width effect
+  at fixed 128b refill, committed=Burst4 vs uncommitted-working-tree Burst1; dynamic_offset FF reset=14
+  vs CSR resval=0; tcdm_id_remapper unused in CachePool; pseudo_dual modules live inside the wrapper;
+  cache_sync_insn has 4 modes).
+- `insitu_cache_rtl_coverage_matrix.md` — **replaced** (was 2026-06-08; old backed up to
+  /tmp/coverage_matrix_2026-06-08.bak) with the RTL-vs-GVSoC gap analysis (arch + microarch + full
+  matrix). Untracked.
+- `insitu_cache_dev_plan_2026-06-15.md` — **new** phased GVSoC dev plan (Phase 0 done → Phase 1
+  structural per-core controller + par_coalescer + bypass → Phase 2 Tile/Group shared-bank substrate →
+  Phase 3 caps → Phase 4 SPM+flush/sync → Phase 5 AMO → Phase 6 bank-conflict → Phase 7 async-Spatz).
+  Untracked. Applied the verifier fix: Phase 0 re-scoped to **DONE** (closed-loop hang already fixed/
+  committed core 3d712809/pulp d8abb08; vfadd 15/15), residual closed-loop gaps reassigned to Phase 4
+  (DMA/flush) + Phase 2 (topology); resp/wt-FIFO "quick win" reworded (counters not yet wired).
+
+**Key RTL facts now documented (corrected understanding):** Group(4 tiles)→Tile(4 CC + 4 per-core L1
+ctrls)→CC; NumL1CacheCtrl=NumCores (one cache/core), fully-shared L1 via per-lane tcdm_cache_interco +
+remote ports + inter-tile xbar with register-programmable mapping + runtime bank partitioning; per-core
+ctrl = single wide-line cache + par_coalescer (equal-window CSHR, hitmap, last-writer-wins wide merge,
+rsp_spliter) + 2:1 scalar bypass reqrsp_xbar + 4-beat refill burst FSM; 7-state core FSM; 7-state
+flush/sync FSM (4 cache_sync opcodes, CheckPendDrainCycles=20); the GVSoC model is structurally v1
+(4 address-interleaved ctrls + hashed interco) and matches none of the shared-L1 substrate → Phase B.
+
+**Memory:** [[rtl-integrated-topology]] updated to point at these docs. No commit (docs; per the
+docs-stay-local convention). Related: [[insitu-cache-closedloop-state]].
+
+---
+
 ## 2026-06-15 14:17 +0200 — Closed-loop Spatz bring-up: cache runs vfadd end-to-end; open-loop regression fixed
 
 **Status:** committed — core `3d712809`, pulp `d8abb08` (pushed force-with-lease to forks;
