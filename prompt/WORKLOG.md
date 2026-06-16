@@ -8,6 +8,64 @@
 
 ---
 
+## 2026-06-16 — Structural rewrite kickoff: master plan + Step 1 (decode/encode datapath)
+
+**Direction (user):** implement EVERY microarch/arch component with the REAL RTL logic (not the
+cycle-approximate latency knobs), THEN calibrate. So the build-time gate is now functional correctness
++ structural fidelity; performance calibration is a final pass. Keep the existing calibrated model as a
+selectable parallel fallback (switch only at the cluster integration boundary).
+
+**Master plan:** `prompt/insitu_cache_structural_plan_2026-06-16.md` (from a 10-agent workflow:
+8 RTL-port readers → synth → adversarial review = SOUND-WITH-FIXES). 7-component, dependency-ordered
+build: Step0 scaffold → **Step1 decode/encode** → Step2 bank array → Step3 fwd buffer → Step4 cache core
+→ Step5 par_coalescer → Step6 xbar/bypass/SPM/sync → Step7 system composite (+DRAMSys DDR4 on refill).
+Review must-fixes folded into the plan: (1) the structural core MUST keep a **synchronous-slave mode**
+(run the per-cycle FSM internally, return OK inline) for the cluster — same constraint inline_sync_miss
+solves; (2) validate by diffing per-access data/latency vs the RTL reference dataset, not the RTL SV
+scoreboard; (3) reuse insitu_calib_mem as the Step-4 refill responder; (4) resolve FIFO depths / MRP /
+BankFactor from cachepool_cache_ctrl.sv before Step 4. (The refill-evict-fsm reader hit a transient API
+error — re-read cachepool_cache_ctrl.sv directly at Step 4.)
+
+**Step 1 DONE:** `core/models/cache/insitu/insitu_cache_decode.hpp` (committed) — a header-only,
+RTL-faithful transcription of `insitu_cache_decoder.sv` + `insitu_cache_encoder.sv`: address decode,
+the real **hash-way = lowtag^lowset** (replaces the model's Knuth-hash approximation), the SOP
+hit/hit_pend/hit_conflit/all_pend classify (status bit-encoding INVALID=0/VALID=1/READ_PEND=2/
+WRITE_PEND=3), the full-assoc LRU victim (first-credit-0 / min-LRU), the encoder LRU-credit update
+(max_lru_credit = #VALID|INVALID ways; allocate→ways-1, complete→mlc, MRU-bump), and masked byte merge.
+Pure logic, no ports/events; used by the Step-4 core. Validated standalone (g++ self-test, all checks
+pass); not yet referenced by any compiled target → zero build impact. Open follow-ups: Steps 2-7.
+
+---
+
+## 2026-06-16 ~03:00 +0200 — Miss-path diagnosis vs the new single-tile RTL reference (no code change)
+
+**Status:** diagnosis only (a temp `enable_multi_read_pend=True` experiment was run and **reverted** —
+zero effect; tree clean at P2-inc1). RTL reference received from the RTL side:
+`ManyRVData_rebase/reports/cache_calib/rtl_ref_1t_2026-06-16/` (single-tile 4-core, Burst=4; closed-loop
+mem = DRAMSys DDR4-1866, NOT MemLatency=50; per-access CSVs at ML=50 = open-loop reference).
+
+**What.** Open-loop per-access replay of 5 single-tile kernels (idotp/fmatmul/fft/fdotp/gemv) through the
+calib model, diffed vs the new RTL `.rtl.csv`. Hit path faithful (+0.2…+7.5 cy); **miss path
+over-predicts +17…+80 cy under deep saturation** (these are memory-bound; RTL per-miss latency up to
+330 cy). **Root-caused to the `max_outstanding` gap (calib_report §13):** GVSoC bounds outstanding by
+the per-port requester budget (4 VLSU × 32 = **128**) vs RTL's cache-internal cap (~**56**) → ~2× deeper
+queue → flat +40…+80 cy. NOT multi-read-pend (flipping it, verified live in the dumped config, had zero
+effect — queue is budget-bounded, not retr_fifo-bounded). The over-prediction is flat across the trace
+(steady-state queue depth, not an unbounded backup); `max_outstanding=128` confirmed in CALIB_REPORT.
+
+**Why hard:** capping outstanding at ~56 regresses the matched synthetic miss-throughput (coal_cold/
+cold_stream/evict) — the §13 coupled/NO-GO result. And the open-loop saturated latency likely
+over-states the error that matters: the real metric (closed-loop cycle count) is throughput-driven, and
+throughput IS matched (≤7%).
+
+**Recommendation (in `prompt/insitu_cache_misspath_diagnosis_2026-06-16.md`):** don't chase the open-loop
+saturation latency in isolation; validate **closed-loop** `region_cyc` vs the §D RTL table (needs DDR4
+DRAMSys on the refill path + single-tile topology + dynamic_offset≈6 + the RTL ELFs). Only model the
+per-resource MSHR cap (P3) if closed-loop cycles are off in a way attributable to outstanding depth — in
+which case ask the RTL side for per-kernel `max_outstanding` to set the cap precisely.
+
+---
+
 ## 2026-06-15 20:59 +0200 — Phase-2 increment 1: per-core controller cardinality (gated, default-off)
 
 **Status:** committed — core `d821214b`, pulp `b88f878` (pushed force-with-lease to forks); parent
