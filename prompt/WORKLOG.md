@@ -33,7 +33,16 @@ hit/hit_pend/hit_conflit/all_pend classify (status bit-encoding INVALID=0/VALID=
 WRITE_PEND=3), the full-assoc LRU victim (first-credit-0 / min-LRU), the encoder LRU-credit update
 (max_lru_credit = #VALID|INVALID ways; allocate→ways-1, complete→mlc, MRU-bump), and masked byte merge.
 Pure logic, no ports/events; used by the Step-4 core. Validated standalone (g++ self-test, all checks
-pass); not yet referenced by any compiled target → zero build impact. Open follow-ups: Steps 2-7.
+pass); not yet referenced by any compiled target → zero build impact.
+
+**Step 2 DONE:** `insitu_cache_bank_array.hpp` (core `d6d244b8`) — RTL-faithful pseudo-dual-port bank model
+(transcribes `pseudo_dual_port_tcdm_wrapper` + `pseudo_dual_port_bank.sv` + `folded_data_bank.sv`): the
+6-state R-vs-W classify, `bank_select = low log2(BankFactor) bits of the set/row`, and the **WR_CONFLICT
+penalty via a PER-CYCLE write scoreboard** (a read to the same way + same bank-select + different row
+that a write took this cycle → retry next cycle, +1) — the structural replacement for `set_busy_until_`.
+Ways are independent SRAMs (no cross-way conflict); same-row = WR_SAME_ADDR forward (no penalty); SRAM
+read latency=1. Validated standalone (classify + scoreboard + per-cycle reset all pass); header, zero
+build impact. Open: Steps 3-7 (fwd-buffer FSM, cache core, par_coalescer, xbar/SPM/sync, composite).
 
 ---
 
