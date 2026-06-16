@@ -55,11 +55,14 @@ False → the calibrated controller, byte-identical: default-off fmatmul mean-Δ
 swaps InsituCacheCore for InsituCacheController when set. Open-loop/async ONLY (the cluster keeps the
 controller until the synchronous-slave inline mode lands). **Validated:** compiles; runs synthetic
 (cold_miss/warm_stream/raw/cold_stream) + the real single-tile fmatmul t0c0 (5488 acc) with
-**data_err=0**, no hangs. KNOWN: timing uncalibrated + over-serialized (1-deep input buffer +
-1-resp/tick drain → warm_stream lat 435, cold_stream 1659) — next: pipeline concurrency + the explicit
-7-state stall enum + the fwd-buffer FSM (Step 3) + the cluster synchronous-slave mode, then calibrate.
-New config knobs: `bank_factor` (RTL L1BankFactor=2), `use_structural_core`. Open: Steps 3/5/6/7 + the
-core timing-fidelity / calibration pass.
+**data_err=0**, no hangs. **Concurrency fidelity fix (core `05e856b2`):** replaced the 1-deep input
+buffer with a bounded streaming accept queue (~NumSpatzOutstandingLoads=32) — `max_outstanding` now
+tracks the budget (3 → 34 on fmatmul t0c0, 32 on cold_stream), data_err=0. KNOWN/deferred: per-access
+latency still over-predicts (fmatmul t0c0 ~251 vs RTL ~18) = single-outstanding-refill serialization +
+the open-loop replay-backpressure double-count (the `per_cycle_arb`/fix-#5 effect) → the CALIBRATION
+phase. New config knobs: `bank_factor` (RTL L1BankFactor=2), `use_structural_core`. Open: Steps 3/5/6/7
+(fwd-buffer FSM, real par_coalescer, xbar/SPM/sync, composite + DDR4) + the cluster sync mode + the
+core timing-calibration pass.
 
 ---
 
