@@ -42,7 +42,24 @@ penalty via a PER-CYCLE write scoreboard** (a read to the same way + same bank-s
 that a write took this cycle → retry next cycle, +1) — the structural replacement for `set_busy_until_`.
 Ways are independent SRAMs (no cross-way conflict); same-row = WR_SAME_ADDR forward (no penalty); SRAM
 read latency=1. Validated standalone (classify + scoreboard + per-cycle reset all pass); header, zero
-build impact. Open: Steps 3-7 (fwd-buffer FSM, cache core, par_coalescer, xbar/SPM/sync, composite).
+build impact.
+
+**Step 4 DONE (first runnable):** `insitu_cache_core.{cpp,py}` (core `07203629`) — the RTL-faithful
+STRUCTURAL cache core: a per-cycle ClockEvent FSM (2-stage pipeline: stage-0 arbitrate {request,
+refill} → preread reg; stage-1 decode+FSM+one bank write+output drain) consuming Step-1 decode +
+Step-2 bank. REQ_PROC: read-hit / write-hit / read-hit-pend (in-situ MSHR append) / miss-allocate /
+victim dirty-writeback; single-outstanding refill install + drain of all queued readers; bank
+WR_CONFLICT → read retries next tick; functional data path. **Latency EMERGES from pipeline cycles**
+(not knobs) — calibration deferred. Gated by `InsituCacheTileConfig.use_structural_core` (default
+False → the calibrated controller, byte-identical: default-off fmatmul mean-Δ 3.9 confirmed); the tile
+swaps InsituCacheCore for InsituCacheController when set. Open-loop/async ONLY (the cluster keeps the
+controller until the synchronous-slave inline mode lands). **Validated:** compiles; runs synthetic
+(cold_miss/warm_stream/raw/cold_stream) + the real single-tile fmatmul t0c0 (5488 acc) with
+**data_err=0**, no hangs. KNOWN: timing uncalibrated + over-serialized (1-deep input buffer +
+1-resp/tick drain → warm_stream lat 435, cold_stream 1659) — next: pipeline concurrency + the explicit
+7-state stall enum + the fwd-buffer FSM (Step 3) + the cluster synchronous-slave mode, then calibrate.
+New config knobs: `bank_factor` (RTL L1BankFactor=2), `use_structural_core`. Open: Steps 3/5/6/7 + the
+core timing-fidelity / calibration pass.
 
 ---
 
