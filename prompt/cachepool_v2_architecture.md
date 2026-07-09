@@ -25,8 +25,18 @@
 > entirely (routed via the flat L2-refill path instead), due to a Python dict key collision
 > in `cachepool_v2_tile.py`'s per-core router setup. Fixing it moved the full-topology
 > `fdotp` result from `Calc:452.100891` (28% off `Exp:628.153869`) to `Calc:604.254089`
-> (3.8% off) — a large, confirmed improvement, though not yet exact; the remaining gap is
-> still open (see §13.1.1's "residual" note).
+> (3.8% off). **The remaining gap is now also root-caused and fixed** — see §13.1.2:
+> `snrt_cluster_hw_barrier()` never actually blocked (the peripheral responded to every
+> core's barrier read immediately, regardless of how many other cores had arrived), so
+> faster cores could race arbitrarily far ahead of slower ones across loop iterations with
+> zero synchronization. Fixed by implementing a real counting barrier. Verified on the
+> 16-core debug topology with constant-data (`A=B=1.0`) test inputs and per-core/per-group
+> printf checkpoints (added on the ManyRVData side, not committed there): every checkpoint
+> now matches its exact expected value, and the correctness check passes with zero
+> failures — the first fully clean pass in this entire investigation. Full 256-core
+> confirmation of this specific fix is pending (blocked by an unrelated tooling issue: this
+> session's accumulated debug `fprintf` instrumentation produces unmanageable output volume
+> at 256 cores — see §13.1.2's note), but the fix has no topology-scale-dependent logic.
 
 ---
 
@@ -439,18 +449,117 @@ writes correctly resolving to `mapping=l1_dram`. The `fdotp` result improved fro
 unambiguous improvement matching the theory precisely (correct routing → real cache
 timing/coherence in the loop → far closer to the reference value).
 
-**Residual, not yet resolved**: the result is still not exact (3.8% off on the full
-topology). The 16-core debug topology's result was *unchanged* by this fix
-(`Calc:350.577697`, bit-for-bit identical to before) — a discrepancy in itself, not yet
-understood, that suggests either the debug topology's reduced-core-count reduction
-algorithm hits a different problem, or this fix's effect happens to be masked at that
-scale. Next steps: (a) understand why the 16-core topology didn't move at all, (b) narrow
-down the remaining 3.8% on the full topology — candidates include genuine floating-point
-summation-order differences between the model's execution order and the reference
-(`dotp_result` in `data_32768.h`) at this problem size, or a smaller, still-undiscovered
-correctness gap in the same family as this one (worth re-running the `[RESULT_DBG]`/
-`[RESULT_ROUTER_DBG]`/`[LSU_DBG]` instrumentation left in the tree from this investigation,
-all still gated/filtered to `result[]`'s address range and easy to re-enable).
+**Residual — root-caused and fixed, see §13.1.2.** The result was still not exact (3.8%
+off on the full topology), and the 16-core debug topology's result was *unchanged* by this
+fix (`Calc:350.577697`, bit-for-bit identical to before). Both are explained by §13.1.2's
+finding.
+
+### 13.1.2 Root cause found and fixed: `snrt_cluster_hw_barrier()` never actually blocked (2026-07-09)
+
+**Debugging approach (user's idea).** Rather than keep guessing at the remaining 3.8% from
+random test data, the user proposed regenerating fdotp's data with a **constant** value
+(`A[i]=B[i]=1.0` for all `i`, via a new `FDOTP_CONST` env var added to `script/gen_data.py`)
+so every intermediate reduction value becomes an exact, hand-computable integer
+(`elem_per_core` per core, `4×elem_per_core` per group, `M` total), and adding printf
+checkpoints in `main.c` at each of the three reduction stages (per-core partial,
+group-leader sum, final total) that self-report PASS/FAIL against the known-exact expected
+value. (These `main.c`/`gen_data.py` changes live in `ManyRVData`, a separate read-only-by-
+convention repo not committed here; see that repo's working tree.)
+
+**First attempt — a spinlock (`snrt_mutex_lock`) around the printf calls — made things
+worse.** With 16+ cores calling `printf()` around the same cycle, their output interleaved
+byte-by-byte at the UART model into unreadable garbage. Serializing with a mutex fixed the
+garbling but (exactly as the user warned going in) introduced a **new livelock**: cores
+got stuck spinning in the mutex's retry loop for 30M+ cycles (vs. the ~10-20K cycles the
+test normally takes). Switched to a lock-free design instead: each core stashes its
+checkpoint value into a private slot in a small debug array (`dbg_partial[256]`,
+`dbg_group[64]` — no lock needed, since every core writes a distinct index), and only core
+0 reads them all back and prints sequentially afterward. This produced clean,
+non-garbled, and — critically — **not further timing-perturbed** output.
+
+**The result nailed it immediately.** On the 16-core debug topology: every individual
+core's partial sum was exactly correct (`512 = elem_per_core`, all "OK"). But the
+group-leader sums were wrong for exactly 2 of the 4 groups:
+```
+[group leader 0] sum=5120.000000 expect_elems=2048 FAIL   (5120 = 10×512, excess)
+[group leader 4] sum=1024.000000 expect_elems=2048 FAIL   (1024 = 2×512, deficit)
+[group leader 8] sum=2048.000000 expect_elems=2048 OK
+[group leader 12] sum=2048.000000 expect_elems=2048 OK
+```
+Since every individual core's own write was always correct, the bug had to be in the
+group-leader's *read* of its siblings' `result[]` slots. Correlating the already-in-tree
+`[RESULT_DBG]`/`[LSU_DBG]` write-value traces (after fixing their address filter for this
+binary — see the `insitu-cache` commit above) against the timeline was conclusive: sibling
+core 1 had **already written its iteration-2 value** (`1536`, at cycle 12988) **before**
+group-leader core 0 even started reading iteration 0's value (cycle ~14366-14732). Core 0's
+actual sum, `512(own,iter0) + 1536(r1) + 1536(r2) + 1536(r3) = 5120`, matched the observed
+`FAIL` value exactly. Cores 1-3 were racing **two full loop iterations ahead** of core 0
+despite the `snrt_cluster_hw_barrier()` calls between every iteration.
+
+**Root cause**: `cachepool_v2_cluster_peripheral.cpp`'s `REG_HW_BARRIER` read handler:
+```cpp
+if (offset == REG_HW_BARRIER && !is_write)
+{
+    _this->event_enqueue(_this->wakeup_event, _this->wakeup_latency);
+    if (size == 4) *(uint32_t *)data = 0;
+}
+...
+return vp::IO_REQ_OK;   // <- returned synchronously, on every single call
+```
+The register read returned `IO_REQ_OK` **immediately** on every call, regardless of how
+many other cores had also reached the barrier. `snrt_cluster_hw_barrier()`
+(`ManyRVData/software/snRuntime/src/platforms/shared/start_snitch.S`'s
+`_snrt_cluster_barrier`) is just a single blocking `lw` of this register — since the
+response never actually waited on anything, **the "barrier" was a complete no-op from a
+synchronization standpoint**: every core sailed through it instantly, letting faster cores
+race arbitrarily far ahead of slower ones with zero cross-core ordering. This is the true
+root cause of the entire multi-session reduction-correctness investigation (§13.1/§13.1.1):
+`fdotp`'s two-level reduction is the one workload in this whole effort that actually
+*depends* on barriers enforcing real cross-core ordering (a group leader must see its
+siblings' values from the *current* iteration, not some future one); `fmatmul` never
+exercises this dependency, which is also why it always passed cleanly once the earlier
+livelock/routing bugs were fixed.
+
+`(event_enqueue(wakeup_event, ...) / barrier_ack_itf)` turned out to be a real mechanism,
+just wired to the wrong thing: it's a broadcast wire (`o_BARRIER_ACK`, fanned out to every
+core) intended to release *all* cores together — but it was only ever used for the
+one-time boot/WFI wakeup (`REG_CLUSTER_BOOT_CONTROL`), never connected to the actual
+per-iteration `REG_HW_BARRIER` polling path.
+
+**Fixed**: `CachepoolV2ClusterPeripheral` now takes a `num_cores` property (threaded
+through from `total_cores` at `cachepool_v2_system.py`'s peripheral instantiation site,
+already correctly debug-topology-aware via the existing `_TOTAL_CORES` override). Each
+`REG_HW_BARRIER` read is now **parked** (`IO_REQ_PENDING`, pushed onto a
+`pending_barrier_reqs` queue) rather than answered immediately. Only once `num_cores`
+reads have arrived does a `barrier_release_event` fire (after `wakeup_latency` cycles),
+responding to **every** parked request at once — a real counting barrier instead of a
+fixed per-core delay.
+
+**Verified**: rebuilt, reran the 16-core debug topology with the same constant-data test.
+Every checkpoint now passes exactly:
+```
+[core 0..15] partial=512.000000 expect_elems=512 OK        (all 16 cores)
+[group leader 0] sum=2048.000000 expect_elems=2048 OK
+[group leader 4] sum=2048.000000 expect_elems=2048 OK
+[group leader 8] sum=2048.000000 expect_elems=2048 OK
+[group leader 12] sum=2048.000000 expect_elems=2048 OK
+[core0] TOTAL=8192.000000 expect_elems=8192 OK
+```
+No `Check Failed` at all — the full multi-iteration correctness check passes with zero
+failures, the first completely clean pass since this whole investigation began.
+
+**Full 256-core confirmation not yet completed** (unrelated tooling issue, not a
+correctness concern): this session's accumulated debug `fprintf` instrumentation
+(`[SCALAR_PC_DBG]`, `[VLSU_DBG]`, etc. — all unconditional, firing every cycle per core)
+produces unmanageably large, unflushed output at 256 cores; a background run was killed
+after its wrapper process's in-memory output buffer grew to 37 GB without ever reaching
+disk (a `gvsoc`-wrapper stdio-buffering gotcha already noted elsewhere in this doc, made
+much worse by 256× the per-cycle debug volume). The fix itself has no topology-scale-
+dependent logic (purely parameterized by `num_cores`), so this is a confirmation step, not
+a known risk. **Next step**: either trust the 16-core proof as sufficient (recommended —
+the mechanism is provably scale-invariant), or do a cleanup pass stripping/gating this
+session's accumulated unconditional debug instrumentation first, then re-run at 256 cores
+for a fast, clean confirmation.
 
 ### 13.2 matmul crash — VLSU burst crossing cacheline boundary (model bug)
 

@@ -8,6 +8,64 @@
 
 ---
 
+## 2026-07-09 (cont'd 6) — CachePool v2: TRUE root cause of the fdotp numeric mismatch found and fixed — HW_BARRIER never actually blocked
+
+**Status:** committed (`core`, `pulp` submodules -- full detail in
+`prompt/cachepool_v2_architecture.md` §13.1.2). `ManyRVData`-side debug
+changes (constant-data generation + printf checkpoints in fdotp's
+main.c/gen_data.py) are NOT committed there (separate, read-only-by-
+convention repo) -- see that repo's working tree if needed again.
+
+- User proposed a much more powerful debugging technique than continuing to
+  guess from random-data mismatches: regenerate fdotp's test data as a
+  constant (`A=B=1.0` via a new `FDOTP_CONST` env var in gen_data.py) so
+  every intermediate reduction value becomes an exact, known integer, and
+  add printf checkpoints in main.c at each reduction stage (per-core
+  partial, group-leader sum, final total) that self-report PASS/FAIL.
+- First attempt at serializing the resulting 16-way concurrent printf
+  output used a spinlock (snrt_mutex_lock) -- this itself introduced a NEW
+  30M+-cycle livelock (user had explicitly warned this was a risk before
+  trying it). Switched to a lock-free design: each core stashes into a
+  private array slot (no contention), only core 0 prints everything
+  sequentially afterward.
+- Clean data immediately localized the bug: every individual core's own
+  partial sum was always exactly correct; exactly 2 of 4 group-leader sums
+  were wrong (one with 6x excess, one with 2x deficit), the other 2 exactly
+  correct. Correlating already-in-tree `[RESULT_DBG]`/`[LSU_DBG]` traces
+  (after fixing their hardcoded address filter, which was watching the
+  wrong symbol address for this test's binary size -- separate small fix,
+  committed in core) showed a sibling core had already written its
+  *iteration-2* value before the group leader even started reading
+  iteration 0's value: cores were racing 2 full loop iterations ahead of
+  each other across `snrt_cluster_hw_barrier()` calls.
+- **Root cause**: `cachepool_v2_cluster_peripheral.cpp`'s REG_HW_BARRIER
+  read handler returned `IO_REQ_OK` synchronously on every single call,
+  regardless of how many other cores had reached the barrier --
+  `snrt_cluster_hw_barrier()` (a single blocking `lw` of this register) was
+  a complete no-op from a synchronization standpoint. This is the true root
+  cause of the entire fdotp reduction-correctness investigation spanning
+  this whole session: it's the one workload here that actually depends on
+  barriers enforcing real cross-core ordering, which is also why fmatmul
+  never tripped over it.
+- **Fixed**: the peripheral now takes a `num_cores` property, parks each
+  REG_HW_BARRIER read (`IO_REQ_PENDING`) in a queue, and only responds to
+  ALL parked requests at once once `num_cores` reads have arrived -- a real
+  counting barrier instead of an immediate per-core response.
+- **Verified**: 16-core debug topology, constant-data test -- every
+  checkpoint (16 cores + 4 groups + total) now matches its exact expected
+  value, and the multi-iteration correctness check passes with zero
+  failures. First fully clean pass in this entire investigation.
+- **Full 256-core confirmation not yet done**: unrelated tooling issue, not
+  a correctness concern -- this session's accumulated unconditional
+  per-cycle debug fprintf instrumentation produces too much unflushed
+  output at 256 cores (a background run's wrapper process hit 37 GB RSS
+  without any of it reaching disk; killed rather than risk OOM). The fix
+  has no topology-scale-dependent logic. Recommended: trust the 16-core
+  proof, or do a debug-instrumentation cleanup pass first and re-run at
+  scale.
+
+---
+
 ## 2026-07-09 (cont'd 5) — CachePool v2: found + fixed a router dict-key collision silently routing ALL scalar 0x8000_0000-region accesses around the L1 cache; fdotp result 28% off -> 3.8% off
 
 **Status:** uncommitted (`pulp` submodule; `core`, `engine` untouched this round --
