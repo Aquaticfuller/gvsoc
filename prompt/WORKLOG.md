@@ -8,6 +8,97 @@
 
 ---
 
+## 2026-07-09 (cont'd) — CachePool v2: third root cause fixed (L1 NoC address-window aliasing); all memory-response-loss bugs eliminated; livelock now isolated to Ara/AraVlsu completion signaling
+
+**Status:** uncommitted (`core`, `pulp` submodules — full detail in
+`prompt/cachepool_v2_architecture.md` §13.2.4).
+
+- Fixed the residual bug flagged at the end of the previous entry: `FlooNoc::get_entry()`
+  (`pulp/floonoc/floonoc.cpp`/`.hpp`) only did a plain contiguous `base<=addr<base+size`
+  range match, but `L1NocAddressConverter` leaves cacheline "tag" bits (above the
+  group_id/bank_offset field) untouched, so incrementing tag by 1 shifts the address by
+  exactly `num_groups × noc_size_per_group` — a whole period over every group's window.
+  Added an optional `period` field to `Entry`/`get_entry()` (default 0 = old behavior) and
+  plumbed it through `floonoc.py`'s `o_NARROW_MAP`; `cachepool_v2_cluster.py` now passes
+  `period = nb_groups × noc_size_per_group` on every registered window, so every tag value
+  resolves correctly instead of only tag==0. Also fixed a related boundary-clamp underflow
+  in `NetworkQueue::enqueue_router_req` that the periodic case exposed (harmless for this
+  workload's 4-byte bursts, but wrong in general).
+- **Verified**: zero `NO_ENTRY_FOUND` drops (down from 8), simulation progresses further
+  still (cycle ~2.76M → ~3.24M before stalling).
+- **Conclusively isolated the remaining hang as NOT a memory/NoC bug.** At the new stall
+  point, the stuck core's `AraVlsu` (`[VLSU_FSM_DBG]`) shows itself fully idle
+  (`nb_waiting_insn=0, pending_size=0x0`) while `Ara`'s global instruction queue
+  (`[ARA_DBG]`) is still stuck full (`nb_pending_insn=8`) on a head-of-queue entry that
+  never gets marked done. This is the "puzzling half of the picture, not yet resolved"
+  noted at the end of §13.2.1 — a desync between `AraVlsu`'s own local completion indices
+  and `Ara`'s separate global scoreboard (`Ara::insn_end()` not firing, or firing on the
+  wrong entry, for the stuck instruction). With memory-side noise now fully eliminated,
+  this is the sole confirmed remaining blocker. Next step: audit `AraVlsu`'s three-index
+  bookkeeping (`insn_first`/`insn_first_waiting`/`insn_last`) in `spatz_vlsu.cpp` against
+  `Ara::insn_end()`'s call site in `ara.cpp` — see §13.2.4 for the precise pointer.
+
+---
+
+## 2026-07-09 — CachePool v2: two root causes of the "lost VLSU response" livelock found & fixed; residual narrower NoC address-window bug found (open)
+
+**Status:** uncommitted (`core`, `pulp` submodules — full detail in
+`prompt/cachepool_v2_architecture.md` §13.2.3).
+
+- Rebuilt + reran `test-cachepool-fdotp-32b_M32768` on the 16-core debug
+  topology (bounded via `timeout`, per §13.2.1's log-size gotcha) to confirm
+  the §13.2.2 boot-hang fix still holds: cores now reach real program code
+  past the bootrom, then hang at the already-documented vfmacc PC.
+- Mined the existing (already-in-tree) `[VLSU_DBG]` ISSUE/RESPONSE log for one
+  core: found every burst of the very first post-boot vector load returned
+  `IO_REQ_DENIED` from cycle ~16457 on, with **zero** matching RESPONSE lines
+  ever — that core's `AraVlsu` froze permanently right there.
+- **Fix 1** (`core/models/cache/insitu/insitu_cache_controller.cpp`):
+  `handle_request()`'s three fifo-full `IO_REQ_DENIED` sites (retr/miss/evic)
+  are correct for the open-loop calib driver (which retries) but not for
+  `inline_sync_miss_`/cluster mode, where `AraVlsu` treats any DENIED as
+  "someone is holding this, ignore it" (true only for the FlooNoc NI's
+  DENIED contract) and never retries — silently dropping the request. Added
+  `admission_stall_queue_` + `try_admit_stalled()`: in `inline_sync_miss_`
+  mode, park the request and return `PENDING` instead of `DENIED`; retry
+  admission whenever a fifo slot frees. Verified real but **not** the cause
+  of this particular trace (no change to the DENIED-storm log after this fix
+  alone).
+- **Fix 2** (actual cause of this trace) — `pulp/cachepool_v2/
+  cachepool_v2_cluster.py`: added `[NI_DBG]` instrumentation to
+  `pulp/floonoc/floonoc_network_interface.cpp` (raw `fprintf`, since
+  `--trace=` is unusable at this scale per §13.2.1) and found the FlooNoc's
+  `NetworkQueue::enqueue_router_req()` silently drops a burst (`return;`, no
+  status, no `resp()` — there's even a dead `// TODO` for the never-
+  implemented invalid-response path) whenever `FlooNoc::get_entry()` finds no
+  address-range match. Root cause: `L1NocAddressConverter` only rearranges
+  the low `constant_bits_lsb+bank_offset_bits+group_id_bits` bits and leaves
+  bit 29 (the `0x8000_0000` vs `0xa000_0000` DRAM-region selector) untouched,
+  but `cachepool_v2_cluster.py`'s `o_NARROW_MAP` registrations only ever
+  covered `0x8000_0000`-based windows — so any cross-group request whose
+  address was in `0xa000_0000+` (exactly where fdotp's source data lives)
+  never found a routing entry. Fixed by mirroring the same per-group windows
+  at `dram_base = 0xa0000000` (distinct `name=` per entry so both windows
+  coexist).
+- **Verified**: after both fixes, the same run completes its first ever
+  DENY→RETRY_READ→FINAL_RESP round trip (previously zero completions in the
+  whole run) and progresses ~170× further (cycle ~16464 → ~2.76M) before
+  hitting the *already-documented* vfmacc/Ara-queue-full livelock from
+  §13.2.1/§13.2.2 — i.e. this round's fixes cleared the earlier blocker;
+  that livelock itself is still open.
+- **Residual bug found, not fixed**: even with both fixes, 8 more
+  `NO_ENTRY_FOUND` drops occurred at addresses whose "tag" bits (above the
+  group_id/bank_offset field) are nonzero — the base+size contiguous-window
+  match in `FlooNoc::get_entry()` only ever captures tag==0 per group; larger
+  offsets either drop (same bug class) or could in principle numerically
+  alias into a different group's window. Rare in this workload (8 events in
+  ~2.76M cycles) but architecturally real; plausible contributor to whatever
+  response-loss remains in the still-open vfmacc livelock. Flagged for next
+  round — see §13.2.3's "Residual" note for the proposed fix direction
+  (mask-based entry matching instead of contiguous windows).
+
+---
+
 ## 2026-07-08/09 — CachePool v2: `pulp` rebased onto upstream/master; permanent-boot-hang root cause found & fixed (wrong Hierarchical_Interco port name); second hang localized to lost VLSU async responses (open)
 
 **Status:** uncommitted (`pulp`, `core`, `engine` submodules — see full detail in

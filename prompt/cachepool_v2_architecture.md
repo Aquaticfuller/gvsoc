@@ -3,12 +3,22 @@
 > Last updated 2026-07-09. Describes the GVSoC simulation model, not the RTL directly.
 > RTL reference is at `/scratch/diyou/cachepool/gvsoc/ManyRVData/` (read-only).
 > **Status as of 2026-07-09**: the long-standing permanent-boot-hang bug (every core stuck
-> forever at the reset vector) is root-caused and fixed — see §13.2.2. A second, distinct
-> vector-pipeline livelock (same class as the matmul hang in §13.2.1/§13.2.2, lost async
-> VLSU memory responses) now blocks `fdotp` shortly after boot; neither `fdotp` nor
+> forever at the reset vector) is root-caused and fixed — see §13.2.2. All three components
+> of the "lost async VLSU response" livelock that blocked `fdotp` shortly after boot are now
+> root-caused and fixed — see §13.2.3 and §13.2.4 (the L1-NoC address-window bug flagged as
+> "residual" in §13.2.3 is now also fixed, via periodic FlooNoc map entries). With all
+> memory-response-loss bugs eliminated (verified: zero dropped bursts, `AraVlsu`'s own
+> completion bookkeeping now reaches fully-idle), `fdotp` progresses substantially further
+> (~3.24M cycles vs ~2.76M) before hitting a **different, deeper bug**: `Ara`'s global
+> instruction queue stays permanently full even though `AraVlsu` (the block that issues its
+> memory requests) believes it is completely idle — i.e. not a lost response at all, but a
+> desync between `AraVlsu`'s local completion tracking and `Ara`'s global scoreboard. This
+> is the "puzzling half of the picture, not yet resolved" flagged at the end of §13.2.1 —
+> now confirmed as the actual remaining blocker, isolated to `Ara`/`AraVlsu` instruction-
+> completion signaling rather than anything memory/NoC-related. Neither `fdotp` nor
 > `fmatmul` reaches EOC yet. The fdotp numeric-mismatch item in §13.1 predates the boot-hang
-> fix and has **not** been re-verified since (blocked by the new vector livelock before it
-> can reach the final check).
+> fix and has **not** been re-verified since (blocked by this livelock before it can reach
+> the final check).
 
 ---
 
@@ -589,6 +599,161 @@ All of the above plus §13.2.1's original `[VLSU_DBG]`/`[VLSU_WAIT_DBG]`/
 `[VLSU_BURST_DBG]`/`[ARA_DBG]`/`[STUB_DBG]` are still present; `grep -rn "_DBG\b"
 core/models/ engine/engine/src/` finds them all for eventual cleanup once the response-loss
 bug is fixed.
+
+### 13.2.3 Two root causes of "lost async VLSU response" found and fixed (2026-07-09)
+
+Following the §13.2.2 recipe (16-core debug topology via `CACHEPOOL_V2_*` env vars, direct
+`fprintf` instrumentation, bounded `timeout` runs to avoid multi-GB logs), the existing
+`[VLSU_DBG]` ISSUE/RESPONSE log for a single core (`tile_0/pe0`) showed something more
+specific than "some response is lost": for the very first vector load past boot (reading
+fdotp's source data at `0xa0000000+`), **every burst from cycle ~16457 onward returned
+`IO_REQ_DENIED` (not `PENDING`) and none ever got a matching `RESPONSE` line** — the whole
+88-byte remainder of that one load instruction's bursts were denied and then silently
+dropped, freezing that core's `AraVlsu` forever (`nb_waiting_insn` stuck, matching §13.2.2's
+description).
+
+**Root cause 1 — `InsituCacheController` DENIED has no retry-holder for async masters.**
+`insitu_cache_controller.cpp`'s `handle_request()` returns `IO_REQ_DENIED` synchronously
+(no internal queue, caller must retry) when the retr/miss/evic fifo counters
+(`retr_fifo_level_ >= retr_fifo_depth_` etc., lines ~547/560/580) are full — correct for the
+open-loop calib trace-replay driver (which does retry every cycle) but **not** for
+`inline_sync_miss_` (cluster/closed-loop) mode: `AraVlsu::fsm_handler`'s DENIED handling
+(§9's fix) assumes DENIED means "someone downstream is holding this and will complete it
+later" (true for the FlooNoc NI's DENIED-and-hold contract), not "rejected, please retry
+yourself" — AraVlsu has no retry path, so a controller-level DENIED is simply dropped.
+**Fixed**: added `admission_stall_queue_` (a `std::deque<vp::IoReq*>`) — in
+`inline_sync_miss_` mode, the three fifo-full sites push the request onto this queue and
+return `IO_REQ_PENDING` instead of `IO_REQ_DENIED`. `try_admit_stalled()` re-attempts
+`handle_request()` on the head of the queue (safe: nothing was mutated before the DENIED
+return, so re-deriving tag/set/line from the untouched request is equivalent to a fresh
+call) whenever a fifo slot frees — hooked in after each of the three decrement sites
+(`refill_resp_handler`'s `miss_fifo_level_--`, transitively via the `fsm_drain_mshr` call
+right after it; `fsm_drain_mshr`'s own `retr_fifo_level_--` loop; `issue_eviction`'s
+`evic_fifo_level_--`). A retried `IO_REQ_OK` needs an explicit `resp()` call here (since
+it's no longer happening inside the original synchronous `req()` call); a retried
+`IO_REQ_PENDING` has already re-parked itself (onto `mshr_` or back onto this same stall
+queue) and needs nothing further.
+
+Verified this fix alone did **not** change the trace at all — same DENIED storm, same
+addresses, same freeze point — meaning this DENIED source, while real, was not the one
+this particular load instruction was hitting. Kept anyway (real bug, will bite the miss/evict
+fifos under different traffic patterns), and instrumentation was extended (`[NI_DBG]` in
+`floonoc_network_interface.cpp`) to find where these specific bursts were actually being
+denied.
+
+**Root cause 2 — L1 NoC map has no entry for the `0xa000_0000` "uncached label" region
+(the actual bug for this trace).** `[NI_DBG]` counters showed the FlooNoc network interface
+(`pulp/floonoc/floonoc_network_interface.cpp`) itself only saw **2 total calls** to
+`handle_req()` (its local-injection entry point) in the entire bounded run, and its
+`handle_request()` (the router→NI delivery callback) was **never called even once** — i.e.
+essentially no traffic ever completed a round trip through the NoC. The first accepted
+burst (`addr=0xa0002700`) permanently occupied the NI's single-outstanding-narrow-read slot
+(`narrow_read_pending_burst`) and was never freed, so every subsequent narrow read at that
+NI was denied forever (matches the DENIED-storm trace exactly). Added an `fprintf` at
+`NetworkQueue::enqueue_router_req`'s `entry == NULL` branch (`floonoc_network_interface.cpp`
+~line 132) — previously only a `trace.msg(LEVEL_ERROR, ...)`, invisible without
+`--trace=`, which is unusable at this scale per §13.2.1 — confirming: **when
+`FlooNoc::get_entry()` finds no address-range match, the burst is silently dropped**
+(`return;` with no status change, no `resp()`, no cleanup — a `// TODO` comment even marks
+the intended-but-never-implemented invalid-response path). Root cause: `pulp/cachepool_v2/
+cachepool_v2_l1_noc_address_converter.cpp`'s `L1NocAddressConverter` only rearranges the
+*low* `constant_bits_lsb + bank_offset_bits + group_id_bits` bits (bank_offset ↔ group_id
+swap for NoC routing, §8); it leaves every bit above that — including bit 29, the
+`0x8000_0000` vs `0xa000_0000` DRAM-region selector — completely untouched in both
+directions. But `cachepool_v2_cluster.py`'s `o_NARROW_MAP` registrations
+(`dram_base = 0x80000000; base = dram_base + group_id * noc_size_per_group`) only ever
+registered windows anchored at `0x8000_0000`. Any cross-group L1 request whose *original*
+address was in `0xa000_0000+` (exactly where fdotp's actual source data lives — see §3) —
+still carries that address after the bit-rearrangement, so `get_entry()` never finds a
+matching window. **Fixed**: `cachepool_v2_cluster.py` now registers a mirrored second set
+of `o_NARROW_MAP` windows at `dram_base = 0xa0000000` (same group→(x,y) routing, distinct
+`name=` per entry so both windows coexist in FlooNoc's `mappings` dict) alongside the
+existing `0x8000_0000` ones. `o_GROUP_OUTPUT` (the group→NI *output* binding, as opposed to
+`o_NARROW_MAP`'s *routing-table* entry) is only called once per (group, port) — it's not a
+per-region thing.
+
+Verified: after rebuild, the same run for the first time shows a completed round trip
+(`DENY → RETRY_READ → FINAL_RESP` all for the same burst/address) and the simulation
+progresses ~170× further (from freezing at cycle ~16464 to reaching cycle ~2.76M, the same
+point independently documented in §13.2.1/§13.2.2's vfmacc/Ara-queue-full livelock) instead
+of freezing immediately after the first vector load of the run.
+
+**Residual, narrower-scope bug found in the same code path — now also fixed, see §13.2.4.**
+Even with both fixes above, 8 more `NO_ENTRY_FOUND` drops still occurred over the same
+bounded run, at addresses like `0xa0021100`/`0xa0023504`/`0xa0022750` — offsets *larger*
+than `noc_size_per_group`. Root cause and fix: §13.2.4.
+
+**Debug instrumentation added this round** (same gate-and-leave-in-tree rationale as
+§13.2.1/§13.2.2): `insitu_cache_controller.cpp` has no new prints (the fix is silent,
+correctness-only); `floonoc_network_interface.cpp` gained `[NI_DBG]` at: `handle_req`'s
+DENY branch (rate-limited `%5000`), the narrow-read retry/grant site in `fsm_handler`
+(`%5000`), the final burst-completion site in `handle_request` (`%5000`), unconditional
+entry counters on `handle_req` and `handle_request` (`%2000`), and an **unconditional**
+print at the `entry == NULL` silent-drop branch (left unconditional since real drops are
+rare and each one matters).
+
+### 13.2.4 L1 NoC address-window aliasing bug found and fixed; livelock isolated to Ara/AraVlsu completion signaling, not memory (2026-07-09)
+
+**Root cause of the §13.2.3 residual drops.** `L1NocAddressConverter` only permutes bits
+*within* the `constant_bits_lsb+bank_offset_bits+group_id_bits` slice (§8); every bit
+*above* that — the cacheline "tag": which specific line within a bank, as opposed to which
+bank — passes through completely unchanged in both directions. Incrementing the tag by 1
+therefore adds exactly `2^(constant_bits_lsb+bank_offset_bits+group_id_bits)` to the
+address, which — because `group_id_bits` exactly spans `clog2(num_groups)` — equals exactly
+`num_groups × noc_size_per_group`: one full pass over *every* group's registered window at
+the current tag. So the whole address space tiles with period `num_groups ×
+noc_size_per_group`, and within each tile the same `base = dram_base + group_id ×
+noc_size_per_group` position identifies the same group. `FlooNoc::get_entry()`
+(`pulp/floonoc/floonoc.cpp`), however, only ever did a single contiguous `base <= addr <
+base+size` range match — so only `tag == 0` (the very first line per group) ever resolved;
+every other tag either found no entry (silent drop, same mechanism as §13.2.3's root cause
+2) or, in principle, could numerically land inside a *different* group's contiguous window
+if the registered spans were packed back-to-back (misrouting, not just dropping).
+
+**Fixed properly** (not by registering more windows, which would just require enumerating
+every tag up to the backing memory's full size — thousands of entries for a 256 MB region,
+and still finite): added a `period` field to `Entry` (`pulp/floonoc/floonoc.hpp`) and
+`FlooNoc::get_entry()` (`pulp/floonoc/floonoc.cpp`) — when `period > 0`, an address also
+matches if `(addr - entry->base) % period` falls inside `[0, entry->size)`, in addition to
+the existing plain-range check (default `period=0` preserves the old behavior for any other
+FlooNoc user). Plumbed through `floonoc.py`'s `__add_mapping`/`o_NARROW_MAP` as an optional
+`period` parameter. `cachepool_v2_cluster.py` now passes `period = nb_groups ×
+noc_size_per_group` on every `o_NARROW_MAP` call (both the `0x8000_0000` and `0xa0000000`
+regions), so every tag value resolves correctly by construction instead of needing explicit
+enumeration. Also fixed a related latent bug this exposed: `NetworkQueue::
+enqueue_router_req`'s (`floonoc_network_interface.cpp`) boundary-clamp calculation
+(`max_size = entry->base + entry->size - burst_base`) would have underflowed for any
+periodic match where `burst_base` is many periods past `entry->base` (harmless for this
+workload's 4-byte VLSU bursts, since the clamp is never the binding constraint at that
+size, but wrong in general) — now computed from the offset *within* the matched period
+(`rel = (burst_base - entry->base) % entry->period` when periodic) rather than raw
+`burst_base`.
+
+**Verified**: rebuilt, reran the same bounded 16-core fdotp run. Zero `NO_ENTRY_FOUND`
+events (down from 8), and the simulation progresses further still — from freezing at
+~2.76M cycles (§13.2.3's post-fix state) to ~3.24M cycles.
+
+**The remaining hang is conclusively NOT a lost-memory-response bug.** At the new stall
+point, `[VLSU_FSM_DBG]` for the stuck core's `AraVlsu` shows `nb_pending_insn=1,
+nb_waiting_insn=0, pending_size=0x0` — i.e. `AraVlsu` believes it has fully issued and
+completed everything outstanding. But `[ARA_DBG]` for the same core's `Ara` shows
+`nb_pending_insn=8, queue_size=8` (completely full) with the head-of-queue entry
+(`insn_first=2`, `pc=0x80000770`) permanently stuck `HEAD_NOT_DONE`. This is precisely the
+"puzzling half of the picture, not yet resolved" noted at the end of §13.2.1: a desync
+between `AraVlsu`'s own local completion bookkeeping (its three indices `insn_first`/
+`insn_first_waiting`/`insn_last` into its own `insns[]`) and `Ara`'s separate global
+`pending_insns[]` scoreboard — `AraVlsu` locally believes it has finished, but never (or
+incorrectly) calls `ara.insn_end()` for the head instruction, so `Ara`'s global queue never
+hears "done" and every subsequent vector instruction stays blocked on
+`iss->vu.queue_is_full()`. With every memory-response-loss bug now eliminated (verified:
+zero drops, zero denied-forever bursts, `AraVlsu` reaching genuine full-idle state), this
+is now the sole confirmed remaining blocker on `fdotp`/`fmatmul` reaching EOC. **Next
+step** (per §13.2.1's original suggestion, now higher-confidence given the memory-side
+noise is gone): audit `AraVlsu`'s three-index bookkeeping in `spatz_vlsu.cpp` against
+`Ara::insn_end()`'s call site in `ara.cpp`, specifically why the bottom of
+`AraVlsu::fsm_handler` (which is supposed to detect `pending_size==0 &&
+nb_pending_bursts==0` at `insns[insn_first]` and call `ara.insn_end()`) isn't reaching or
+correctly triggering that call for this instruction.
 
 ### 13.3 Peripheral registers not fully implemented
 
