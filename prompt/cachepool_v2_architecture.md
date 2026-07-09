@@ -3,22 +3,17 @@
 > Last updated 2026-07-09. Describes the GVSoC simulation model, not the RTL directly.
 > RTL reference is at `/scratch/diyou/cachepool/gvsoc/ManyRVData/` (read-only).
 > **Status as of 2026-07-09**: the long-standing permanent-boot-hang bug (every core stuck
-> forever at the reset vector) is root-caused and fixed — see §13.2.2. All three components
-> of the "lost async VLSU response" livelock that blocked `fdotp` shortly after boot are now
-> root-caused and fixed — see §13.2.3 and §13.2.4 (the L1-NoC address-window bug flagged as
-> "residual" in §13.2.3 is now also fixed, via periodic FlooNoc map entries). With all
-> memory-response-loss bugs eliminated (verified: zero dropped bursts, `AraVlsu`'s own
-> completion bookkeeping now reaches fully-idle), `fdotp` progresses substantially further
-> (~3.24M cycles vs ~2.76M) before hitting a **different, deeper bug**: `Ara`'s global
-> instruction queue stays permanently full even though `AraVlsu` (the block that issues its
-> memory requests) believes it is completely idle — i.e. not a lost response at all, but a
-> desync between `AraVlsu`'s local completion tracking and `Ara`'s global scoreboard. This
-> is the "puzzling half of the picture, not yet resolved" flagged at the end of §13.2.1 —
-> now confirmed as the actual remaining blocker, isolated to `Ara`/`AraVlsu` instruction-
-> completion signaling rather than anything memory/NoC-related. Neither `fdotp` nor
-> `fmatmul` reaches EOC yet. The fdotp numeric-mismatch item in §13.1 predates the boot-hang
-> fix and has **not** been re-verified since (blocked by this livelock before it can reach
-> the final check).
+> forever at the reset vector) is root-caused and fixed — see §13.2.2. All memory-response-
+> loss bugs in the L1 NoC / InsituCacheController path are root-caused and fixed — see
+> §13.2.3 and §13.2.4. The `Ara`/`AraVlsu` instruction-completion-signaling bug flagged at
+> the end of §13.2.1 as "the puzzling half of the picture" is now **also root-caused and
+> fixed** — see §13.2.5. **`fdotp` now reaches EOC** on the 16-core debug topology (verified
+> 2026-07-09) — the first time this has happened since the investigation began. The check
+> itself still fails (`Calc:350.577697, Exp:628.153869`), but this is expected on the debug
+> topology: the "Exp" reference value assumes the real 256-core reduction, not 16 cores —
+> §13.1's numeric-mismatch item needs to be re-run on the **full 256-core topology** to be
+> meaningful, which has not been done yet post-fix. `fmatmul` has not been re-verified since
+> these fixes either.
 
 ---
 
@@ -754,6 +749,54 @@ noise is gone): audit `AraVlsu`'s three-index bookkeeping in `spatz_vlsu.cpp` ag
 `AraVlsu::fsm_handler` (which is supposed to detect `pending_size==0 &&
 nb_pending_bursts==0` at `insns[insn_first]` and call `ara.insn_end()`) isn't reaching or
 correctly triggering that call for this instruction.
+
+### 13.2.5 Ara/AraVlsu completion-signaling bug found and fixed — fdotp now reaches EOC (2026-07-09)
+
+**Root cause.** Confirmed via `[VLSU_DBG]` for the specific stuck core (`tile_0/pe2`) that
+this was never a lost response: exactly 128 `IO_REQ_DENIED` issues were logged, and exactly
+128 matching `RESPONSE` lines, the last one showing `nb_pending_bursts_after=0` — all at
+cycle ~12784, **very early** in the run. So the head-of-queue instruction's bursts had
+genuinely, fully completed thousands of cycles before the eventual stall. Yet `[ARA_DBG]`
+kept reporting `Ara`'s global queue stuck full (`nb_pending_insn=8`) at cycle 3.2M+, with
+`[VLSU_FSM_DBG]` showing `AraVlsu` itself at `nb_waiting_insn=0, pending_size=0x0` (nothing
+left to issue). The bug: in `AraVlsu::fsm_handler` (`spatz_vlsu.cpp`), the block that
+checks whether the head instruction (`insns[insn_first]`) can be marked done — and, if so,
+calls `ara.insn_end()` — was nested **inside** `if (_this->pending_size) { ... }`, i.e. it
+only ran on a cycle where some *other* (typically newer) instruction happened to still be
+mid-issue. Once every currently-waiting instruction had fully finished issuing its bursts
+(`pending_size` back to 0, `nb_waiting_insn == 0`), that whole block — including the
+completion check — stopped running, even though the FSM was still being correctly
+re-triggered by `data_response()`'s `fsm_event.enable()` on every burst completion. So the
+head instruction's `nb_pending_bursts` reaching 0 was never even *checked* once no newer
+instruction was in flight, permanently stranding it "done in practice, not marked done",
+which head-of-line-blocked `Ara`'s global 8-slot queue forever (exactly the symptom chased
+since §13.2.1).
+
+**Fixed**: moved the head-of-queue completion check (the `if (_this->nb_pending_insn.get()
+> 0) { ... ara.insn_end(pending_insn); ... }` block) out from under `if
+(_this->pending_size)` so it runs unconditionally every FSM invocation, gated only on its
+own pre-existing conditions (`pending_size == 0 && slot.nb_pending_bursts == 0 &&
+pending_insn->timestamp <= now`). No other logic changed.
+
+**Verified**: rebuilt, reran the same bounded 16-core fdotp run (`timeout 60`, since the
+run now completes rather than looping forever). **The simulation reaches EOC** — first
+time in this entire investigation:
+```
+The 1st execution took 6290 cycles. The performance is 10419 OP/1000cycle (81% utilization).
+The execution took 5755 cycles. The performance is 11387 OP/1000cycle (88% utilization).
+Check Failed! Calc:350.577697, Exp:628.153869
+EOC: exit code 2147483647
+```
+The check failure is expected here: this run used the 16-core debug topology
+(`CACHEPOOL_V2_*` env vars), but the `Exp` reference value is computed assuming the real
+256-core reduction (`snrt_cluster_core_num()`/group-size-4 two-level reduction, see §13.1).
+A meaningful re-check of §13.1's numeric-mismatch item requires rerunning on the **full
+256-core topology**, which has not been done yet post-fix (all fixes this round were
+developed and verified on the fast 16-core debug topology per §13.2.2's iteration
+strategy). `fmatmul` (§13.2.1's original repro) has also not been re-verified since these
+fixes; it very plausibly hit the exact same `Ara`/`AraVlsu` bug given the identical stall
+signature (`Ara`'s queue full, head instruction a `vle32.v`/similar VLSU op never marked
+done) documented there.
 
 ### 13.3 Peripheral registers not fully implemented
 

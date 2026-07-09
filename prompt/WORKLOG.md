@@ -8,6 +8,43 @@
 
 ---
 
+## 2026-07-09 (cont'd 2) — CachePool v2: Ara/AraVlsu completion-signaling bug fixed — fdotp reaches EOC for the first time
+
+**Status:** uncommitted (`core` submodule — full detail in
+`prompt/cachepool_v2_architecture.md` §13.2.5).
+
+- Root-caused the "puzzling half" bug flagged at the end of §13.2.1 (and
+  confirmed as the sole remaining blocker at the end of the previous entry).
+  `[VLSU_DBG]` for the specific stuck core showed all 128 of its DENIED
+  bursts had genuinely completed (matching RESPONSE lines, last one at
+  `nb_pending_bursts_after=0`) thousands of cycles before the eventual
+  stall -- so this was never a lost response.
+- **Bug**: `AraVlsu::fsm_handler`'s (`core/models/cpu/iss/src/ara/
+  spatz_vlsu.cpp`) check for whether the head-of-queue instruction can be
+  marked done (and `ara.insn_end()` called) was nested inside
+  `if (_this->pending_size) { ... }` -- i.e. it only ran while some other,
+  newer instruction happened to still be mid-issue. Once every waiting
+  instruction finished issuing (`pending_size` back to 0,
+  `nb_waiting_insn==0`), that whole block stopped running, even though the
+  head instruction's bursts had long since all completed asynchronously via
+  `data_response()`. This permanently stranded the head instruction
+  "done in practice, never marked done", head-of-line-blocking `Ara`'s
+  global 8-slot queue forever.
+- **Fixed**: moved the completion-check block out from under
+  `if (_this->pending_size)` so it runs unconditionally every FSM
+  invocation (gated only on its own pre-existing conditions). No other
+  logic changed.
+- **Verified**: rebuilt, reran the same bounded 16-core fdotp run. **The
+  simulation reaches EOC for the first time in this entire investigation**
+  (5755-cycle steady-state execution, 88% utilization). The result check
+  still fails (`Calc:350.577697, Exp:628.153869`), but this is expected --
+  the debug topology (16 cores) doesn't match the `Exp` reference value's
+  assumed 256-core reduction. Re-running §13.1's numeric-mismatch item on
+  the full 256-core topology, and re-verifying `fmatmul` (which very
+  plausibly hit the identical bug), are the natural next steps.
+
+---
+
 ## 2026-07-09 (cont'd) — CachePool v2: third root cause fixed (L1 NoC address-window aliasing); all memory-response-loss bugs eliminated; livelock now isolated to Ara/AraVlsu completion signaling
 
 **Status:** uncommitted (`core`, `pulp` submodules — full detail in
