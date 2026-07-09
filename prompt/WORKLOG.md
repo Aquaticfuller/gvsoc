@@ -8,6 +8,26 @@
 
 ---
 
+## 2026-07-09 (cont'd 3) — CachePool v2: confirmed fdotp reaches EOC on the full 256-core topology too
+
+**Status:** doc-only update (no code change).
+
+- Ran `test-cachepool-fdotp-32b_M32768` on the real, default 256-core
+  topology (no `CACHEPOOL_V2_*` debug env vars, `timeout 300`) for the
+  first time since the §13.2.5 fix. Reaches EOC with no hang, in 250
+  simulated cycles (128% utilization) -- far fewer than the 16-core debug
+  topology's 6290 cycles, as expected with 16x the parallel work.
+- Check still fails: `Calc:452.100891, Exp:628.153869`. This is a
+  *different* miscalculated value than both the 16-core debug run
+  (`350.577697`) and the pre-boot-hang-fix baseline in §13.1
+  (`189.697906`) -- consistent with a genuine, distinct-per-topology
+  numerical bug (§13.1), not an artifact of any of today's livelock fixes.
+- This is the first time the model has run end-to-end on the real topology
+  since the investigation began; re-investigating §13.1's numeric mismatch
+  on this topology is the natural next step.
+
+---
+
 ## 2026-07-09 (cont'd 2) — CachePool v2: Ara/AraVlsu completion-signaling bug fixed — fdotp reaches EOC for the first time
 
 **Status:** uncommitted (`core` submodule — full detail in

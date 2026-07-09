@@ -7,13 +7,16 @@
 > loss bugs in the L1 NoC / InsituCacheController path are root-caused and fixed — see
 > §13.2.3 and §13.2.4. The `Ara`/`AraVlsu` instruction-completion-signaling bug flagged at
 > the end of §13.2.1 as "the puzzling half of the picture" is now **also root-caused and
-> fixed** — see §13.2.5. **`fdotp` now reaches EOC** on the 16-core debug topology (verified
-> 2026-07-09) — the first time this has happened since the investigation began. The check
-> itself still fails (`Calc:350.577697, Exp:628.153869`), but this is expected on the debug
-> topology: the "Exp" reference value assumes the real 256-core reduction, not 16 cores —
-> §13.1's numeric-mismatch item needs to be re-run on the **full 256-core topology** to be
-> meaningful, which has not been done yet post-fix. `fmatmul` has not been re-verified since
-> these fixes either.
+> fixed** — see §13.2.5. **`fdotp` now reaches EOC on both the 16-core debug topology and
+> the full 256-core topology** (both verified 2026-07-09) — the first time this has happened
+> since the investigation began, on either topology. The full-topology run completes in 250
+> cycles (128% utilization) with no hang, confirming the fix scales. The correctness check
+> itself still fails on both (`Calc:452.100891, Exp:628.153869` on the full topology,
+> `Calc:350.577697` on the 16-core debug one — expectedly different, since the debug
+> topology's reduced core count doesn't match the "Exp" reference value's assumed 256-core
+> reduction). This is §13.1's pre-existing, separately-tracked numeric-mismatch item — not a
+> new regression, and now finally re-checkable end-to-end on the real topology, but not yet
+> re-investigated. `fmatmul` has not been re-verified since these fixes either.
 
 ---
 
@@ -790,13 +793,21 @@ EOC: exit code 2147483647
 The check failure is expected here: this run used the 16-core debug topology
 (`CACHEPOOL_V2_*` env vars), but the `Exp` reference value is computed assuming the real
 256-core reduction (`snrt_cluster_core_num()`/group-size-4 two-level reduction, see §13.1).
-A meaningful re-check of §13.1's numeric-mismatch item requires rerunning on the **full
-256-core topology**, which has not been done yet post-fix (all fixes this round were
-developed and verified on the fast 16-core debug topology per §13.2.2's iteration
-strategy). `fmatmul` (§13.2.1's original repro) has also not been re-verified since these
-fixes; it very plausibly hit the exact same `Ara`/`AraVlsu` bug given the identical stall
-signature (`Ara`'s queue full, head instruction a `vle32.v`/similar VLSU op never marked
-done) documented there.
+
+**Confirmed on the full 256-core topology too** (no debug-topology env vars, default
+`gvsoc_config.json`, `timeout 300`): also reaches EOC, no hang, in far fewer simulated
+cycles than the debug topology (250-cycle 1st execution, 128% utilization, vs. 6290 cycles
+at 81% for 16 cores — expected, since 256 cores do 16× the parallel work). Result:
+`Calc:452.100891, Exp:628.153869` — still a mismatch, and a *different* miscalculated value
+than either the 16-core run here (`350.577697`) or the pre-boot-hang-fix baseline in §13.1
+(`189.697906`), consistent with this being a genuine, distinct-per-topology numerical bug
+(§13.1) rather than an artifact of the livelock fixes. This is the natural next
+investigation now that the model runs end-to-end on the real topology for the first time.
+
+`fmatmul` (§13.2.1's original repro) has not been re-verified since these fixes; it very
+plausibly hit the exact same `Ara`/`AraVlsu` bug given the identical stall signature
+(`Ara`'s queue full, head instruction a `vle32.v`/similar VLSU op never marked done)
+documented there.
 
 ### 13.3 Peripheral registers not fully implemented
 
