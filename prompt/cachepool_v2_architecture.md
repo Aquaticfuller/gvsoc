@@ -19,9 +19,14 @@
 > re-investigated. **`fmatmul` also reaches EOC on the full 256-core topology, and its
 > correctness check *passes*** (verified 2026-07-09: exit code 0, no "Core N error" lines,
 > 1935-cycle steady-state execution at 529% utilization) — confirming §13.2.1's original
-> repro (the `vfmacc`/`Ara`-queue-full livelock) is fully resolved end-to-end, and that the
-> §13.1 numeric mismatch is specific to `fdotp`'s reduction, not a general model-correctness
-> problem.
+> repro (the `vfmacc`/`Ara`-queue-full livelock) is fully resolved end-to-end. **Root-caused
+> and fixed a major contributor to §13.1's `fdotp` numeric mismatch** — see §13.1.1: scalar
+> loads/stores to the whole `0x8000_0000` DRAM region were silently bypassing the L1 cache
+> entirely (routed via the flat L2-refill path instead), due to a Python dict key collision
+> in `cachepool_v2_tile.py`'s per-core router setup. Fixing it moved the full-topology
+> `fdotp` result from `Calc:452.100891` (28% off `Exp:628.153869`) to `Calc:604.254089`
+> (3.8% off) — a large, confirmed improvement, though not yet exact; the remaining gap is
+> still open (see §13.1.1's "residual" note).
 
 ---
 
@@ -349,6 +354,103 @@ all groups' partial sums (cross-tile/cross-group L1 read/write visibility — se
 L1 interconnect, esp. the FlooNoc hop), vs. a numerical issue in the vector dot-product
 kernel itself (`kernel/fdotp.c`) at this problem size. User's prior stated on
 2026-07-08: suspects the issue is *not* the interconnect.
+
+### 13.1.1 Root cause found and fixed: scalar accesses to the whole 0x8000_0000 DRAM region silently bypassed L1 (2026-07-09)
+
+**Starting point**: with §13.2.1-13.2.5's livelock fixes in place, `fdotp` finally reaches
+EOC end-to-end (§13.2.5) but the check still fails (`Calc:452.100891, Exp:628.153869` on
+the full 256-core topology). Per the user's own hypothesis — *"since it only occurs to
+dotp, I highly doubt [suspect] the reduction part, since in matmul we do not have real
+shared data"* — investigation focused on `main.c`'s two-level reduction (`result[]` array
+at `0x800037c8`, read/written by every core across group and global barriers), since it's
+the one thing `fdotp` does that `fmatmul` (which passes) doesn't: many cores' scalar
+`fsw`/`flw` cross-reading each other's just-written values.
+
+**Investigation path** (each step ruled something out or found something real):
+1. Instrumented `InsituCacheController::handle_request()` (`core/models/cache/insitu/
+   insitu_cache_controller.cpp`) to trace every access to `result[]`'s 1KB address range.
+   **Zero writes ever reached it** — but reads to other addresses worked fine, and the
+   `fsw` instructions clearly retired (confirmed via the always-on `[SCALAR_PC_DBG]`
+   trace). This ruled out a lost-response bug (already fixed in §13.2.3/13.2.4) and pointed
+   at the write never even reaching the L1 subsystem.
+2. Chased the ISS-side dispatch for scalar float stores. `core/models/cpu/iss/src/
+   snitch_fast/fpu_lsu.cpp`'s `FpuLsu` class (which has pre-existing, **still-uncommitted**
+   WIP async-response support from an earlier, unrelated session, and shares a single
+   request buffer + stall-callback slot with the regular `Lsu` — a real but, it turned out,
+   irrelevant fragility) was the first suspect, but instrumenting it directly showed **it is
+   never even called** for `fsw`/`flw` in this configuration.
+3. Instrumented `Sequencer::float_handler` (`core/models/cpu/iss/src/spatz/
+   fpu_sequencer.cpp`, which intercepts every `fp_op`-tagged instruction for a register-
+   hazard check before dispatching to the real handler) and used `dladdr()` to resolve the
+   real handler's function pointer to a symbol + file offset. This revealed the actual
+   handler is `fsw_exec`/`flw_exec` in `core/models/cpu/iss/include/isa/rvf.hpp` — a
+   **different, generic ISA file** from the `snitch_fast/`-specific one step 2 was looking
+   at. These call `iss->lsu.store_float_perf<uint32_t>`/`load_float_perf<uint32_t>` — i.e.
+   the **regular `Lsu` class** (`lsu_implem.hpp`), not `FpuLsu` at all. (`FpuLsu`'s
+   async-response WIP from step 2 is real fragility worth revisiting some day, but is not on
+   the path this ISA/core configuration actually exercises for scalar float ops.)
+4. Instrumented `Lsu::store_float`/`store_resume` (the actually-used path). The store
+   completes **synchronously** (`IO_REQ_OK`) every single time (963/963 = exactly matching
+   the expected write count for 3 iterations × 321 writes/iteration) — so from the core's
+   perspective, everything works. Yet `InsituCacheController` still saw zero writes.
+5. Cross-checked against the always-on `[MEM_DBG]` trace at `core/models/memory/
+   memory.cpp` (fires at the final DRAM/L2 backing-store level, `offset<0x2000`, unrelated
+   to this investigation but already in the tree): found **22000+ individual 4-byte writes
+   landing directly at `l2_mem`** — i.e. the writes *were* completing, just not through the
+   L1 cache. This meant the request was being **routed to L2 directly**, bypassing L1
+   entirely — a routing bug, not a lost/dropped request.
+6. Instrumented `Router::handle_req()` (`core/models/interco/router/router.cpp`, already
+   had a `[ROUTER_DBG]` print for a different address range from the §13.2.2 boot-hang
+   investigation — added a second one for `result[]`'s range) to see which named mapping
+   the per-core scalar router (`ico{core_id}` in `cachepool_v2_tile.py`) selected. Writes
+   consistently matched `mapping=axi` (the catch-all) → tile `axi_ico` (`output`) → group
+   `Hierarchical_Interco` (`output`) → SoC `axi_ico_i` (`l2`) → `l2_mem` — exactly the L2
+   refill path from §12.5, confirming step 5's finding and explaining *why*: **the `l1`
+   mapping simply never matched.**
+
+**Root cause**: `Router.add_mapping()` (`core/models/interco/router.py:161`) stores
+mappings in a **plain Python dict keyed by name**: `self.get_property('mappings')[name] =
+{...}`. `cachepool_v2_tile.py`'s per-core router setup registered *two* mappings with the
+same name:
+```python
+ico.add_mapping('l1', base=DRAM_BASE,   size=0x20000000)   # 0x8000_0000 region
+ico.add_mapping('l1', base=0xa0000000,  size=0x20000000)   # 0xa000_0000 region — same key!
+```
+The second call **silently overwrote** the first in the dict — there was never a working
+`l1` mapping for the `0x8000_0000` region at all. *Every* scalar load/store to that entire
+512 MB region (not just `fdotp`'s `result[]` — any scalar access to normal cacheable DRAM)
+fell through to the `axi` catch-all and got routed via the flat, non-cached L2-refill path
+instead of the L1 cache. `fdotp`'s reduction is what actually surfaced it because it's the
+one place where correctness *depends on* cross-core L1 visibility of scalar writes with
+short turnaround (group-leader reads happening soon after sibling writes) — the RTL/L1
+timing model was simply never in the loop for these accesses. `fmatmul` didn't trip over
+this because vector loads/stores (`vlsu_in{k}_{l}`) go through a completely separate port
+straight to `l1.vlsu_in{k}_{l}` (§5), bypassing `ico` (and this bug) entirely — only
+*scalar* float ops hit it, and `fmatmul`'s output writes are vectorized.
+
+**Fixed**: renamed the two mappings to distinct names (`l1_dram`, `l1_pdcp`), each still
+bound to the same `l1.pe_in{core_id}` target (two separate `self.bind()` calls — the same
+"give unique names, bind both to the same destination" pattern already used for the
+FlooNoc fix in §13.2.3/cluster.py).
+
+**Verified**: rebuilt, reran on the full 256-core topology. Router trace now shows all 963
+writes correctly resolving to `mapping=l1_dram`. The `fdotp` result improved from
+`Calc:452.100891` (28% off) to **`Calc:604.254089` (3.8% off `Exp:628.153869`)** — a large,
+unambiguous improvement matching the theory precisely (correct routing → real cache
+timing/coherence in the loop → far closer to the reference value).
+
+**Residual, not yet resolved**: the result is still not exact (3.8% off on the full
+topology). The 16-core debug topology's result was *unchanged* by this fix
+(`Calc:350.577697`, bit-for-bit identical to before) — a discrepancy in itself, not yet
+understood, that suggests either the debug topology's reduced-core-count reduction
+algorithm hits a different problem, or this fix's effect happens to be masked at that
+scale. Next steps: (a) understand why the 16-core topology didn't move at all, (b) narrow
+down the remaining 3.8% on the full topology — candidates include genuine floating-point
+summation-order differences between the model's execution order and the reference
+(`dotp_result` in `data_32768.h`) at this problem size, or a smaller, still-undiscovered
+correctness gap in the same family as this one (worth re-running the `[RESULT_DBG]`/
+`[RESULT_ROUTER_DBG]`/`[LSU_DBG]` instrumentation left in the tree from this investigation,
+all still gated/filtered to `result[]`'s address range and easy to re-enable).
 
 ### 13.2 matmul crash — VLSU burst crossing cacheline boundary (model bug)
 

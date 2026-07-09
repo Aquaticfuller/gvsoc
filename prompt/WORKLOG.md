@@ -8,6 +8,57 @@
 
 ---
 
+## 2026-07-09 (cont'd 5) — CachePool v2: found + fixed a router dict-key collision silently routing ALL scalar 0x8000_0000-region accesses around the L1 cache; fdotp result 28% off -> 3.8% off
+
+**Status:** uncommitted (`pulp` submodule; `core`, `engine` untouched this round --
+full detail in `prompt/cachepool_v2_architecture.md` §13.1.1).
+
+- Followed up on §13.1's numeric-mismatch item, prompted by the user's hypothesis
+  that it's specific to fdotp's cross-core reduction (not a general correctness
+  issue, since fmatmul -- no cross-core shared-data dependency -- passes cleanly).
+- Traced scalar `fsw`/`flw` dispatch through several dead ends before finding the
+  real path: `Sequencer::float_handler` (fpu_sequencer.cpp) intercepts fp_op-tagged
+  instructions, and `dladdr()`-resolving its captured handler pointer showed the
+  real callee is `core/models/cpu/iss/include/isa/rvf.hpp`'s `fsw_exec`/`flw_exec`
+  -> the regular `Lsu` class (lsu_implem.hpp), NOT `FpuLsu`
+  (`snitch_fast/fpu_lsu.cpp`) as initially suspected -- that class's pre-existing,
+  still-uncommitted async-response WIP from an earlier session turned out to be a
+  red herring for this particular bug (real fragility, just not on this code path).
+- `Lsu::store_float` completes synchronously (`IO_REQ_OK`) every time, but
+  `InsituCacheController::handle_request()` (core) never saw any of these writes.
+  Cross-checked against the always-on `[MEM_DBG]` trace: the writes *were*
+  landing, but directly at `l2_mem`, bypassing L1 -- a routing bug.
+- **Root cause**: `Router.add_mapping()` (`core/models/interco/router.py:161`)
+  stores mappings in a plain Python dict keyed by name.
+  `cachepool_v2_tile.py`'s per-core `ico` router registered *two* mappings both
+  named `'l1'` (one for the `0x8000_0000` region, one for `0xa0000000`) -- the
+  second call silently overwrote the first. Every scalar access to the entire
+  `0x8000_0000`-`0xA0000000` DRAM region (not just fdotp's `result[]`) had no
+  working `l1` mapping and fell through to the `axi` catch-all, bypassing the L1
+  cache entirely for the flat L2-refill path. fdotp's reduction is what surfaced
+  it because it's the one workload that depends on cross-core L1 visibility of
+  scalar writes; fmatmul's vector stores go through a separate port
+  (`vlsu_in{k}_{l}` straight to `l1.vlsu_in{k}_{l}`) that never touches this
+  router at all.
+- **Fixed** (`pulp/cachepool_v2/cachepool_v2_tile.py`): renamed the two mappings
+  to `l1_dram`/`l1_pdcp`, both bound to the same `l1.pe_in{core_id}` target (two
+  `self.bind()` calls) -- same pattern as the FlooNoc dual-region fix earlier
+  today (§13.2.3).
+- **Verified**: full 256-core topology fdotp result improved from
+  `Calc:452.100891` (28% off `Exp:628.153869`) to `Calc:604.254089` (3.8% off) --
+  a large, clear improvement. Router trace confirms all 963 `result[]` writes now
+  correctly resolve to `mapping=l1_dram`.
+- **Residual, not understood yet**: still not exact (3.8% off), and the 16-core
+  debug topology's result was completely unchanged by this fix
+  (`Calc:350.577697`, bit-identical to before) -- flagged for next round. Debug
+  instrumentation from this investigation (`[RESULT_DBG]` in
+  insitu_cache_controller.cpp, `[RESULT_ROUTER_DBG]` in router.cpp, `[LSU_DBG]` in
+  lsu.cpp/lsu_implem.hpp, `[SEQ_DBG]` in fpu_sequencer.cpp, `[FPU_LSU_DBG]` in
+  fpu_lsu.cpp) all left in the tree, gated/filtered to result[]'s address range,
+  ready to re-enable for the next round.
+
+---
+
 ## 2026-07-09 (cont'd 4) — CachePool v2: fmatmul reaches EOC AND passes its correctness check on the full 256-core topology
 
 **Status:** doc-only update (no code change).
