@@ -8,6 +8,115 @@
 
 ---
 
+## 2026-07-08/09 — CachePool v2: `pulp` rebased onto upstream/master; permanent-boot-hang root cause found & fixed (wrong Hierarchical_Interco port name); second hang localized to lost VLSU async responses (open)
+
+**Status:** uncommitted (`pulp`, `core`, `engine` submodules — see full detail in
+`prompt/cachepool_v2_architecture.md` §13.2.2, not duplicated here).
+
+- Rebased `pulp` (`Aquaticfuller/gvsoc-pulp`) onto `gvsoc/gvsoc-pulp` `master`
+  (55 commits, incl. the `SnitchMempool` core originally requested) — clean,
+  no conflicts. `core`/`engine` untouched.
+- Two pre-existing latent bugs (unrelated to the rebase, just never previously
+  exercised) fixed to unblock the rebuild: `Hierarchical_Interco`'s always-
+  constructed `Cache` sub-block segfaulting at small elaboration sizes
+  (`pulp/mempool/l2_interconnect/hierarchical_interco.py`), and
+  `Hierarchical_cache`'s per-tile icache sizing math going fractional/negative
+  at `cores_per_tile < 2` (`pulp/mempool/hierarchical_cache.py`, worked around
+  not fixed).
+- Added a `CACHEPOOL_V2_NB_X_GROUPS`/`_NB_Y_GROUPS`/`_TILES_PER_GROUP`/
+  `_CORES_PER_TILE` debug-topology override + bootrom BOOTDATA patcher to
+  `cachepool_v2_system.py`, turning an 8+ minute repro into ~15s.
+- **Root cause of the long-standing fdotp/matmul "silent hang" found**: every
+  core was permanently stuck on the very first bootrom instruction. Traced
+  through the ISS decode/fetch path, the generic GVSoC component-binding
+  engine (`engine/engine/src/component.cpp`, `ports.cpp`), and the AXI router
+  chain to a single wrong port name in `cachepool_v2_group.py` — bound a
+  tile's AXI output to `Hierarchical_Interco`'s `'input'` port, but with the
+  default `nb_slaves=1` it actually exposes `'input_0'`. The mismatch
+  silently created an orphaned, never-connected placeholder port (GVSoC
+  auto-creates one for any unrecognized "self"-referenced name rather than
+  erroring), so every instruction fetch and L1 refill for every core got
+  `IO_REQ_INVALID` forever, permanently caching a decode of "illegal
+  instruction" at the reset vector. **Fixed.**
+- Verified: post-fix, PC advances cleanly out of the bootrom and deep into
+  real program code (millions of cycles, `fdotp` reaches `0x80002fc8`+).
+- A **second, distinct hang** appears once boot completes, same general class
+  as the previously-documented matmul `Ara`-queue livelock (§13.2.1): traced
+  to `AraVlsu`'s per-port request-object pool permanently draining because
+  some async burst's memory response never arrives, freezing `pending_size`
+  and head-of-line-blocking `Ara`'s global 8-slot queue. Root location within
+  the L1 FlooNoc/cache-bank chain not yet found — open.
+- Operational notes worth remembering: the `gvsoc` CLI wrapper silently
+  swallows the launched process's stdout/stderr — invoke
+  `install/bin/gvsoc_launcher --config=gvsoc_config.json` directly instead;
+  and `gvsoc_config.json` is never regenerated if it already exists (no
+  staleness check), so `rm -f gvsoc_config.json` before every regen or you
+  silently keep simulating stale topology/wiring.
+
+## 2026-07-08 — CachePool v2: fdotp/matmul functional verification, two Ara/Spatz bugs fixed, matmul deadlock traced to Ara/AraVlsu queue desync (open)
+
+**Status:** uncommitted (core submodule). Full detail in
+`prompt/cachepool_v2_architecture.md` §13.1–§13.2.1 (kept current, not
+duplicated here).
+
+**Context:** verifying the CachePool v2 build/run flow works end-to-end on
+`fdotp-32b_M32768` and `fmatmul-32b_M32_N32_K32`. fdotp's `result[64]`→`result[256]`
+array-size bug (software, ManyRVData) was fixed upstream by the user; re-ran
+and found a *different*, still-open numeric mismatch (`Calc:189.697906` vs
+`Exp:628.153869`, ratio ≈0.302). Root cause not yet identified — ruled out
+the two bugs fixed below (bit-for-bit identical fdotp output before/after).
+
+**Two real bugs found and fixed** (both in `core/models/cpu/iss/src/`, per
+the user's out-of-order-memory hypothesis — CachePool's NUMA/cache paths
+return `IO_REQ_PENDING`/`IO_REQ_DENIED` far more than the flat
+standalone-Spatz testbench this model was originally validated against):
+1. `spatz/fpu_sequencer.cpp:101-109` (`Sequencer::float_handler`) — missing
+   `nb_out_reg` offset when indexing `args[]` for the FREG-input hazard
+   check, so e.g. `flw`'s single OUTPUT arg's flags got checked instead of
+   its INPUT arg's, and the wrong (aliased) scoreboard slot got queried.
+2. `ara/spatz_vlsu.cpp` (`AraVlsu::fsm_handler`) — `ara.insn_commit()` was
+   called unconditionally at burst-issue time, even for async
+   `IO_REQ_PENDING`/`IO_REQ_DENIED` responses, prematurely signalling
+   vector-chaining consumers that data was ready before `data_response()`
+   had actually written it. Deferred the async case's commit into
+   `data_response()` (2 extra IoReq arg slots pushed, 4 total for AraVlsu,
+   10/16 of the documented budget — still safe).
+
+**Verification:** rebuilt clean; both fixes confirmed to have **zero**
+observable effect on fdotp (bit-for-bit identical output) and **zero**
+effect on the matmul hang's onset cycle (still hangs at the same
+`pc=0x800007b0`, same cycle 6197, before and after). Real bugs, not the
+cause of either symptom.
+
+**matmul hang (was a crash, now a livelock/deadlock, still open):** the
+`spatz_lane_width=8`→`4` fix from a previous session stopped the
+`IO_REQ_INVALID` abort, but running `fmatmul-32b_M32_N32_K32` now hangs
+forever instead. Traced (via targeted rate-limited `fprintf` instrumentation
+— `--trace-level=trace` was unusably slow, hanging elaboration itself for
+10-15s with zero output even scoped narrowly) to: `Ara`'s shared 8-slot
+`pending_insns[]` queue gets permanently stuck full from cycle ~6092, head
+instruction `vle32.v v20, (t2)` (`pc=0x800007cc`) never marked `done`,
+head-of-line-blocking all subsequent vector instructions via
+`vector_insn_stub_handler`'s `queue_is_full()` gate. `AraVlsu`'s own local
+bookkeeping (`nb_waiting_insn`, `pending_size`) looks idle throughout the
+hang, suggesting a desync between `AraVlsu`'s three internal indices
+(`insn_first`, `insn_first_waiting`, `insn_last`) and `Ara`'s single global
+`insn_first` / `insn_end()` completion signal. Not yet pinned to an exact
+line — next step is a careful read of `AraVlsu::fsm_handler`'s bottom
+completion check against `Ara::insn_end`, not more instrumentation.
+
+**Debug instrumentation left in tree** (gated/rate-limited, harmless, not
+yet cleaned up): `spatz_vlsu.cpp` (`[VLSU_DBG]`, `[VLSU_WAIT_DBG]`,
+`[VLSU_BURST_DBG]`), `ara.cpp` (`[ARA_DBG]`), `snitch.cpp` (`[STUB_DBG]`).
+Strip once the real fix lands.
+
+**Operational note:** matmul runs must be wall-clock-bounded
+(`timeout ≤30s`) — a hung run's default per-cycle trace spam produces
+multi-GB logs in seconds. Two separate accidental multi-GB logs were
+generated and deleted during this session.
+
+---
+
 ## 2026-06-16 — Structural rewrite kickoff: master plan + Step 1 (decode/encode datapath)
 
 **Direction (user):** implement EVERY microarch/arch component with the REAL RTL logic (not the

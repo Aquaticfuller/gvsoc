@@ -74,6 +74,64 @@ Two frontends exist:
 
 Examples live under `examples/<target>/` and each has a `testset.cfg` + `gvtest.yaml`. Example binary for DDR experiments: `gvsoc --target=pulp-open-ddr --binary <bin> image flash run --trace=ddr`.
 
+## CachePool v2 target
+
+### Build
+
+All commands run from the **inner gvsoc folder** (`/scratch/diyou/cachepool/gvsoc/gvsoc/`), never the root.
+
+```bash
+conda run -p /home/msc26f31/.conda/envs/gvsoc bash -c \
+  'cd /scratch/diyou/cachepool/gvsoc/gvsoc && \
+   eval "$(scripts/setup_elfutils_headers.sh --env)" && \
+   CXX=g++-14.2.0 CC=gcc-14.2.0 CMAKE=cmake-3.18.1 make build TARGETS="cachepool_v2"'
+```
+
+- The conda env with Python 3.12 + toolchain is at `/home/msc26f31/.conda/envs/gvsoc`.
+- `setup_elfutils_headers.sh --env` sets `CPATH`/`LIBRARY_PATH` for elfutils headers; run once to download, `--env` is fast/idempotent on subsequent calls.
+- Use target `cachepool_v2` (not `cachepool`).
+
+### Run simulation
+
+```bash
+# Source the environment first (once per shell session):
+source sourceme.sh
+
+# Run (from /scratch/diyou/cachepool/gvsoc/gvsoc/):
+gvsoc --target=cachepool_v2 \
+      --binary ../ManyRVData/software/build/CachePoolTests/test-cachepool-fdotp-32b_M32768 \
+      image flash run \
+      --trace=/cachepool_v2_soc/cachepool_cluster/group_0_0/tile_0/pe0 \
+      --trace=/cachepool_v2_soc/peripheral \
+      > ./gvsoc_trace.txt
+```
+
+- `../ManyRVData` is relative to the inner gvsoc folder → resolves to `/scratch/diyou/cachepool/gvsoc/ManyRVData/`.
+- Test binaries live in `../ManyRVData/software/build/CachePoolTests/`.
+- `--trace=` paths are GVSoC component hierarchy paths (not filesystem paths). Use `.` to trace everything (very verbose). `--trace-level=trace` has been observed to stall elaboration itself for 10-15s producing zero output even scoped to a handful of components — avoid it; prefer targeted `fprintf(stderr, ...)` instrumentation in the C++ source for deep debugging.
+- To capture the fatal message before an `abort()`, prefix with `stdbuf -oL -eL` to disable stdio buffering.
+- Do **not** run the process in the background; kill any hung simulation and check the log.
+- **The `gvsoc` wrapper can silently swallow the launched process's stdout/stderr** (confirmed: `fprintf(stderr, ...)` calls that fire on every instruction produced zero bytes through it, even after 90s+). If a run looks suspiciously silent, generate the config with a short-timeout `gvsoc ... image flash run` (the config write happens within the first ~1-10s, well before any hang) then invoke `install/bin/gvsoc_launcher --config=gvsoc_config.json` **directly** — this reliably shows real-time output.
+- **`gvsoc_config.json` is not regenerated if it already exists** — there's no mtime/staleness check against the Python topology source. Always `rm -f gvsoc_config.json` before regenerating after any Python-side change, or you'll silently keep simulating the old topology/wiring.
+- **Debug-topology override** (for faster iteration than the full 256-core config): `CACHEPOOL_V2_NB_X_GROUPS` / `_NB_Y_GROUPS` / `_TILES_PER_GROUP` / `_CORES_PER_TILE` env vars (default 4/4/4/4) in `cachepool_v2_system.py`, e.g. `CACHEPOOL_V2_NB_X_GROUPS=2 CACHEPOOL_V2_NB_Y_GROUPS=2 CACHEPOOL_V2_TILES_PER_GROUP=1 CACHEPOOL_V2_CORES_PER_TILE=4` = 16 cores instead of 256. Keep `CORES_PER_TILE>=2` — `Hierarchical_cache`'s icache sizing math (`pulp/mempool/hierarchical_cache.py`) goes fractional/negative below that (known bug, not yet fixed, see `prompt/cachepool_v2_architecture.md` §13.2.2).
+
+### Directory layout
+
+| Path | Contents |
+|------|----------|
+| `/scratch/diyou/cachepool/gvsoc/gvsoc/` | GVSoC SDK — source, build, install, sourceme.sh |
+| `/scratch/diyou/cachepool/gvsoc/ManyRVData/` | RTL reference + built software + test binaries (read-only) |
+| `pulp/pulp/cachepool_v2/` | Python topology files for the v2 model |
+| `core/models/cache/insitu/` | InsituCache C++/Python model |
+| `core/models/cpu/iss/src/ara/spatz_vlsu.cpp` | Spatz VLSU (AraVlsu with DENIED handling) |
+
+### Key design notes
+
+- **Address normalization**: The "uncached" DRAM region 0xa0000000–0xBFFFFFFF is treated as cacheable DRAM for now. `cachepool_v2_tile.py` maps it to 0x80000000-based addresses before L1. The `CachepoolV2DramNormalizer` shim (`cachepool_v2_dram_normalizer.cpp`) handles this for VLSU ports without consuming IoReq arg slots (unlike Router, which calls `arg_alloc(4)` per traversal).
+- **IoReq arg stack**: `IO_REQ_NB_ARGS = 16` slots. Each Router traversal costs 4 slots. Components using `req_forward` (L1NocAddressConverter, DramNormalizer) cost 0 slots. The FlooNoc NI needs slots at `current_arg+0` and `current_arg+1`.
+- **AraVlsu DENIED**: When the FlooNoc NI already has a pending burst, it returns `IO_REQ_DENIED` to a second concurrent VLSU request on the same port. The fix in `spatz_vlsu.cpp` treats DENIED like PENDING — increments `nb_pending_bursts` and advances the address. The NI will eventually call `response` via the Router's response path.
+- **GVSoC composite-boundary port names must match exactly, and a mismatch fails silently.** When crossing a composite component boundary with `self.bind(child, 'child_port', self, 'boundary_name')` + (one level up) `self.bind(tile_instance, 'boundary_name', target, 'target_port')`, the *exact* port name string must match what the target component actually exposes (e.g. `Router`/`Hierarchical_Interco` with `nb_slaves=N` expose `input_0..input_{N-1}`, not a plain `input`, once `N` is passed or defaulted). GVSoC's `vp::Component::create_ports()` auto-creates a placeholder `VirtualPort` for *any* unrecognized "self"-referenced name rather than raising an error — so a typo'd port name silently produces an orphaned, never-connected dead end instead of a build failure. This caused a real bug: every core in `cachepool_v2` was permanently stuck at the reset vector because `cachepool_v2_group.py` bound to `axi_ico`'s `'input'` instead of `'input_0'` (see `prompt/cachepool_v2_architecture.md` §13.2.2). When a request mysteriously comes back `IO_REQ_INVALID` despite the wiring "looking right" in Python, suspect this first — check `Router::req()`'s `!entry->itf.is_bound()` branch, or instrument `engine/engine/src/ports.cpp`'s `MasterPort::bind_to_slaves()`/`get_final_ports()` to see whether the binding chain actually resolves (`nb_final` should be ≥1, not 0).
+
 ## Testing
 
 `gvtest` is the test driver. Top-level `testset.cfg` imports subsets from `core/tests`, `core/docs/developer_manual/tutorials`, `tests/`, `examples/`.
@@ -132,10 +190,11 @@ When the user says "the RTL has updated, please update our model" or equivalent:
 4. **Update `core/models/cache/insitu/insitu_cache_config.py`** to mirror new
    knobs. Default values should track the latest CachePool ctrl defaults (not
    the cache_top defaults, which are different).
-5. **Wire the C++ side** in `insitu_cache_controller.cpp`: read the new
-   properties via `get_js_config()->get_child_*`, gate behaviour appropriately
-   (e.g. `if (write_through_mode_) issue_write_through(req);`). Phase A can
-   keep these as simple gates; full-topology refactors go to Phase B.
+5. **Wire the C++ side**: for the calibrated path, edit `insitu_cache_controller.cpp`
+   (read props via `get_js_config()->get_child_*`, gate behaviour — e.g.
+   `if (write_through_mode_) issue_write_through(req);`). For the structural path,
+   wire the corresponding knob in `insitu_cache_core.cpp` or the relevant header.
+   Phase A = simple gates; full-topology refactors go to Phase B.
 6. **Regression smoke**:
    `make all TARGETS="insitu_cache_microbench spatz:use_insitu_cache=True insitu_cache_tb"`
    then run `gvsoc --target=insitu_cache_microbench run` and confirm the 7
@@ -148,6 +207,8 @@ The RTL location and the GVSoC repo location are tracked in
 `~/.claude/projects/.../memory/rtl_readonly.md`.
 
 ### Summary of the model:
+
+**Calibrated (cycle-approximate) path** — default (`use_structural_core=False`):
 
 - `insitu_cache_controller.{cpp,py}` — one cache controller (tag array, MSHR, hit/miss,
   hash-or-LRU victim selection, eviction, refill, write-through hook).
@@ -162,6 +223,30 @@ The RTL location and the GVSoC repo location are tracked in
   `InsituCacheTileConfig` bundling them. `make_cachepool_512_config()` returns the
   canonical 1-tile / 4-core / 4-way / 128-set / 512b-line / hash-way configuration from
   `prompt/insitu_cache_architecture.md §1.3`.
+
+**Structural (RTL-faithful) path** — opt-in (`use_structural_core=True` in
+`InsituCacheTileConfig`). Steps 1–4 committed; Steps 3/5/6/7 pending. Latency emerges
+from pipeline cycles; calibration deferred until Steps 5–7 are in place:
+
+- `insitu_cache_decode.hpp` — Step 1: RTL-faithful address decode, hash-way (`lowtag^lowset`),
+  SOP hit/hit_pend/hit_conflict/all_pend classify, full-assoc LRU victim, encoder LRU-credit
+  update, masked byte merge. Header-only, no ports.
+- `insitu_cache_bank_array.hpp` — Step 2: pseudo-dual-port bank model (6-state R/W classify,
+  `bank_select = low log2(BankFactor) bits of set`, per-cycle WR_CONFLICT scoreboard → read
+  retry next cycle). Header-only.
+- `insitu_cache_fwd_buffer.hpp` — Step 3: forwarding buffer header (in progress).
+- `insitu_cache_core.{cpp,py}` — Step 4: per-cycle ClockEvent FSM core (2-stage pipeline:
+  stage-0 arbitrate → preread; stage-1 decode+FSM+bank write+drain). Consumes Steps 1–2.
+  Bounded streaming accept queue (`max_outstanding` knob, default 32).
+- `insitu_cache_par_coalescer.{cpp,py}` — Step 5: parallel coalescer (RTL `par_coalescer_top`
+  port; stub / in progress).
+- `insitu_cache_xbar.{cpp,py}`, `insitu_cache_remote_xbar.{cpp,py}` — Step 6: crossbar and
+  remote crossbar (in progress).
+- `insitu_cache_cell_coalescer.{cpp,py}` — cell-granularity coalescer.
+- `insitu_cache_amo.hpp`, `insitu_cache_amo_shim.{cpp,py}` — AMO support shim.
+- `insitu_cache_group.py` — group component (composite helper).
+- `insitu_cache_coalesce.hpp`, `insitu_cache_l2_addr.hpp`, `insitu_cache_route.hpp`,
+  `insitu_cache_spm_remap.hpp`, `insitu_cache_sync_fsm.hpp` — shared header logic.
 
 **Enabling on the spatz cluster.** `ClusterArch` in
 `pulp/pulp/snitch/snitch_cluster/snitch_cluster.py` takes `use_insitu_cache=False`
@@ -179,6 +264,8 @@ the cache at DDR instead is a matter of configuring `wide_axi`'s map to route
 cache-range refills elsewhere.
 
 **Design notes** (see `prompt/insitu_cache_gvsoc_plan.md` for the full plan):
+- Two selectable implementations share the same tile wrapper. `InsituCacheTileConfig.use_structural_core=False` (default) → calibrated controller; `=True` → per-cycle FSM core (Steps 1–4). The cluster integration keeps the default until the structural core's synchronous-slave inline mode lands (Steps 5–7).
+- The structural core's per-access latency over-predicts under deep saturation (open-loop replay double-count + single-outstanding-refill serialization). Do not read structural-core numbers as calibrated; closed-loop region_cyc comparison is the right metric (see `prompt/insitu_cache_misspath_diagnosis_2026-06-16.md §13`).
 - The model is cycle-approximate (<5% target), not cycle-exact.
 - `IoReq::get_args()` is **shared** with `save()`/`restore()` (save pushes 4 slots onto
   the arg stack starting at `current_arg`). Don't co-use slots without offsetting past
@@ -193,12 +280,18 @@ cache-range refills elsewhere.
 scalar host → single `InsituCacheTile` → memory) for driving focused microbenchmarks
 without the full Spatz cluster. Build via `make all TARGETS=insitu_cache_tb`.
 
-**Build environment.** The GVSoC Python code (including `config_tree`) requires
-Python ≥ 3.10 for `str | None` syntax. If the default `python3` is 3.9, shim it:
-`ln -sf /usr/bin/python3.12 /tmp/py312_shims/python3 && PATH=/tmp/py312_shims:$PATH make …`.
-Needed pip packages for Python 3.12: `typing_extensions prettytable rich pexpect
-pycryptodome ppk2_api pyelftools psutil lz4 setuptools<81 numpy pandas matplotlib mako
-hjson jsonref`.
+**Build environment.** On the ETH cluster (`fenga` / `gondola` nodes), the correct
+Python is in the shared conda env. Full build procedure:
+
+```bash
+conda activate /home/msc26f31/.conda/envs/gvsoc
+eval "$(scripts/setup_elfutils_headers.sh --env)"   # sets CPATH + LIBRARY_PATH
+CXX=g++-14.2.0 CC=gcc-14.2.0 CMAKE=cmake-3.18.1 make build TARGETS="cachepool"
+source sourceme.sh
+```
+
+The default system `python3` is 3.6 (too old). The conda env at
+`/home/msc26f31/.conda/envs/gvsoc` provides Python 3.12 with all required packages.
 
 **elfutils headers (since the 2026-06 upstream pull).** Upstream's ISS now resolves trace
 PC→symbol at runtime via libdw (`core/models/cpu/iss*/src/trace.cpp` includes
@@ -207,11 +300,16 @@ PC→symbol at runtime via libdw (`core/models/cpu/iss*/src/trace.cpp` includes
 cluster ships the runtime libs (`libdw.so.1`/`libelf.so.1`) but **not** `elfutils-devel`, and
 there's no passwordless sudo. Provide the headers + the missing `libdw.so` link symlink
 **without sudo** via `scripts/setup_elfutils_headers.sh` (dnf-downloads the matching
-`elfutils-devel` RPM into the gitignored `third_party/elfutils-devel/` and extracts just the
-headers). Then export what it prints before building:
+`elfutils-devel` RPM into `third_party/elfutils-devel/` and extracts just the headers). Once
+run once, the `--env` flag just prints the exports (fast, idempotent):
 `eval "$(scripts/setup_elfutils_headers.sh --env)"` → sets `CPATH` (include search) and
 `LIBRARY_PATH` (link search). Without these, the iss targets fail to compile
 (`elfutils/libdwfl.h: No such file`) / link (`cannot find -ldw`).
+
+**Note on `dnf download` failures.** If `setup_elfutils_headers.sh` fails with
+`Error: Loading repository 'code'` (VS Code's dnf repo failing), the root filesystem
+is also likely full (`/var/tmp` out of space). Run dnf with:
+`dnf download --disablerepo=code --setopt=cachedir=/tmp/dnf-cache-elf ...` to bypass both.
 
 ## Development log (for weekly reports)
 
@@ -268,11 +366,17 @@ column. GVSoC-side pieces:
 - `make_cachepool_512_calib_config()` in `insitu_cache_config.py` — one
   controller, 5 ports, 4-way × 256-set (= 64 KiB), matching the RTL DUT geometry.
 
-Reference numbers to match (config 512): **warm read-hit = 10 cyc isolated /
-7 cyc streaming**, **cold read-miss = MemLatency + 17 cyc**, **miss throughput
-serialized** (≈ 1/(MemLatency+17), not divided by accept depth), **single-port
-hit ceiling ≈ 0.86 acc/cyc**. Full comparison + current gaps:
+Reference numbers to match **for the calibrated controller** (config 512):
+**warm read-hit = 10 cyc isolated / 7 cyc streaming**, **cold read-miss =
+MemLatency + 17 cyc**, **miss throughput serialized** (≈ 1/(MemLatency+17)),
+**single-port hit ceiling ≈ 0.86 acc/cyc**, **write latency 8 / throughput
+~0.49**, **read-after-write forwarding 7 cyc**. Full comparison + current gaps:
 `prompt/insitu_cache_calib_report.md`.
+
+The structural core (`use_structural_core=True`) is **not yet calibrated** —
+per-access latency over-predicts under saturation (open-loop replay double-count;
+see `prompt/insitu_cache_misspath_diagnosis_2026-06-16.md §13`). Calibrate via
+closed-loop `region_cyc` once Steps 5–7 are in place.
 
 ## Architecture notes
 
