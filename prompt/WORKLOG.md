@@ -8,6 +8,26 @@
 
 ---
 
+## 2026-07-09 (cont'd 4) — CachePool v2: fmatmul reaches EOC AND passes its correctness check on the full 256-core topology
+
+**Status:** doc-only update (no code change).
+
+- Ran `test-cachepool-fmatmul-32b_M32_N32_K32` (§13.2/§13.2.1's original matmul
+  repro -- the crash, then the livelock, that kicked off this whole
+  investigation) on the full 256-core topology, `timeout 300`.
+- **Reaches EOC, exit code 0, no `Core N error` lines** -- the correctness
+  check *passes*. 1935-cycle steady-state execution, 529% utilization,
+  active cores 8.
+- This confirms the matmul crash (§13.2) and livelock (§13.2.1) were
+  ultimately the same root cause as fdotp's: the boot-hang bug (§13.2.2)
+  and the Ara/AraVlsu completion-signaling bug (§13.2.5). With both fixed,
+  matmul now runs correctly end-to-end -- not just "no longer hangs" but
+  actually produces the right answer, unlike fdotp which still has the
+  separately-tracked §13.1 numeric-mismatch issue in its reduction. Closes
+  out §13.2/§13.2.1 as resolved.
+
+---
+
 ## 2026-07-09 (cont'd 3) — CachePool v2: confirmed fdotp reaches EOC on the full 256-core topology too
 
 **Status:** doc-only update (no code change).

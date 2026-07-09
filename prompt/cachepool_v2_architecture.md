@@ -16,7 +16,12 @@
 > topology's reduced core count doesn't match the "Exp" reference value's assumed 256-core
 > reduction). This is §13.1's pre-existing, separately-tracked numeric-mismatch item — not a
 > new regression, and now finally re-checkable end-to-end on the real topology, but not yet
-> re-investigated. `fmatmul` has not been re-verified since these fixes either.
+> re-investigated. **`fmatmul` also reaches EOC on the full 256-core topology, and its
+> correctness check *passes*** (verified 2026-07-09: exit code 0, no "Core N error" lines,
+> 1935-cycle steady-state execution at 529% utilization) — confirming §13.2.1's original
+> repro (the `vfmacc`/`Ara`-queue-full livelock) is fully resolved end-to-end, and that the
+> §13.1 numeric mismatch is specific to `fdotp`'s reduction, not a general model-correctness
+> problem.
 
 ---
 
@@ -360,8 +365,12 @@ The VLSU has no handler for `IO_REQ_INVALID` → fatal.
 4-byte bursts (one float32) never cross a 64-byte cacheline boundary for 4-byte-aligned data.
 
 **Status**: the crash itself is gone, but running `test-cachepool-fmatmul-32b_M32_N32_K32`
-now **hangs forever** instead (verified 2026-07-08) — see §13.2.1 for the ongoing
-investigation. Not yet a working matmul run.
+then **hung forever** instead (verified 2026-07-08) — see §13.2.1 for the investigation.
+**Resolved 2026-07-09**: after the boot-hang fix (§13.2.2) and the `Ara`/`AraVlsu`
+completion-signaling fix (§13.2.5), `test-cachepool-fmatmul-32b_M32_N32_K32` reaches EOC on
+the full 256-core topology with **no hang and a passing correctness check** (exit code 0,
+no `Core N error` lines, 1935-cycle steady-state execution at 529% utilization) — this was
+in fact the same underlying bug as §13.2.5, not a separate matmul-specific issue.
 
 #### 13.2.1 matmul livelock/deadlock investigation (open, 2026-07-08)
 
