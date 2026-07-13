@@ -18,7 +18,8 @@ This repo is a top-level "SDK" that aggregates several git submodules into a sin
 The repo's own `core/CMakeLists.txt` is empty (0 bytes) before `git submodule update` — if a clean-looking tree appears empty, the submodules likely aren't checked out.
 
 The `core` and `pulp` submodules are pointed at the user's forks
-(`Aquaticfuller/gvsoc-core` and `Aquaticfuller/gvsoc-pulp`). Both forks use
+(`DiyouS/gvsoc-core` and `DiyouS/gvsoc-pulp`; previously `Aquaticfuller/...`,
+a colleague's fork the user doesn't have push access to). Both forks use
 `master` as the default branch and have a long-lived `insitu-cache` dev
 branch. **When the user asks to "rebase the dev branches", "pull from
 upstream/main", or "update from main", see `prompt/rebase_dev_branches_runbook.md`
@@ -76,6 +77,47 @@ Examples live under `examples/<target>/` and each has a `testset.cfg` + `gvtest.
 
 ## CachePool v2 target
 
+### Hardware/software reference
+
+- **RTL branch & commit**: `dev/multi-group` @ `05e4671a6cc355923793893c7be5bc373cbb0dde` — the ManyRVData hardware revision this GVSoC model is built against. See also `rtl_readonly` memory for the reference tree location.
+- **Software config**: `cachepool_fpu_16g` — the ManyRVData config used to generate the CachePoolTests software/binaries this model is validated against.
+
+### Known gaps / not yet implemented
+
+The 256-core fdotp/fmatmul livelock (undersized `pdcp_mem`) documented as open in
+`prompt/cachepool_v2_architecture.md` §13.1/13.2 **is fixed and verified** (both
+kernels reach `EOC: exit code 0` with zero `FAIL` at full 256-core scale) — that
+doc predates the fix and is stale on this point; trust this file + `git log` over
+it for current status.
+
+Actual open items:
+
+1. **Address scrambling in L1** — the model approximates the RTL's hash-way
+   victim/set-index selection with a Knuth-style hash rather than RTL's exact
+   polynomial (`core/models/cache/insitu/README.md` §9 roadmap item 4). Only
+   matters if set-index aliasing becomes workload-visible.
+2. **Cache partitioning** — `cachepool_v2_cluster_peripheral.cpp` doesn't
+   implement `l1d_part` / `l1d_xbar_config` / `l1d_flush`; those writes silently
+   return OK and are no-ops (`prompt/cachepool_v2_architecture.md` §13.3/13.4).
+   The 0xa0000000 "uncached" region is also treated identically to cacheable
+   DRAM — coalescer-side uncached logic isn't implemented either.
+3. **L2 refill mesh** — RTL's real L2-side interconnect is WIP upstream, so this
+   model uses a flat AXI `Router` tree (not a mesh) from each group down to
+   `l2_mem`/`pdcp_mem`. Those backing stores are also plain `memory.Memory`
+   (idealized fixed-latency), not routed through DRAMSys — no realistic DRAM
+   timing model yet either.
+4. **Calibration** — Phase 6 validation (RTL-vs-GVSoC cycle-count/counter diff on
+   curated workloads: cache-line-rw-smoke, random reads, streaming writes,
+   blocked GEMM, vector AXPY) hasn't been done (`core/models/cache/insitu/
+   README.md` §9). The calibrated controller is validated against the standalone
+   `insitu_cache_calib` testbench, not the full `cachepool_v2` topology.
+5. **Structural (RTL-faithful, per-cycle) cache core** — a second,
+   `use_structural_core=True` implementation path exists alongside the default
+   calibrated controller; Steps 1–2/4 are committed but Steps 3 (forwarding
+   buffer), 5 (parallel coalescer), and 6 (crossbar/remote crossbar) are
+   incomplete, and it isn't wired into `cachepool_v2` at all. Not just
+   uncalibrated — the model itself is unfinished.
+
 ### Build
 
 All commands run from the **inner gvsoc folder** (`/scratch/diyou/cachepool/gvsoc/gvsoc/`), never the root.
@@ -108,6 +150,7 @@ gvsoc --target=cachepool_v2 \
 
 - `../ManyRVData` is relative to the inner gvsoc folder → resolves to `/scratch/diyou/cachepool/gvsoc/ManyRVData/`.
 - Test binaries live in `../ManyRVData/software/build/CachePoolTests/`.
+- **`test-cachepool-fdotp-32b_M8192` will not run correctly at 256 cores** — the M8192 problem size is too small to divide evenly across 256 Spatz-4 cores. Use `test-cachepool-fdotp-32b_M32768` (or larger) for full 256-core runs; M8192 is only valid at smaller core counts.
 - `--trace=` paths are GVSoC component hierarchy paths (not filesystem paths). Use `.` to trace everything (very verbose). `--trace-level=trace` has been observed to stall elaboration itself for 10-15s producing zero output even scoped to a handful of components — avoid it; prefer targeted `fprintf(stderr, ...)` instrumentation in the C++ source for deep debugging.
 - To capture the fatal message before an `abort()`, prefix with `stdbuf -oL -eL` to disable stdio buffering.
 - Do **not** run the process in the background; kill any hung simulation and check the log.

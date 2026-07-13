@@ -8,6 +8,64 @@
 
 ---
 
+## 2026-07-13 — 256-core fdotp/fmatmul livelock: TRUE root cause (undersized `pdcp_mem`), debug cleanup, fork migration
+
+**Status:** committed (`core`, `pulp`) and this entry's own parent commit.
+
+- Root-caused the 256-core livelock (open since the HW_BARRIER fix above) to
+  `pulp/pulp/cachepool_v2/cachepool_v2_system.py`'s `pdcp_mem` being sized
+  256 MB while the L1 side (`cachepool_v2_tile.py`'s `l1_pdcp` mapping)
+  advertises a full 512 MB window — addresses ≥0xb0000000 fell through to
+  the SoC router's unmapped catch-all and refills there were rejected
+  `IO_REQ_INVALID`, permanently stranding the requesting core's MSHR entry.
+  Found via targeted cache-controller-level tracing (`[CACHE_SEND_REFILL
+  ... status=1]`). Fixed by widening `pdcp_mem` and its two router mappings
+  to 0x20000000 (`pulp` commit `bcd0066`).
+- Along the way, investigated and ruled out two other hypotheses (shallow
+  router input queues; a FlooNoc self-loop/missing-map bug) via targeted
+  experiments — both disproven, reverted. Also found and fixed a real,
+  independent latent bug: `InsituCacheController`'s single shared
+  `refill_req_` had no concurrency guard against overlapping misses
+  (`core` commit `68503b61`, `refill_busy_`/`refill_wait_queue_`) — not the
+  cause of this livelock, but worth keeping.
+- **Verified** at full 256-core scale: `test-cachepool-fdotp-32b_M32768`
+  (`EOC: exit code 0`, all 321 checkpoints `OK`) and
+  `test-cachepool-fmatmul-32b_M128_N128_K128` (`EOC: exit code 0`, no
+  `FAIL`). Note: `fdotp-32b_M8192` does **not** work at 256 cores — the
+  problem size doesn't divide evenly across 256 Spatz-4 cores; use M32768+
+  for full-scale runs (now documented in `CLAUDE.md`).
+- Stripped all debug `fprintf` instrumentation accumulated across this and
+  the preceding investigation rounds (`core` commit `d7d6c50f`, 12 files;
+  `pulp` commit `7c8e758`, incl. `BARRIER_HEARTBEAT`/`NOC_DROP`/
+  `NOC_ENTRY`/`NOC_DELIVER`).
+- Rewrote 5 unpushed `core` commits and 6 unpushed `pulp` commits (message-
+  only, verified via empty tree diff) to remove dangling references to
+  `prompt/cachepool_v2_architecture.md ... in the parent repo` that don't
+  make sense outside this repo.
+- **Fork migration**: `core`/`pulp` were pointed at a colleague's fork
+  (`Aquaticfuller/gvsoc-{core,pulp}`), which the user doesn't have push
+  access to (confirmed via `ssh -T git@github.com` resolving to a different
+  GitHub identity). User forked `gvsoc`/`gvsoc-core`/`gvsoc-pulp` to their
+  own account (`DiyouS`); added `myfork` remotes and pushed the
+  `insitu-cache` branch in both submodules there. Parent `.gitmodules`
+  updated to point at the `DiyouS` forks; this commit bumps the `core`/
+  `pulp` submodule pointers to match.
+- Added to `CLAUDE.md`: hardware/software reference (RTL `dev/multi-group`
+  @ `05e4671a6cc355923793893c7be5bc373cbb0dde`, software config
+  `cachepool_fpu_16g`), a "Known gaps / not yet implemented" section
+  (address scrambling / hash polynomial, cache partitioning, L2 refill
+  mesh + DRAM timing, calibration, the incomplete structural cache core),
+  and the M8192-doesn't-scale-to-256-cores note above.
+
+**Files touched (parent).** `.gitmodules`, `CLAUDE.md`, `prompt/WORKLOG.md`,
+submodule pointers `core` → `d7d6c50f`, `pulp` → `7c8e758`.
+
+**Verification.** Clean rebuild (`make build TARGETS="cachepool_v2"`) from
+the fully-committed tree; `test-cachepool-fdotp-32b_M32768` reruns clean
+post-cleanup (`EOC: exit code 0`, zero `FAIL`).
+
+---
+
 ## 2026-07-09 (cont'd 6) — CachePool v2: TRUE root cause of the fdotp numeric mismatch found and fixed — HW_BARRIER never actually blocked
 
 **Status:** committed (`core`, `pulp` submodules -- full detail in
