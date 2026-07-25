@@ -18,8 +18,7 @@ This repo is a top-level "SDK" that aggregates several git submodules into a sin
 The repo's own `core/CMakeLists.txt` is empty (0 bytes) before `git submodule update` — if a clean-looking tree appears empty, the submodules likely aren't checked out.
 
 The `core` and `pulp` submodules are pointed at the user's forks
-(`DiyouS/gvsoc-core` and `DiyouS/gvsoc-pulp`; previously `Aquaticfuller/...`,
-a colleague's fork the user doesn't have push access to). Both forks use
+(`Aquaticfuller/gvsoc-core` and `Aquaticfuller/gvsoc-pulp`). Both forks use
 `master` as the default branch and have a long-lived `insitu-cache` dev
 branch. **When the user asks to "rebase the dev branches", "pull from
 upstream/main", or "update from main", see `prompt/rebase_dev_branches_runbook.md`
@@ -210,6 +209,20 @@ A cycle-approximate GVSoC model of the CachePool InSitu L1 data cache lives in
   initial GVSoC model was built against. Retained for the per-line-state-machine /
   FSM-state details that still apply.
 
+### Structure map convention (user request, standing)
+
+Maintain a **dated structure map** — `prompt/insitu_cache_structure_map_<YYYY-MM-DD>.md` — a single
+hierarchical tree of the InSitu cache (Cluster→Group→Tile→per-core cache→internals) with every node
+**badged by GVSoC model status** (✓ implemented+calibrated / ≈ approximated / ✗ not yet modeled →Phase
+/ N/A out of scope), plus a status table. The latest one is
+`prompt/insitu_cache_structure_map_2026-06-15.md`.
+
+**Whenever the model's structure changes** (a Phase item lands, a new mechanism is modeled, a topology
+refactor, etc.), **write a NEW dated structure map** reflecting the change — do **not** overwrite the
+old one. The dated files form a visible history of how model coverage advanced. (Reminder of a key
+fact the map must keep right: the L1 is **shared, not private** — the Tile L1 Xbar routes any core to
+any bank by address, extended cross-tile by the remote xbars.)
+
 ### Tracking new RTL revisions (procedure)
 
 When the user says "the RTL has updated, please update our model" or equivalent:
@@ -323,18 +336,17 @@ cache-range refills elsewhere.
 scalar host → single `InsituCacheTile` → memory) for driving focused microbenchmarks
 without the full Spatz cluster. Build via `make all TARGETS=insitu_cache_tb`.
 
-**Build environment.** On the ETH cluster (`fenga` / `gondola` nodes), the correct
-Python is in the shared conda env. Full build procedure:
+**Build environment.** The GVSoC Python code (including `config_tree`) requires
+Python ≥ 3.10 for `str | None` syntax. If the default `python3` is 3.9, shim it:
+`ln -sf /usr/bin/python3.12 /tmp/py312_shims/python3 && PATH=/tmp/py312_shims:$PATH make …`.
+Needed pip packages for Python 3.12: `typing_extensions prettytable rich pexpect
+pycryptodome ppk2_api pyelftools psutil lz4 setuptools<81 numpy pandas matplotlib mako
+hjson jsonref`.
 
-```bash
-conda activate /home/msc26f31/.conda/envs/gvsoc
-eval "$(scripts/setup_elfutils_headers.sh --env)"   # sets CPATH + LIBRARY_PATH
-CXX=g++-14.2.0 CC=gcc-14.2.0 CMAKE=cmake-3.18.1 make build TARGETS="cachepool"
-source sourceme.sh
-```
 
-The default system `python3` is 3.6 (too old). The conda env at
-`/home/msc26f31/.conda/envs/gvsoc` provides Python 3.12 with all required packages.
+> NOTE (2026-07 merge of DiyouS's `cachepool` work): his CLAUDE.md documented a conda env at
+> `/home/msc26f31/.conda/envs/gvsoc` and paths under `/scratch/diyou/...` — that is HIS working copy.
+> Our environment uses the py312 shim above and this repo at `.../manyRVData/ManyRVData_GVSoC/gvsoc`.
 
 **elfutils headers (since the 2026-06 upstream pull).** Upstream's ISS now resolves trace
 PC→symbol at runtime via libdw (`core/models/cpu/iss*/src/trace.cpp` includes
