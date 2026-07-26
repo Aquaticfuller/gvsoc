@@ -6,6 +6,352 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-26 (P1.1):** A1 VLSU delayed-commit DONE (core `e49c12b9`) + the SoC-DRAM bandwidth
+divergence it exposed FIXED (pulp `cdc4aa8`, width_log2 2→6). All 9 kernel binaries PASS data-correct at
+16-core cache-ON with vector traffic now paying the calibrated cache latency; calib TB exact (async 67/10,
+structural 67/10 @xbar=0; 68/11 @xbar=1 = the intended step-4 interco hop — new `INSITU_CALIB_XBAR_LAT`
+boundary knob, pulp `a0dfa38`). Doc: `prompt/cachepool_p1_1_vlsu_delayed_commit_2026-07-26.md`.
+
+---
+
+## 2026-07-26 (cont'd 6) — P1.1 DONE: A1 VLSU delayed-commit + the bandwidth bug it exposed
+
+First item of the gap-review roadmap (`prompt/cachepool_architecture_gap_review_2026-07-26.md`).
+
+**The gap.** The Spatz AraVlsu committed every IO_REQ_OK burst to the vreg scoreboard AT ISSUE —
+`get_full_latency()` ignored. Through the InSitu cache (which stamps hit/miss latency ON the sync OK
+return), all vector loads/stores were ~0-cycle: the calibrated cache latency never reached the scoreboard,
+and chained consumers could logically read unwritten elements.
+
+**Fix (core `e49c12b9`).** Ported the Ara variant's delayed-burst pattern to the Spatz `AraVlsu`
+(`CONFIG_GVSOC_ISS_USE_SPATZ` branch — NOT the `#else` branch, which already had it; first attempt edited
+the wrong class, build error caught it): OK bursts with full_latency>0 are held in `delayed_bursts` with
+timestamp=now+latency, args left on the req; `fsm_handler` drains ALL eligible per firing (VLSU issues
+nb_ports/cyc — a 1/cyc drain would serialize streams) through the existing `data_response` path.
+Latency-0 OK keeps the issue-time commit.
+
+**What A1 exposed — the real bug underneath.** First post-fix runs collapsed ~3.5× (fdotp M8192
+24k→86k, M32768 94k→279k) with per-burst latency growing unboundedly (39+). NOT the commit logic:
+`cachepool.py` had BOTH SoC memories at `width_log2=2` (4 B/cyc) — an 8× under-provision vs the ~32 B/cyc
+aggregate VLSU stream, so memory.cpp's `next_packet_start` busy-stamp diverged and `get_full_latency()`
+grew without bound. Pre-A1 nobody consumed that latency on the commit path (it only inflated cache-miss
+refills), so it went unnoticed. Fix (pulp `cdc4aa8`): `width_log2` 2→6 on `mem` AND `uncached` → latencies
+bounded (max ~13).
+
+**Verified.** (a) Calib TB exact: async controller 67/10 (warm/cold @ML50, RTL refs 10/67); structural
+67/10 @xbar=0 — A1 is ISS-only, provably can't touch the trace-replay TB, confirmed empirically. The
+structural 68/11 @xbar=1 is step-4's intended interco hop (RTL standalone TB has no interco); added
+`INSITU_CALIB_XBAR_LAT` (pulp `a0dfa38`) to select the diff boundary. (b) Full 16-core (4×4) cache-ON
+sweep, ALL 9 binaries retval=0 + zero FAIL lines (+ spin-lock result 120=gold, byte-enable PASSED):
+fdotp_M32768 147,383 (pre-A1 87,346, +69% = the delayed-commit effect), gemv 154,115 (+72%), fft 109,226
+(+89%), fdotp_M8192 48,877 — vs load-store 567,257 (−49%), linked-list 2,215,363 (−49%), fmatmul 37,858
+(−22%), spin-lock 24,001 (−11%), byte-enable 204,873 (−3%) = the bandwidth-divergence-removal effect
+(pre-A1 baselines ran with the divergent memory inflating every refill). Direction mix explained per
+kernel in the doc. Full table + analysis: `prompt/cachepool_p1_1_vlsu_delayed_commit_2026-07-26.md`.
+
+**Methodology traps hit (again):** (1) `gvsoc` without the py312 shim on PATH dies on `str | None` —
+silently if stdout is redirected, leaving stale CSVs that read as plausible results (cost me one bogus
+"68/11 regression" scare: the numbers were from an inconsistent pre-rebuild install state, clean rebuild
+reproduces 67/10 exactly); (2) target Python is copied to `install/generators/` at build time
+(copy_if_different) — source edits need `make build TARGETS=...`; (3) rm gvsoc_config.json between knob
+changes; (4) zsh doesn't word-split unquoted `$VAR` in `env $VARS cmd` (use explicit assignments) and
+`echo ===X===` glob-fails.
+
+**Next:** P1.2 (E1 MSB address rotation — per-bank capacity collapse).
+
+---
+
+## 2026-07-26 (cont'd 5) — Calibration steps 1–5 COMPLETE: full-calibration sweep = ALL 8/8 PASS
+
+Step 5 (re-measure with the full calibration, steps 1–4 applied). 16-core (4×4) cache-ON, all 8 CI kernels:
+**ALL 8/8 PASS data-correct.** Calibrated 16-core cycles vs pre-calibration baseline: spin-lock 26879 (was
+25695), fdotp 87346 (86243), gemv 89481 (88331), fmatmul 48765 (46491), byte-enable 210777 PASSED (196355),
+load-store 1108280 (1105531), fft 57934 (57477), linked-list 4312955 (4305314). The calibration report
+(`prompt/cachepool_architecture_and_calibration_2026-07-25.md`) is updated with the step-1–4 results + the
+final state. Calibration report doc has the runbook + the remaining items (per-kernel RTL cycle diff, cell
+coalescer, DRAM-timing refinement).
+
+**CALIBRATION LADDER (steps 1–5) COMPLETE.** All commits local; see the task list + the calibration doc.
+
+---
+
+## 2026-07-26 (cont'd 4) — Calibration step 4 (xbar/hop latency) + step 5 running
+
+**Step 4 (xbar + cross-tile hop latency, was 0).** Read the RTL: `tcdm_cache_interco` has one request-side
+`spill_register` per port (response path is a fall-through register = 0), and `cachepool_group` uses AXI
+`CUT_ALL_PORTS` (a pipeline cut on every port) — so each xbar / cross-tile hop ≈ 1 cycle on the request path.
+The remote xbar is the same module. Added `xbar_latency_cycles` / `hop_latency_cycles` to
+InsituCacheTileConfig (default **1**) and passed them to the xbar / remote-xbar instantiations (they were
+instantiated with 0). Also fixed a Python gotcha in cachepool.py (`import memory.dramsys` branch-local broke
+the else path). Commits: core (xbar/hop wiring), pulp `7edfa38` (import fix), parent `2b54472`.
+**Verified: 4-core single tile fdotp 93552 (was 92867, +685 xbar hops); 16-core group spin-lock 26879 result
+120 gold 120 (was 25695, +1184 cross-tile hops) — both data-correct.**
+
+**Step 5 running:** full-calibration 16-core (4×4) kernel sweep with steps 1–4 all applied.
+
+---
+
+## 2026-07-26 (cont'd 3) — DRAMSys kernel-crash ROOT CAUSE + FIX (the icache DENIED bug)
+
+The vendored-DRAMSys SystemC segfault (`Cache::refill_response` ← `ddr::rspCallback` ← `peqCallback` ←
+`sc_simcontext::simulate`) was NOT a DRAMSys-library bug — it was a **cache_impl (the standard GVSoC cache,
+used by the icache's Hierarchical L0/L1 banks) async-refill accounting bug**, exposed only by DRAMSys.
+
+Root cause (trace-driven): with plain `memory.Memory`, refills return `IO_REQ_OK` synchronously, so
+`Cache::refill_response` is never called asynchronously. DRAMSys instead returns `IO_REQ_PENDING` and responds
+asynchronously, AND under load it returns **`IO_REQ_DENIED`** (busy → queues the request in `denied_req_queue`
+and retries it later via `reqCallback` → `grant` + `paraSendRequest` → responds). `cache_impl::refill()`
+handled only `IO_REQ_OK`/`IO_REQ_PENDING`; on `IO_REQ_DENIED` it returned NULL with **no parked user request
+and no `pending_refill`**. The denied refill was still queued + retried + responded by DRAMSys, and
+`Cache::refill_response` then fired with an EMPTY `refill_pending_reqs` → `pop()` on an empty queue (vp_assert
+is a no-op in Release) → segfault. Proven by the diag trail: a `[DDR-RESP]` for `0x1460` with NO corresponding
+`[REFILL_ISSUE]` — the DENIED request retried later.
+
+**Fix (core, cache_impl.cpp):** treat `IO_REQ_DENIED` exactly like `IO_REQ_PENDING` (park the user request +
+set `pending_refill`); DRAMSys then retries + responds and the accounting stays correct. **Verified:
+fdotp_M8192 cache-ON with DRAMSys DDR4 backing now COMPLETES (`retval=0 cycles=28001`)**, refill queue stays
+healthy. Diagnostics removed; only the fix remains.
+
+This was the last blocker for the realistic-DRAM calibration step. The runtime recipe (LD_PRELOAD of the
+rebuilt SystemC 3.0.1 + DRAMSys libs + `gvsoc_launcher_sc`) is documented in `cachepool.py` and the earlier
+WORKLOG entry.
+
+---
+
+## 2026-07-26 (cont'd 2) — DRAMSys debug: root causes found, one vendored kernel-crash open
+
+Debugging the DRAMSys integration (step 3). Chain of root causes, each verified:
+
+1. **v1 wrapper abort at elaboration**: `install/models/memory/dramsys.so: undefined symbol
+   sc_core::sc_api_version_3_0_1_cxx201703L...sc_writer_policy` at dlopen. The symbol IS in the SystemC lib,
+   but **`dramsys.so` and `gvsoc_launcher` don't link SystemC** (no libsystemc in NEEDED), so it must come
+   from the process's global namespace. **Fix: `LD_PRELOAD .../libsystemc.so.3.0.1`** → elaboration passes,
+   DRAM instantiates ("DRAM id is: 0").
+2. **Wrong DRAMSys lib**: the prebuilt `add_dramsyslib_patches/libDRAMSys_Simulator.so` needs
+   **libsystemc.so.2.3** (SystemC 2.3); we built 3.0.1. Use the freshly-rebuilt
+   `.../build_dynlib_from_github_dramsys5/DRAMSys/build/lib/libDRAMSys_Simulator.so`.
+3. **Launcher**: plain `install/bin/gvsoc_launcher` instantiates but **hangs** (SystemC kernel not driven);
+   **`install/bin/gvsoc_launcher_sc`** (built by the SC-enabled build) drives it.
+4. **v2 wrapper**: rejects the loader's write — it is beat-form only (size>beat_width → fatal; needs
+   burst_id/is_last) and our masters are legacy `io`, not io_v2, so the beat adapter doesn't engage. v1
+   (plain-io) is the natural fit.
+5. **OPEN (vendored)**: with preload + SC launcher, the vendored DRAMSys SystemC model **segfaults inside
+   `sc_core::sc_simcontext::simulate`** (from sc_main) — a genuine third-party-library crash, no debug
+   symbols. Configs all present (addressmapping/simconfig/memspec OK). Next step = build DRAMSys with debug
+   info to localize the crash in its SystemC processes.
+
+Committed: pulp `4e42434` (v1 wiring + the runtime recipe in a comment), parent `c82981b`. The default
+(plain-memory) path is unchanged. Steps 1–2 (cache latency model) calibrated + committed, unaffected.
+Steps 4 (xbar/hop latency) + 5 (re-measure) remain; realistic-DRAM is gated on the kernel-crash debug.
+
+---
+
+## 2026-07-26 (cont'd) — Calibration step 3 (DRAMSys): infra + wiring done, vendored-model issue open
+
+**Infra:** ran `make dramsys_preparation` (sourceme_systemc.sh) — SystemC 3.0.1 built into
+`third_party/systemc_install/`, `libDRAMSys_Simulator.so` rebuilt from source (prebuilt self-test failed),
+configs copied to `core/models/memory/dramsys_configs/` (incl. `ddr4-example.json`).
+
+**Wiring (pulp `2b98759`):** `CACHEPOOL_DRAMSYS=1` routes the cached-DRAM backing store through DRAMSys
+(`memory.dramsys.Dramsys`, `CACHEPOOL_DRAM_TYPE`, default `ddr4-example.json`) instead of plain
+fixed-latency `memory.Memory`. Gated off by default (fast functional path unchanged). Uses the v2 wrapper.
+
+**OPEN ISSUE (vendored, not our cache):** the **v1 wrapper segfaults at sim start** in this tree; the **v2
+wrapper elaborates + instantiates (DRAM id 0) but rejects the loader's DRAM write at 0x80000000** ("Received
+error during copy", exitcode 1) — a vendored-wrapper integration issue (capacity/address-range or beat
+protocol). Next debug: check the ddr4-example.json capacity/address map vs our rebased HBM addresses, and the
+v2 beat adapter for the loader's large (0x3960 B) writes. Steps 1–2 (the cache's own latency model) are
+calibrated + committed and unaffected. Steps 4 (xbar/hop latency) + 5 (re-measure) remain.
+
+---
+
+## 2026-07-26 — Calibration, steps 1–2 DONE (sync-slave hit/miss knobs + refill-occupancy)
+
+Following the calibration order from `prompt/cachepool_architecture_and_calibration_2026-07-25.md`.
+
+**Step 1 (core `a850fbe7`) — sync-slave hit/miss knobs vs RTL.** Baseline on the calib TB (structural tile +
+inline sync, STRUCT_BANKS=1): warm hit 9 (RTL 10), cold miss ML+12 (RTL ML+17) — exactly the documented gap.
+The shared knob keys (hit_latency_cycles=9 / miss_penalty_cycles=7) belong to the async controller's
+interco(1)+drain decomposition, so the sync-slave path got its own overrides:
+`structural_hit_latency_cycles=10`, `structural_miss_penalty_cycles=12` (fallback -1 → shared keys), set in
+make_cachepool_512_config (inherited by the group factory). KEY GOTCHA (again): the C++ reads component
+**properties** via get_child_int, not the config object — the new keys had to be added to
+`insitu_cache_core.py`'s `add_properties`, and `gvsoc_config.json` must be deleted before re-measuring (stale
+config zeroed the knobs the first time). Measured: warm hit 10 ✓, cold miss 67 @ML=50 / 117 @ML=100 ✓
+(ML+17 + ML-scaling). The controller's own calibration untouched.
+
+**Step 2 (core `e2aeb60a`) — refill-occupancy gate for cold-miss throughput.** Baseline: cold_stream
+throughput 0.0188 @ML=50 (RTL ~0.0149) — 26% too fast: the inline miss path overlapped the +pipeline
+(bank_write+miss_penalty) with the next refill's memory latency (misses serialized only on ML via the calib
+mem's busy-gate; the cachepool backing memory.cpp doesn't serialize at all). Fix: per-cell refill-occupancy
+gate — each refill issues no earlier than the previous line's ready cycle (`sync_refill_busy_until_`), the
+request stamped (issue + ML_nominal + bank_write + miss_penalty) with the store's UNGATED latency (ml_nominal,
+min full_latency), plus `structural_install_tail_cycles=3` (the RTL install-pipeline tail, added to the
+occupancy only, NOT the reported latency, so isolated ML+17 is unchanged). Measured: cold_stream 0.0143 @ML=50
+(RTL 0.0149, was 0.0188), 0.0083 @ML=100 (RTL 0.0085); isolated cold-miss 67 / warm hit 10 unchanged.
+Learnings: the mem's own ML-gate dominates any naive model gate (double-counting); the right mechanism is
+gating the refill ISSUE on the previous line's ready cycle + using the store's nominal (not gated) latency.
+
+**Next:** step 3 (DRAMSys behind the SoC DRAM — infra setup running), step 4 (xbar/remote-xbar hop latency,
+currently 0), step 5 (re-measure kernel tables).
+
+---
+
+## 2026-07-25 (cont'd 6) — #4 DONE: **ALL 8/8 CI kernels PASS cache-ON at the full 16-core CachePool** 🎉
+
+16-core (4 tiles × 4), cache ON, 380s each: **spin-lock 25695 (`result: 120; gold: 120` = Σ0..15 ✓) · fdotp
+86243 · gemv 88331 · fmatmul 46491 · byte-enable 196355 PASSED · load-store_M16 1105531 · fft 57477 retval=0
+(passes at the full config — its 4-core failure was purely the core-count partition mismatch) · linked-list
+4305314.** The multi-tile cache (cross-tile remote xbars + per-tile AMO) is **data-correct across the full
+CachePool**. 4-core stays 7/8 (fft only, partition). Milestone 3 of the north-star (cache in the data path,
+data-correct) is CLOSED. Remaining: milestone 5 cycle calibration vs RTL; fft at non-16 counts (partitionable
+SPM). Docs updated (run guide status banner, integration report final results).
+
+**GOAL LADDER COMPLETE:** #1 sweep ✅ → #2 spin-lock (AMO second_data) ✅ → #3 hygiene ×4 ✅ → #4 16-core +
+docs ✅.
+
+---
+
+## 2026-07-25 (cont'd 5) — #3 DONE: four hygiene fixes (core `19a1797d`, parent `cc10cca`)
+
+From the DiyouS-work review + follow-up analysis:
+1. **fpu_lsu.cpp build break** (his `a02a541d`): `stall_callback` used the single-outstanding form
+   unconditionally; with `CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING` it's an ARRAY (lsu.hpp:137) → compile error on
+   nb_outstanding>1 targets. Guarded both sites (index by the arg-0 req id, same convention as
+   `load_float_resume`). **Verified: snitch_testbench builds.**
+2. **refill_busy_ leak** (his `68503b61`, controller): the unmatched-response early return skipped
+   `refill_busy_ = false` → one stray response latched the refill slot forever (hard deadlock). Now releases
+   the slot + continues the wait queue on that path too.
+3. **Never-filled-line-VALID** (our `insitu_cache_core.cpp` miss fallback): a non-OK refill served the
+   requester from the never-filled line (stale/zero bytes) and marked it VALID → silent permanent garbage.
+   Now: revert the allocation, serve directly from the backing store, line stays unallocated (later access
+   retries the refill).
+4. **DENIED-drop** (structural core async accept path): accept-queue-full returned DENIED + dropped the
+   request — an async-capable master (the now-async Spatz VLSU) would wait forever for a resp() that never
+   comes. Now parks in a new `admission_stall_q_` (PENDING) and re-admits in stage0_arbitrate as space frees.
+Verified: cachepool + cachepool_v2 + snitch_testbench all build; spin-lock/byte-enable/fdotp cache-ON still
+pass. This closes the async-Spatz↔cache compatibility gap flagged earlier (alongside the already-landed
+controller-side hold/retry).
+
+---
+
+## 2026-07-25 (cont'd 4) — #2 VERIFIED: full cache-ON sweep = **7 of 8 kernels PASS**
+
+With the AMO second_data fix + per-core SPM, all 8 CI kernels cache-ON at 4-core (300s each):
+**spin-lock 10853 (result:6 gold:6) ✅ · load-store_M16 1086770 ✅ · fdotp 92867 ✅ · gemv 95262 ✅ ·
+fmatmul 30893 ✅ · linked-list 4249663 ✅ (was "needs CL_CLINT" — the never-blocking barrier + visibility
+were the real blockers!) · byte-enable 196001 PASSED ✅** · fft EOC retval=1 (59272, "Error: r:1024,i:1024"
+— the known 4-vs-16-core partition issue, reaches EOC cleanly, not a hang; a milestone-4 partitionable-SPM
+item). **The complete cache-in-the-loop model now runs 7/8 CI kernels data-correct at 4-core.**
+
+---
+
+## 2026-07-25 (cont'd 3) — #2 CLOSED: spin-lock root cause = AMO result written to the wrong IoReq buffer
+
+**The spin-lock livelock, root-caused end-to-end** (trace chain): all spinning cores in the mcycle backoff
+loop in perfect lockstep; the lock cell's stored values correct; yet no core ever acquired. The break came
+from comparing the AMO operand conventions: the ISS (`lsu.cpp:547-549`) sends the AMO operand in
+`req->get_data()` and delivers the **result via `req->get_second_data()`** (aliases rd); `memory.cpp`'s
+`handle_atomic` honours exactly that. **Our AMO shim wrote the old value to `get_data()` and never touched
+`get_second_data()`** → the core's rd kept stale garbage → `beqz/bnez` acquire check meaningless → live-lock
+(cache-OFF unaffected since memory.cpp does it right). **Fix (core `dc2e82ca`):** write the AMO old value +
+SC result to `get_second_data()`. **Verified: spin-lock cache-ON prints `result: 6; gold: 6`, EOC 10853 cyc**
+(was >500M-cycle livelock). This bug lived in our shim since Step 7/A3 and only mattered once `amo_lane` was
+enabled in the cachepool target.
+
+**Also in #2: byte-enable fixed by per-core-private SPM** (pulp `9aaa78d`, now the default): the shared-SPM
+stack-frame collision (previous entry). Verified byte-enable PASSES (196001 cyc). None of the 8 CI kernels
+use snrt_l1alloc (0 symbols) so per-core is safe for the suite.
+
+Commits: core `dc2e82ca` (AMO second_data fix), pulp `9aaa78d` (per-core SPM default), parent `fc69558`
+(pointer bump). Full cache-ON sweep with both fixes running next.
+
+---
+
+## 2026-07-25 (cont'd 2) — byte-enable/spin-lock cache-ON hang: ROOT CAUSE = shared-SPM stack collision
+
+**Investigation (#2 of the goal ladder).** byte-enable (scalar-only kernel, 5458 cyc cache-OFF) hangs cache-ON.
+Trace chain: (1) all 4 cores take **exception id 1 (instruction access fault)** at ~26.4k cyc and park in
+`__snrt_isr`'s `while(1)`; the others hang at the (now-blocking) barrier. (2) The fault is a **`ret` to `0x0`**
+— `_vsnprintf`'s epilogue `lw ra, 124(sp)` (0x80002334) returned **0**. (3) All-4-core PA trace of the slot
+(PA bffffeb4, SPM window): pe0 `sw ra=80001620` @26062, pe3 `sw ra=80001620` @26128, then **pe3's `printf_`
+frame store @26401 clobbers the slot**, pe1's `lw ra` @26406 reads 0. **All 4 cores share ONE SPM instance
+(spm_num_groups=NB_TILE=1) with the SAME sp VA → identical physical frame addresses → cross-core frame
+corruption.** Cache-ON perturbs timing into the overlap window; cache-OFF stays aligned. NOT a cache bug —
+the cache is only the timing trigger (same class as the fdotp barrier bug).
+
+**This vindicates DiyouS's per-core SPM (his 53effd9, which I reverted to NB_TILE during integration based on
+the June "per-core breaks shared l1alloc" conclusion — that conclusion now looks wrong for these binaries; the
+RTL CachePool SPM is per-core-private).** Tested `CACHEPOOL_SPM_GROUPS=4` (per-core): spin-lock now prints
+`Tile0, Core3:hello` (a second core through the lock — progress), byte-enable behavior changed, but NEITHER
+completes yet → a SECOND hang remains (under investigation: full 300s observation running).
+
+---
+
+## 2026-07-25 (cont'd) — Post-integration re-verification sweep (#1 of the goal ladder)
+
+**Goal ladder set (user):** #1 full re-verification sweep → #2 spin-lock AMO bug → #3 hygiene fixes
+(fpu_lsu #ifdef, refill_busy_ leak, never-filled-line VALID, structural DENIED-hold) → #4 16-core + docs.
+
+**#1 DONE — 8 CI kernels × cache OFF/ON × 4-core** (300s timeout each), post-integration + barrier fix:
+- **Cache-OFF 6/8** (no regressions): spin-lock 8710, load-store 1056405, fdotp 78842, gemv 82592, fmatmul
+  11978, byte-enable 5458; fft SIGABRT (SPM overflow, known), linked-list rc=1 (CL_CLINT, known). The
+  cache-OFF no-output issue from the integration is RESOLVED (was the 0x20/0x24/0x3c fixes).
+- **Cache-ON 3/8 pass**: fdotp_M32768 88916 (the fixed bug!), gemv 82741, fmatmul 13396.
+  **Clean pattern: the 3 passing kernels are all VECTOR kernels (VLSU lanes); the 3 hanging kernels
+  (spin-lock, byte-enable, load-store) are all SCALAR kernels — every access goes through the scalar lane
+  → AMO shim.** byte-enable is 5458 cyc cache-OFF → its cache-ON timeout is a REAL hang, not slowness.
+  fft cache-ON now reaches EOC retval=1 (59620 cyc, wrong result — the known 4-vs-16 partition issue,
+  different from cache-OFF's SIGABRT). Hypothesis for #2: the AMO shim / scalar-lane path, one common bug.
+
+---
+
+## 2026-07-25 — Integrated DiyouS's `cachepool` fork onto our repos + review report
+
+**What/why (user):** "cherry pick or rebase his new commits onto our repos, then review and report."
+
+- **Integration.** His parent `cachepool` (`0acc24d`) descends from our `main` (`f9ebafd`) → **fast-forward**.
+  `core` fast-forwarded `4341bbcc`→`d7d6c50f` (7 commits). `pulp`: he **rebased** our branch onto a newer
+  upstream base (7/8 of our patches byte-identical by patch-id; the 8th differs only in rebase context), so we
+  **adopted his `7c8e758d`** (+11 new commits) — replaying his work onto our older base would conflict.
+- **Adaptations.** (1) **engine**: his bump `9033115a` is unpublished (absent upstream; `DiyouS/gvsoc-engine`
+  404s) but **required** — his pulp needs `vp/debug_mem.hpp` or `l1_interleaver_impl.cpp` won't compile. Upstream
+  `main` is too new (`6c3fb708` drops `vp::MemCheckRequest` used by our `memory.cpp`), so pinned **`ea216770`**.
+  (2) `.gitmodules` restored to `Aquaticfuller/*`. (3) `CLAUDE.md` merged (kept his v2 section; restored our
+  fork URLs, build env, and the structure-map convention he'd dropped); WORKLOG merged.
+- **Commits.** parent `9c19864`, `608638b`, `b58e94e`, `97f5b91`; pulp `3321c02`, `43d1470`. Recovery refs:
+  `recovery/main-pre-diyou`, `recovery/insitu-cache-pre-diyou` (core+pulp), `recovery/engine-pre-diyou`.
+  **Not pushed.**
+- **Regressions found + fixed** (his `53effd9` retargets shared code at the newer `cachepool_fpu_16g` layout,
+  our target runs the older `cachepool_fpu_512` binaries): his `offset < 0x30` scratch intercept swallowed
+  **`0x20` CLUSTER_BOOT_CONTROL** (cores read 0, jumped to 0, ran 79M+ cycles with no output — the killer);
+  EOC moved `0x24`→`0x68` (ours writes 0x24); `spm_num_groups` `NB_TILE`→`NB_CORE` (breaks shared l1alloc).
+- **Verification.** Both `cachepool` and `cachepool_v2` **build clean**; `cachepool` 4-core cache-ON
+  `fdotp_M8192` → `[EOC] retval=0 cycles=24132` (pre-merge 24242). **Open:** cache-OFF still no output in 200 s;
+  8-kernel suite not re-run.
+- **Review headline:** his §13.1.2 (**HW_BARRIER never blocked**) + §13.1.1 (**Router.add_mapping dict-key
+  collision routing all scalar 0x8000_0000 accesses around the L1**) are very likely **OUR** fdotp bug — a
+  barrier/router bug, NOT a cache bug; the router collision also explains our "cache sees only ~40 accesses"
+  and identical-cycle observations. His core `68503b61` does **not** fix it (wrong component: our target runs
+  the structural `InsituCacheCore`, not `InsituCacheController`). Also found in his work: a **build break** on
+  default target `snitch_testbench` (`fpu_lsu.cpp`) and a **latent deadlock** (`refill_busy_` not cleared on the
+  early-return path).
+- 🎉 **OUR LONGEST-STANDING BUG IS FIXED** (pulp `c20bd51`, parent `d5994cf`). Acting on his §13.1.2 diagnosis:
+  the CachePool binaries read HW_BARRIER at **PERIPH+0x10**, but the generated *spatz* regmap (regwidth 64) puts
+  `HART_SELECT_0` at 0x10 and **`HW_BARRIER` at 0x40** — so `hw_barrier_req()` was never reached and
+  **`snrt_cluster_hw_barrier()` never blocked in ANY cachepool run**. Cores drifted across fdotp's 3 measurement
+  iterations (its `vfredusum` never resets `v0`, so each core's acc is 1×/2×/3×) and core 0's `result[]`
+  reduction mixed iterations → the timing-sensitive wrong value. Our own comment ("barrier@0x10 already
+  match the regmap") was wrong. Fix: dispatch 0x10 → `hw_barrier_req()` + honour `stall_core`. Also restored the
+  older-layout L1D block 0x28–0x4c (0x3c reads 0; 0x3c/0x4c were aborting with "Accessing invalid register")
+  and fixed a `cp_l1d[16]` index overrun (his 0x58–0xa4 handler reached index 19).
+  **NOT a cache bug** — the cache only desymmetrised core timing. **VERIFIED 4-core cache-ON:**
+  `fdotp_M32768` **[EOC] retval=0 cyc=88916, no Check Failed** (was Check Failed @88353); `fdotp_M8192` 24305;
+  `gemv-opt` 82741; `fmatmul` 13396. **Still open:** `spin-lock` + `byte-enable` hang (spin-lock is a
+  *separate* AMO/lock-word visibility bug — `spin_lock.c` has no shared counter, just `result += cid` under the
+  lock), and cache-OFF fdotp produced no output in 200 s.
+- **Report:** `prompt/diyous_cachepool_integration_review_2026-07-25.md`.
+
 ---
 
 ## 2026-07-13 — 256-core fdotp/fmatmul livelock: TRUE root cause (undersized `pdcp_mem`), debug cleanup, fork migration
@@ -449,6 +795,370 @@ Strip once the real fix lands.
 (`timeout ≤30s`) — a hung run's default per-cycle trace spam produces
 multi-GB logs in seconds. Two separate accidental multi-GB logs were
 generated and deleted during this session.
+
+---
+
+## 2026-06-25 (latest) — Configurable topology + AMO-fix validation + cross-core root-cause
+
+**Configurable topology (commit pulp `419f43d`):** N tiles × M cores/tile × K banks/tile via env knobs
+CACHEPOOL_NB_TILE / CACHEPOOL_CORES_PER_TILE / CACHEPOOL_BANKS_PER_TILE; NB_CORE = NB_TILE*CORES_PER_TILE;
+bootrom core_count(@0x44)/tile_count(@0x68) patched from the one base blob; group when NB_TILE>1, else single
+structural tile; snitch_cluster.py group path uses the configured topology (+structural_tile/amo_lane) and
+the single-tile path uses banks_per_tile (interco.num_outputs tracks it). **Verified:** no-cache 2×4 EOC,
+4×2 EOC; **with-cache 2×4 gemv EOC (77276 cyc)** — multi-tile cache (cross-tile remote xbars) boots+runs.
+Notes: build once with CACHEPOOL_NB_TILE≥2 so the cross-tile remote_xbar model compiles (gvsoc compiles
+models on-demand from the build-time graph); cores/tile ≤4 (2 KiB per-tile SPM holds ~4 stacks; 1×8 overflows).
+
+**AMO-lane fix validated (cross-core lock visibility WORKS):** the [LCK] trace showed Core0 release (write 0)
+→ Core1 read 0 → acquire — clean ping-pong. So the AMO fix (commits core `4341bbcc` + pulp `6849c06`) makes
+the cross-core mutex correct. BUT spin-lock 2-core still doesn't COMPLETE (>3.3B cyc in 400s vs 5851 no-cache)
+— the shared COUNTER incremented under the lock isn't terminating the loop: a separate cross-core SHARED-DATA
+issue (same class as the fdotp bug), NOT the lock. Build cmd now: CXX=g++-14.2.0 CC=gcc-14.2.0
+CMAKE=cmake-3.18.1 make build TARGETS=cachepool. printf has no lock (overlap cosmetic). See memory.
+
+---
+
+## 2026-06-25 (later) — AMO-lane fix: cross-core atomic mutex (crash + 1-core fixed; 2-core handoff WIP)
+
+**Trigger (user):** "1 core + cache → most kernels correct; 2 cores → software-lock correctness breaks,
+overlapping prints." Classic broken cross-core atomic-mutex signature (snrt_mutex = amoswap on a cached lock).
+
+- **Commits:** core `4341bbcc` (AMO shim sync-path fix), pulp `6849c06` (enable amo_lane + re-lane scalar to
+  lane n_ppc-1), pushed to `insitu-cache` (force-with-lease).
+- **Root causes found + fixed:**
+  1. The cachepool wired the SCALAR to tile lane 0, but the AMO/LR-SC shim sits on lane n_ppc-1 (RTL ordering)
+     and was gated off → cached atomics were plain writes (no mutual exclusion). Fix: `amo_lane=True` +
+     scalar→lane n_ppc-1, VLSU→0..n_ppc-2 (snitch_cluster.py).
+  2. The `spatz_cache_amo` shim was async-only (resp()+PENDING); the cachepool core is synchronous
+     (run_request_sync) so the RMW resolved in-call → resp()+PENDING double-completed → SIGABRT on true-AMO
+     kernels (spin-lock). Fix: in_sync_call_/sync_completed_ flag → return IO_REQ_OK (no resp) when sync.
+- **Verification:** spin-lock crash GONE; spin-lock 1-core now runs + prints its hello cleanly (mutex works);
+  gemv/fmatmul 1-core still pass (95189 / 27142 cyc) — no regression.
+- **STILL-OPEN:** spin-lock 2-core HANGS — Core0 acquires/prints/releases/finishes (wfi), Core1 spins forever
+  in spin_lock never seeing the release. The xbar routes by address (shared cell, NOT private), so it's a
+  cross-core write-visibility/timing issue in the shared cell — same class as the fdotp cross-core bug (likely
+  one unifying root cause). See memory `cachepool_gvsoc_target.md`.
+
+---
+
+## 2026-06-25 — Cache in the loop ON by default + complete-model kernel run
+
+**What/why (user):** "keep the cache in the loop by default on" + a run guide. Flipped
+`CACHEPOOL_USE_CACHE` default `0→1` so `gvsoc --target=cachepool` routes cached-DRAM accesses through the
+structural InSitu cache by default (the complete CachePool model). `=0` still bypasses (fast functional path).
+
+- **Commit:** pulp `c3f45d7` (`cachepool: cache-in-the-loop ON by default`), pushed to `insitu-cache`
+  (force-with-lease). Core unchanged (`0757b944`). Files: `pulp/cachepool.py`.
+- **Ran all 8 CI kernels through the complete model** (cache on, 4-core, 250 s cap):
+  - ✅ **gemv-opt PASS** (82635 cyc), ✅ **fmatmul PASS** (13339 cyc) — **data-correct THROUGH the cache.**
+  - ⚠️ fdotp_M32768 **Check Failed** (88353 cyc) — the open uncached-A/B timing bug.
+  - ⛔ fft exit 1 (SPM overflow); ⏳ spin-lock / load-store / linked-list / byte-enable **timeout**
+    (AMO-lock break, CLINT gap, cache-sim slowness on the heavy kernels).
+- **Key finding:** the with-cache failure is **NOT a general cache bug** — gemv+fmatmul (cached-data
+  compute) are correct through the structural cache. fdotp is specific to its *uncached* `0xA0000000`
+  inputs (VLSU-bypassed via `vico→narrow_axi`). Localized to the VLSU compute on that bypass path
+  (timing-sensitive race), not the cache datapath.
+- **Verification:** the 8-kernel suite above; build clean (`make build TARGETS=cachepool`).
+- **Report:** `prompt/cachepool_complete_model_run_guide_2026-06-25.md` (build/run/knobs + per-kernel
+  outputs + caveats). Memory: `cachepool_gvsoc_target.md`, `cachepool_project_goal.md` updated.
+
+---
+
+## 2026-06-21 — Structural TILE/GROUP integration: design + foundation (xbar + multi-lane core)
+
+**Direction (user):** build the faithful structural tile, then multi-tile group; accept the Spatz
+sync-model performance inaccuracy. Status answered: NO structural tile/group exists today (flat
+single-tile `InsituCacheTile` = 1 hashed interco + N cells + flat l2 fan-in; no group/cluster composite).
+
+**Design** (9-agent workflow `wf_3ff4f274-cdb`, 5 RTL+model readers → synthesis → 3 adversarial reviewers,
+all 3 returned sound=false with must-fixes; folded into `prompt/insitu_cache_structural_tile_plan_2026-06-18.md`).
+Verified RTL tile: **5 per-port-class crossbars** (one `tcdm_cache_interco` per lane j, NOT one hashed
+interco); the **coalescer lives INSIDE the cache cell** (`cachepool_cache_ctrl`: par_coalescer on the 4
+VLSU lanes + internal 2:1 bypass for the scalar lane); **AMO only on lane j=4** per controller; **eviction
+rides the refill channel**; group = 4 tiles + 5 remote xbars with **source-tile-mod-N** slot pinning.
+Key tension surfaced: the **sync-slave mode** (to drive the structural core from the Spatz VLSU, which
+`trace.fatal`s on async) **degrades the cache cell's cross-lane fidelity** (sequential same-cycle delivery
+→ coalescer can't batch, bank WR_CONFLICT smears) — so the build order validates **open-loop first** (full
+fidelity), then adds the sync mode (analytic, NOT a virtual-cycle FSM loop — the reviewers showed that
+re-entrant-`resp()` crashes) for closed-loop.
+
+**Foundation built** (core `f8e78da3`):
+- `insitu_cache_xbar.{cpp,py}` — one per-port-class crossbar wrapping the validated `route.hpp`. Replaces
+  the hashed interco. Not yet instantiated (zero build impact); syntax-clean.
+- `insitu_cache_core.{cpp,py}` — multi-lane core port (`num_input_ports`, default 1 = backward identical;
+  RTL 5-wide core port). Validated in-tree: structural sample ML=50 = 13/13, data_err=0, cold miss 56
+  (b.0 unchanged); controller default byte-identical (67 / 290.8).
+
+**Build-env fix (cost real debugging):** a CMake re-configure with `CXX`/`CC` unset picked the wrong
+compiler — first `arm-linux-gnu-g++` (crt1.o fail), then `g++ 8.5.0` (ABI-mismatch: the 06-16 .so need
+`GLIBCXX_3.4.32`). Fixed by pinning `CXX=/usr/sepp/bin/g++-14.2.0 CC=/usr/sepp/bin/gcc-14.2.0` and
+`LD_LIBRARY_PATH=/usr/pack/gcc-14.2.0-af/lib64:...` at runtime. Recorded in memory [[build_env]].
+
+**Next:** structural cache cell composite (coalescer `coalesce.hpp` + internal bypass + core) → AMO shim
+(`amo.hpp`, lane 4) → `structural_tile` branch in `insitu_cache_tile.py` (5 xbars + 4 cells) → open-loop
+multi-port validation (needs a 4-controller calib variant) → sync mode → closed-loop vfadd → group.
+
+### 2026-06-22 — Structural TILE Phase A1 DONE (5 per-port-class xbars + per-core cells, routing validated)
+
+Built + validated the RTL-faithful structural tile (core `9ad67c88`, pulp `6e0da96`):
+- `InsituCacheXbar` (built last turn) now WIRED: `_build_structural_tile()` in `insitu_cache_tile.py`
+  instantiates NrTCDMPortsPerCore (=5) per-port-class xbars + N multi-lane `InsituCacheCore` cells.
+  Wiring `i_INPUT(p)→xbar[p%5].in_(p//5)`; `xbar[j].out_(cb)→core[cb].input_{j}`; refill/evict→o_L2.
+  Gated by `InsituCacheTileConfig.structural_tile` (default False = flat tile, byte-identical fallback).
+- Config flags: `structural_tile`, `num_remote_port_core`, `num_tiles`, `tile_id`, `addr_width`.
+- Calib hook `INSITU_CALIB_STRUCTURAL_TILE` (+ `INSITU_CALIB_STRUCT_BANKS`, default 4).
+- **Validated** (g++-14.2.0): structural tile, 5 xbars, 4 banks, sample ML=50 → 13/13 respond,
+  **data_err=0**; lane-j accesses route across all 4 banks BY ADDRESS (0x00/0x40/0x80/0xc0→banks
+  0/1/2/3), responses return to originating ports → the shared-L1 intra-tile routing is faithful +
+  data-correct. Fallbacks byte-identical (flat structural core 56/278.5; flat controller 67/290.8).
+- Phase A1 scope: NO MSB rotation, NO coalescer/AMO yet. **Next: A2** = structural cache CELL composite
+  (par_coalescer `coalesce.hpp` on the 4 VLSU lanes + internal 2:1 bypass on the scalar + core),
+  validated against the calib cell reference (warm hit 10/7, coal_cold); then A3 AMO (lane 4), A4 sync
+  mode → closed-loop vfadd, A5 group (remote xbars + source-tile-mod-N).
+
+**Phase A2 DONE** (core `a6ee0038`, pulp `4d4bb78`): the structural cache CELL — `cachepool_cache_ctrl`'s
+par_coalescer (4 VLSU lanes) + scalar bypass. `insitu_cache_cell_coalescer.{cpp,py}`: per-cycle coalescer
+wrapping `coalesce.hpp` — same-cycle same-line VLSU reads coalesce into ONE wide line-read to the core,
+response split back per merged port (rsp_spliter); writes pass through (`req_forward`, data-correct);
+1-cycle CSHR window; 64-group in-flight pool. Tile `cell_coalescer` branch: VLSU lanes → coalescer[cb] →
+core input 0; scalar lane → core input 1 (2-input core). Gated `cell_coalescer` (default False = A1
+n_ppc-input core). Validated (g++-14.2.0): coalescer cell, 4 banks, sample ML=50 → 13/13, data_err=0
+(wide-read+split correct; scalar bypasses to 55). No regressions (A1 data_err=0; flat core 56/278.5; flat
+ctrl 67/290.8). Merge benefit (multi-member groups) needs a coal trace (sample has 1-member groups only)
+→ that + warm-hit 10/7 / coal_cold timing is the calibration step. **Next: A3** AMO shim (lane 4).
+
+**Phase A3 DONE** (core `6d488974`, pulp `a679e98`): the AMO/LR-SC shim on the scalar lane (j=n_ppc-1),
+one per cell (`cachepool_tile.sv:658`; VLSU lanes bypass). `insitu_cache_amo_shim.{cpp,py}` wraps the
+validated `amo.hpp`: IoReqOpcode dispatch — READ/WRITE pass through (req_forward; WRITE clears a matching
+reservation); LR sets the reservation + presents a plain READ; SC returns 0/1; true AMO does the RMW
+(read word → amo_alu → write back → return OLD). Single in-flight (scalar LSU single-outstanding →
+atomic). Tile `amo_lane` branch routes the scalar lane through `amo[cb]` before the core (works with both
+the A1 5-input core and the A2 coalescer cell). Validated (g++-14.2.0): tile+coalescer+AMO, sample ML=50
+→ 13/13, data_err=0 (scalar READ/WRITE pass-through correct; calib has no AMO traffic, so the LR/SC/AMO
+RMW paths rely on amo.hpp's standalone validation + closed-loop). No regressions (A2 55/279.4, A1
+53/275.7, flat core 56/278.5). **Structural TILE is now structurally complete** (5 xbars + coalescer cell
++ AMO shim). **Next: A4** = the synchronous-slave mode (analytic, per the review — NOT a virtual-cycle
+loop) → closed-loop vfadd on the structural tile (validates A1+A2+A3 end-to-end + exercises the AMO RMW);
+then A5 group (remote xbars + source-tile-mod-N + DDR4).
+
+**Phase A4 DONE — structural tile runs CLOSED-LOOP vfadd** (core `7886617e`, pulp `0f89037`+`b2d943a`).
+Design: 7-agent workflow `wf_577e09d4-51c` (deadlock reviewer SOUND; fidelity reviewer must-fixes folded).
+- `insitu_cache_core.cpp` run_request_sync(): ANALYTIC one-shot synchronous-slave (mirrors the
+  controller's inline_sync_miss — NOT a virtual-cycle loop, which the review showed crashes on re-entrant
+  resp()). decode → HIT (serve + lru + inc_latency(hit_latency_cycles) + IO_REQ_OK) / MISS (evict dirty
+  victim copying bytes BEFORE the refill overwrite; lru BEFORE status writes; refill; on OK refill_lat =
+  get_full_latency()+refill_bank_write_cycles+miss_penalty_cycles; install; serve; inc_latency; OK).
+  Write-commit = added latency, never DENY. NO save/resp/tick/FIFO. Gated `inline_sync_` (default off).
+  core.py publishes inline_sync_miss/hit_latency_cycles/write_commit_cycles.
+- Cluster: opt-in property `use_structural_insitu_cache` → structural_tile + cell_coalescer=False +
+  amo_lane=False + controllers_track_cores + line-granular dynamic_offset; same facade (no binding change).
+- **Validated** (g++-14.2.0): calib sync path data_err=0, all IO_REQ_OK, warm hit 9 / cold miss ML+12
+  (RTL 10 / ML+17 — gap = calibration). **CLOSED-LOOP vfadd on the structural tile: 15/15 PASSED,
+  retval=0, cycles=59001** (flat-tile default unregressed: 15/15, 58001 — +1.7%). The RTL-faithful tile
+  (5 per-port-class xbars + per-core sync-slave cells) now runs real Spatz kernels end-to-end.
+- **Next: A5** group (4 tiles + 5 remote xbars + source-tile-mod-N + DDR4); then the timing-calibration
+  pass (warm hit 9→10, cold miss ML+12→ML+17, coal_cold via a same-line multi-lane trace).
+
+**Phase A5 DONE — multi-tile GROUP + cross-tile shared L1** (core `c5d67024`, pulp `038117e`). The full
+hierarchy GROUP→TILE→cell→core is now built. `insitu_cache_remote_xbar.{cpp,py}`: one per-port-class
+inter-tile router (num_tiles×num_tiles), routes a cross-tile request to the TARGET tile by the address
+TileID (route.hpp addr_tile); the GVSoC response auto-routes back via the preserved resp-port chain, so
+the RTL source-tile-mod-N slot pinning is a timing-only detail (not needed for functional correctness).
+`insitu_cache_tile.py`: per-port-class remote-OUT/IN ports (o_REMOTE_OUT/i_REMOTE_IN) when
+num_remote_port_core>0. `insitu_cache_group.py`: InsituCacheGroup = N tile_id-stamped tiles + 5 remote
+xbars + L2 fan-in. Validated (g++-14.2.0): 2-tile group, calib sample ML=50, driving tile-0's 5 ports →
+13/13 respond, data_err=0; addresses route local (tile 0) OR cross-tile (tile 1) by TileID, a tile-0 core
+reading a tile-1-homed line gets correct data via the remote xbar. **The structural rewrite is now
+STRUCTURALLY COMPLETE** (decode/bank/fwd/core/coalescer/xbar/SPM/sync/AMO/L2 components + cell + tile +
+group), single-tile runs closed-loop vfadd (A4), multi-tile cross-tile data-correct (A5). **Next: the
+timing-CALIBRATION pass** (warm hit 9→10, cold miss ML+12→ML+17, coal_cold via a same-line multi-lane
+trace; closed-loop region_cyc) + the cluster-level group wiring (DDR4 L2, peripheral/flush) for a real
+16-core run.
+
+**A5b — group config matches RTL cachepool_fpu_512.mk @ f5c3ef4** (core `a8f13797`, pulp `db96de0`).
+`make_cachepool_fpu_512_config()`: num_tiles=4, 4 cores/tile, NumL1CacheCtrl=NumCores=16 (4 ctrl/tile),
+5 TCDM ports/core, **num_remote_ports_per_tile=2** (NumRemotePortCore=2); per-controller 4-way×256-set×64B
+= 64 KiB (256 KiB/tile), L1BankFactor=2 (pkg hardcodes 2; the .mk's l1d_bank_factor=1 is dead),
+folded+hash+fwd; L1CoalFactor=2; L2 4ch/interleave 16. Fetched the exact commit via WebFetch (matches the
+local config except num_remote_ports_per_tile: local=1, f5c3ef4=2). Generalized the remote ports to
+NumRemotePortCore≥1 (remote xbar = NumTiles*nrpc in/out, source-tile-mod-N slot; tile exposes nrpc
+remote-out/-in per port-class). Validated: fpu_512 group, calib sample ML=50, tile-0/core-0's 5 ports →
+13/13, data_err=0, cross-tile to tiles 1/2/3 correct; single-tile unregressed (53/275.7).
+
+**FULL CachePool path — 16-core config, 6/8 CI kernels pass** (pulp `66ebb3c` → `5ec8cb6`). Extended the
+cachepool target to 16-core (`CACHEPOOL_NB_CORE=16` selects nb_core + a 16-core bootrom: the RTL
+`bootrom.bin` patched to core_count=16/tile_count=4). **Resolved the 16-core SPM model empirically** (the
+snrt crt0 gives every hart the SAME `sp` VA — `init_core_info` returns the same `tcdm_start/end` for all
+16, cluster_idx=mhartid/16=0): a single shared SPM collides 16 stacks (hang); fully per-core-private breaks
+shared l1alloc (`cluster_mem`=the SPM; fdotp/gemv fail even at 4 cores); the right model is **per-TILE-shared
+SPM** (`snitch_cluster.py` `arch.spm_num_groups`; cachepool sets it = NB_TILE → 4 SPMs × 4 cores; 4-core
+= 1 shared SPM = the passing MINIMAL case). **16-core suite (per-tile SPM): spin-lock / load-store_M16 /
+fdotp_M32768 / gemv-opt / fmatmul_M32 [was a 4-core timeout] / byte-enable all retval=0 — 6/8.** Remaining:
+fft (SIGABRT — overflows the shared 2 KiB tile SPM at 16; and is independently wrong, retval=1 at ALL SPM
+configs incl. 4-core where everything else passes → an fft-specific functional bug) + linked-list (SIGABRT,
+needs CL_CLINT inter-core IRQ + likely SPM overflow). The 2 aborters reveal the SPM ultimately needs
+**per-core stacks + shared heap** (the partitionable SPM the structural cache provides) — the next FULL item,
+along with CL_CLINT and wiring the cache to front DRAM.
+
+**FULL — cache-fronting-DRAM WIP (gated, data-incorrect)** (pulp `2867db2`). Opt-in `CACHEPOOL_USE_CACHE=1`
+routes the cores' cached-DRAM region [0x80000000,0x84000000) through the structural `InsituCacheGroup`
+(16-core) / single tile (4-core); SPM/peripheral/uncached stay direct; cache `o_L2` refills DRAM via
+wide_axi→o_WIDE_SOC (the existing TCDM-only local map leaves DRAM to the SoC). Peripheral cachepool mode
+widened to 0x14..0x4c scratch (the cache path reads SPATZ_CYCLE@0x1c). **Default OFF — the validated no-cache
+path is unchanged.** When enabled: **DATA-INCORRECT** (fdotp prints `Check Failed!` — and fdotp `return 0`s
+regardless, so retval=0 HID it) + slow (16-core / spin-heavy kernels time out). Needs cache-data-path debug
+(likely the VLSU wide-read / refill under load) + sim-perf work. **Key lesson:** retval≠correctness for
+several kernels (fdotp/etc. always `return 0`; the real verdict is the `Check Failed!`/`Error:` print). The
+no-cache passes ARE genuine (direct DRAM = exact data; fdotp/gemv/byte-enable print no Check-Failed).
+
+**MINIMAL CachePool SoC target — snrt CI benchmarks boot/print/exit on gvsoc** (core `b5ed7dd4`, pulp
+`85ed0ef`). New `gvsoc --target=cachepool` (`pulp/cachepool.py`) + `cachepool_uart.cpp` (snrt printf→stdout)
++ a gated `cachepool` mode in `cluster_registers` (L1D-config 0x28..0x4c RW scratch, FLUSH_STATUS 0x3c reads
+0, EOC@0x24→quit retval). Reproduces the CachePool boot env/map: bootrom@0x1000 (reuses RTL `bootrom.bin`,
+BOOTDATA core_count=4), DRAM@0x80000000, uncached/.pdcp@0xA0000000, SPM@0xBFFFF800 (2 KiB cluster local
+mem, shrunk+adjacent to peri), peripheral@0xC0000000, fake-UART@0xC0010000. 4-core/1-tile, no cache (cores
+hit DRAM directly; the structural cache fronting DRAM = FULL path). **KEY boot fixes:** (1) install the
+bootrom `.bin` via a `vp_files()` CMakeLists (dir-install copies only `*.py`); (2) wake the wfi'd bootrom
+via **MSIP** (mip bit 3, enabled by the bootrom's `mie=0xF`), NOT MEIP (bit 11) — gvsoc wfi wakes only
+when `(mie & mip)!=0`. Reuses SnitchCluster's blocking HW barrier @0x10 + HTIF. **Validated:** the
+UNMODIFIED CachePool CI binaries now boot/print/exit on gvsoc — cache-line-rw-smoke / spin-lock (prints
+"Tile0, Core1:hello") / byte-enable / load-store_M16 / fdotp-32b_M32768 / gemv-opt all `retval=0`. This is
+the MINIMAL path of `prompt/gvsoc_cachepool_soc_boot_scope_2026-06-22.md`; FULL = 16-core/4-tile bootdata
++ CL_CLINT IRQ + L1D-config wired into the cache + cycle calibration.
+
+**A5c — group wired into the Spatz cluster** (pulp `14c456d`). Opt-in property `use_cachepool_group` →
+the cluster builds `InsituCacheGroup` from `make_cachepool_fpu_512_config()` (4 tiles × 4 cores, same
+i_INPUT/o_L2 facade as the tile; assert nb_core=16). **Validated CLOSED-LOOP on the full 16-core group:**
+`vfadd` 15/15 PASSED, retval=0, cycles=69001 (single-tile 59001, flat 58001). The 16-core 4-tile
+structural group elaborates + a gvsoc-native kernel boots + runs through it data-correct.
+**BLOCKER — CachePool CI benchmarks can't run on gvsoc:** the `configs-ci.sh` binaries
+(`software/build/CachePoolTests/test-cachepool-*`, 8 kernels) are `snrt`-based RTL-sim binaries run by the
+auto-benchmark via **vsim** (`cachepool_cluster.vsim`), built for the **CachePool SoC**. On gvsoc
+`--target=spatz` they hang at boot (no output, baseline + nb_core=16) — the gvsoc spatz target is a
+different SoC (no snrt boot env / cluster peripheral / print path). Running them on gvsoc needs a **GVSoC
+CachePool SoC model**, not just the cache. Full report: `prompt/cachepool_fpu_512_group_run_report_2026-06-22.md`.
+
+---
+
+## 2026-06-16 — (b) open-loop structural calibration kickoff: b.0 refill-latency emergence + deadlock fix
+
+**Direction (user):** go with (b) — calibrate the STRUCTURAL model — but NOT via the current Spatz cluster
+for now (open-loop only). This drops the synchronous-slave mode (must-fix #1) off the critical path: the
+structural core's existing async park+resp is exactly what the open-loop calib testbench speaks.
+
+**Pre-decision finding (workflow `wf_949f6097-32a`, 8 agents, all 3 refuters failed):** the prior premise
+"the Spatz v1 LSU only accepts synchronous IO_REQ_OK" is FALSE. The v1 scalar LSU (`cpu/iss/src/lsu.cpp`,
+the one the `spatz` target builds) handles a non-OK return by stalling + resuming on its `data_response`
+callback. The REAL closed-loop blocker is the Spatz **VLSU** (`cpu/iss/src/ara/spatz_vlsu.cpp`): it
+`trace.fatal("Unimplemented async response")` on any non-OK and binds no resp handler. Verdict:
+`needs_sync_slave_only`, and a sync-slave mode is SUFFICIENT (no VLSU rework) when closed-loop is revisited.
+For open-loop the async structural core works as-is. So the (b)-open-loop decision is confirmed sound and
+the eventual closed-loop gap is one well-scoped sync-slave mode, not a Spatz rewrite.
+
+**b.0 DONE** (core `0c297356`, pulp `5d78298`):
+1. **Refill latency emerges** (`insitu_cache_core.cpp`). `drain_outputs()` discarded the serializing
+   responder's stamped `inc_latency` on an `IO_REQ_OK` refill → cold miss ≈ pipeline cycles regardless of
+   MemLatency. Now captures `refill_req_.get_full_latency()`, defers install to `refill_ready_cycle_ =
+   now + lat`, and gates the next refill on it (serialized miss throughput). Cold miss scales:
+   56@ML50 / 106@ML100; misses serialize ~+53 each (RTL ~+55).
+2. **Deadlock fix** (the deferral exposed it). Refill install was routed through `preread_q_`/stage0; a
+   stalled request also occupies `preread_q_` and blocked stage0 from promoting the refill that would
+   drain `retr` to clear the stall (circular → 5M-cycle watchdog abort, 7/13 responded). Refactored:
+   `process_request()` returns done/stalled (a stall stays latched + retries), and `maybe_install_refill()`
+   installs a ready refill as a priority bank op on its OWN path (more RTL-faithful — the refill block is a
+   separate `always`, refill wins bank arbitration via the retr-room gate). Now 13/13 respond, data_err=0.
+3. **Harness async-measurement fix** (`calib_driver.cpp`): `t_resp = now + full_lat` (was
+   `t_issue + full_lat`). The sync controller calls `on_response` inline at issue (`now==t_issue`, numbers
+   unchanged); the async structural core resp()s at the real completion cycle and conveys latency via
+   wall-clock, which the old formula collapsed to ~t_issue. Plus `INSITU_CALIB_STRUCTURAL_CORE` env hook
+   (default off) to run the structural core through the calib replay.
+
+**Validated:** structural calib sample ML=50/100 → 13/13 respond, data_err=0, cold miss scales with ML,
+misses serialized; **default controller path byte-unchanged** (sample ML=50: 290.8 avg / cold miss 67).
+**Open b.1:** cold-miss isolated = ML+6 vs RTL ML+17 (tune the fixed cache-overhead constant); warm-hit
+10/7, throughput 0.86, gap sweep — needs the phase traces (only `sample.trace` ships under
+reports/cache_calib/traces/; the phase traces come from `gen_traces.py`). Then b.2 (structural coalescer).
+
+---
+
+## 2026-06-16 — Structural rewrite Step 7 (datapath components): AMO/LR-SC + L2 scramble/NAPOT
+
+Two more RTL-faithful header-only datapaths transcribed + standalone-validated (core `32950f40`,
+gated default-off, zero build impact). This completes the **component** transcription mandate — every
+planned microarchitecture/architecture component now has real RTL logic (no approximations):
+
+- `insitu_cache_amo.hpp` — `spatz_cache_amo.sv` RMW/LR-SC shim (scalar lane j=4): the 4-state RMW FSM
+  Idle→DoAMO→WriteBackAMO→Wait with **atomicity via core back-pressure** (core_ready=0 in every non-Idle
+  state), the 32-bit `amo_alu` (swap/add/and/or/xor/signed Max,Min/unsigned Maxu,Minu via the a−b
+  sign-bit), and the `{valid,addr,core}` reservation (LR sets/overwrites; foreign write or true-AMO to
+  the reserved addr clears; owner SC clears + success=addr-match; SC returns 0 success/1 fail; only
+  writes on success). 64-bit handled by 32b-half select (idx → strb 0xF<<idx*4).
+- `insitu_cache_l2_addr.hpp` — `cachepool_pkg` scrambleAddr/revertAddr (Scramble↔InterChange field swap
+  to interleave lines across channels, gated on `granule < per-ch size`) + `cachepool_cluster` NAPOT
+  channel decode (`channel = scrambled>>SizeOffsetBits & (NumL2Channel-1)`). DDR4, DramAddr 0x8000_0000,
+  1GiB, 4 channels. revertAddr kept for a DRAMSys-side linear-address need (RTL routes responses by
+  tile_id/bank_id sideband, not un-scramble).
+
+**Validation:** `/tmp/insitu_step7_selftest.cpp` (g++ -std=c++17) — 38 checks, ALL PASS: every ALU op,
+the full LR/SC reservation rule set, the complete RMW walk (Idle→Idle, atomicity asserted each state,
+64b upper-half), and scramble/revert round-trip + channel extraction + inactive identity. RTL read-only
+refs: `hardware/src/{spatz_cache_amo,cachepool_cluster,cachepool_pkg,cachepool_tile}.sv` (extracted via
+two Explore agents). **Remaining Step-7 = COMPOSITION** (cachepool_tile/group/cluster.py wiring the
+structural components + remote/inter-tile xbar + DDR4 refill + the cluster **synchronous-slave inline
+mode** for the structural core — master-plan must-fix #1), then the **calibration pass** (wire the
+validated headers' per-cycle timing into the tick; diff per-access + region_cyc vs `rtl_ref_1t_2026-06-16`).
+
+---
+
+## 2026-06-16 — Structural rewrite Steps 3, 5, 6 (RTL-faithful headers, validated standalone)
+
+Continuing the structural rewrite (master plan `prompt/insitu_cache_structural_plan_2026-06-16.md`).
+Three more components transcribed as header-only, RTL-faithful datapaths, each with a standalone g++
+self-test. All gated default-off; zero build impact (headers, not yet referenced by a compiled target);
+the calibrated controller/interco/coalescer path is untouched (fallback stays default).
+
+**Step 3 DONE** (core `d0abdeed`): `insitu_cache_fwd_buffer.hpp` — single-entry SRAM forwarding buffer
+(`sram_forwarding_buffer.sv`): read-suppress (serve resident line from buffer, skip bank read),
+write-absorb (lazy byte-mask merge, mark dirty), lazy writeback of a dirty victim, partial-validity
+bitmap (per-part residency), RAW forward. SCOPE: single-entry in-order; deferred to calibration — the
+double-buffered `_q/_d` same-cycle split, in-flight-SRAM-populate merge, and the N-entry variant.
+Validated standalone; NOT yet wired into the core data path (lands with calibration).
+
+**Step 5 DONE** (core `54815e22`): `insitu_cache_coalesce.hpp` — the real par_coalescer datapath
+(`par_coalescer_equal_window.sv` / `req_coalescer_v2.sv` / `rsp_spliter_v2.sv`): same-cycle narrow ports
+to the SAME line + SAME type coalesce into ONE wide 512b beat (write-bit folded into the key MSB so R/W
+never co-merge), per-port word offsets + hitmap, wide write merge (last-writer-wins), and the read-split
+back to each merged port's word. Replaces the `enable_input_coalesce` latency-trick. SCOPE: functional
+group-coalesce + wide-merge + split; deferred to calibration — the CSHR FSM (IDLE/VALID + watchdog),
+per-port depth-4 FIFOs, equal-vs-extend window policy, RR next-line arbiter. Validated standalone.
+
+**Step 6 DONE** (this commit): three headers for the programmable xbar + SPM partition + flush/sync FSM.
+- `insitu_cache_route.hpp` — `tcdm_cache_interco.sv` request routing (3 partition modes:
+  all-private/single-tile, all-shared, mixed — with modulo-fold `bank%num_private` /
+  `num_private+bank%num_shared` and remote-slot `tile%NumRemotePort`), response routing (by core_id;
+  remote tiles return on `tile%NumRemotePort`), and the **MSB address rotation** (`+`inverse for refill):
+  the N routing bits above `dynamic_offset` (BankSel, +TileID for shared banks) rotated to the MSB so the
+  cache tag/index never sees them. Plus the 2:1 `reqrsp_xbar` bypass (coalescer-aggregate | scalar) with
+  RR arbitration + response demux on the `bypass_coalescer` bit.
+- `insitu_cache_spm_remap.hpp` — `partitionable_flushable.sv` SPM address translation: the exact integer
+  DIV/MOD remap `tag=line/cache_sets, set=line%cache_sets + spm_sets` (NOT a power-of-2 mask) carving
+  `NumPseudoDualBanks*bank_depth_for_SPM` sets out as scratchpad; `restore_downstream` is the exact
+  inverse for refill/eviction. Collapses to identity when `bank_depth_for_SPM=0` (the common case).
+- `insitu_cache_sync_fsm.hpp` — the 7-state flush/sync FSM (`insitu_cache_tcdm_wrapper.sv`
+  gen_sync_ctrl_fsm): IDLE→READ_BANK→CHECK_PEND→{INIT|FLUSH}→FINISH, 4 opcodes (flush+inv/flush/inv/
+  init), the **CheckPendDrainCycles=20 consecutive-stable drain interlock**, the per-set walk with
+  per-dirty-way write-through eviction (stay-on-ptr re-check drains multi-way dirty sets), bank-init walk
+  from set 0, and `sync_block_upstream` gating ALL upstream traffic for the whole walk. Owner indexes
+  `dirty_rf[fsm.ptr()]` (the RTL `dirty_rf[sync_ctrl_ptr_q]` combinational read). PartSplit>1
+  `flush_full_*` multi-cycle dance stubbed (canonical PartSplit=1).
+
+**Validation:** `/tmp/insitu_step6_selftest.cpp` (g++ -std=c++17) — 51 checks, ALL PASS: single-tile +
+all-shared + mixed routing, addr rotation round-trip, response routing, bypass RR + demux; SPM
+no-partition identity + partitioned line→set placement + restore round-trip; sync FSM full flow
+(IDLE→FINISH, 20-cycle drain enforced, dirty-line eviction of set1/way2, bank-init walks all sets).
+RTL read-only refs: `hardware/src/{tcdm_cache_interco,reqrsp_xbar}.sv`,
+`insitu_cache_tcdm_wrapper{,_partitionable_flushable}.sv`. Open: Step 7 (tile/group/cluster composite +
+remote/inter-tile xbar + DDR4 refill + cluster synchronous-slave inline mode), then the calibration pass.
 
 ---
 
