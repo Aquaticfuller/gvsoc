@@ -6,6 +6,40 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-26 (P1.2):** E1 MSB address rotation DONE (core `3c9b95ab`, pulp `72af12a`) — the 2^N
+per-bank capacity collapse is fixed and proven (capacity A/B on the 4-bank structural tile: sweep-2 hits
+0/2048 → 2048/2048, data_err=0; BANKS=1 calib 67/10 exact; 16-core sweep 9/9 data-correct). Kernel cycles
+~unchanged — the CI streams live in the uncached `.pdcp_src` @0xA0000000 (bypasses the L1), so E1 becomes
+kernel-visible with P2.13. Doc: `prompt/cachepool_p1_2_msb_rotation_2026-07-26.md`.
+
+---
+
+## 2026-07-26 (cont'd 7) — P1.2 DONE: E1 MSB address rotation (capacity collapse fixed + proven)
+
+**The gap.** `enable_rotation=False` hardcode → banks decoded set/tag from raw addresses; BankSel(+TileID)
+bits are constant per bank but sit inside the 8-bit set index → 16 KiB (1 tile) / 4 KiB (4 tiles) effective
+of 64 KiB/bank. First-order miss-rate corruption, invisible to the single-bank calib TB.
+
+**Fix.** (1) `enable_rotation=True` config default (guarded: dyn_offset==log2(line) required) → the xbar's
+existing `route.hpp::rotate_addr` goes live. (2) Core unrotates every L2-side egress via a single
+`l2_addr()` helper (`route.hpp::unrotate_addr`, per-bank N from new `rotate_bits/_dyn_offset/_addr_width`
+props computed by the tile per `bits_to_rotate`): sync+async refill, dirty-victim writeback, functional
+WT, bypass (save/restore). Refill FIFOs + `pending_refill_addr_` stay rotated (install re-decodes).
+Rotation happens exactly once (destination tile's xbar; remote xbar never rotates — verified in source).
+
+**Verified.** Capacity A/B (4-bank structural calib, new `capacity_2sweep_2048` trace, 512 lines/bank):
+sweep-2 hits **0/2048 → 2048/2048**, data_err=0 both. BANKS=1 67/10 exact (N=0 identity). 4-core fdotp
+retval=0 (N=2 all-private branch). 16-core sweep 9/9 data-correct, cycles byte-identical on 8/9
+(load-store −0.3% — its node region IS cached; rotation confirmed live via `rotate_bits` in
+gvsoc_config.json). **Why ~0 kernel impact:** readelf shows `.pdcp_src` (256 KiB streams) at 0xA0000000
+uncached (bypasses the L1), `.dram` EMPTY — nothing cacheable can thrash. E1 pays off at P2.13 (0xA0000000
+through the cache); landing it first keeps that A/B clean. Doc:
+`prompt/cachepool_p1_2_msb_rotation_2026-07-26.md`. Commits: core `3c9b95ab`, pulp `72af12a`.
+
+**Next:** P1.4+P1.5 (PEND-line ready-cycle clamp + write-miss early ack).
+
+---
+
 **STATUS 2026-07-26 (P1.1):** A1 VLSU delayed-commit DONE (core `e49c12b9`) + the SoC-DRAM bandwidth
 divergence it exposed FIXED (pulp `cdc4aa8`, width_log2 2→6). All 9 kernel binaries PASS data-correct at
 16-core cache-ON with vector traffic now paying the calibrated cache latency; calib TB exact (async 67/10,
