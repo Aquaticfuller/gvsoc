@@ -6,6 +6,42 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-26 (P1.4+P1.5):** D1 PEND-line ready-cycle clamp + D2 write-miss early ack DONE (core
+`16373523`, pulp `b243c37`) — followers no longer hit early through a refill (73 vs ~10 on the gate), store
+misses ack at the RTL winfo latency (8 vs ~67). Calib exact (67/10, cold_stream 0.0143, flat path
+byte-identical); 16-core sweep 9/9 data-correct (cycles ~flat — the streams bypass the L1; cache-internal
+fixes gate on the calib TB until P2.13). Doc: `prompt/cachepool_p1_4_5_pend_clamp_write_ack_2026-07-26.md`.
+
+---
+
+## 2026-07-26 (cont'd 8) — P1.4+P1.5 DONE: D1 PEND clamp + D2 write-miss early ack
+
+**D1 (P1.4).** Sync-slave miss completed PEND→VALID in-call → same-line followers during the refill window
+took 10-cycle hits (~56 cy gift/follower at ML=50; the decode's hit_pend/conflit/all_pend branches were
+dead). Fix: lines keep PEND + `WayMeta.ready_cycle`=resp_cycle (data still memcpy'd at allocate); lazy
+install sweep pre-decode + bounded clamp loop (hit_pend/hit_conflit/all_pend/PEND-victim) installs as the
+in-call wait reaches ready; follower then takes a normal hit (+drain). PEND can no longer be victimized.
+
+**D2 (P1.5).** Store misses stamped ML+17 to the LSU; RTL acks stores from the winfo FIFO at acceptance
+(~8, hit or miss). Fix: write hits AND misses ack at new `structural_write_hit_latency_cycles=8`; store
+data + functional WT + dirty still applied at allocate; WRITE_PEND + ready_cycle keep subsequent loads
+correctly stalled (via D1); + winfo acceptance window (2-cy drain, depth 4). Refill-occupancy gate
+unchanged → cold-miss throughput intact.
+
+**Verified.** New `pend_follower` trace (structural calib, BANKS=1, xbar=0): cold miss 67, mid-window
+follower **73** (was ~10), write miss **8** (was ~67), read-after-write 73 w/ correct data, post-ready hit
+10, data_err=0. Gates exact: warm 67/10, cold 67, cold_stream 0.0143; flat async byte-identical 67/10.
+16-core sweep 9/9 data-correct; cycles ~flat (+0.0-0.3%) — **third P1 item with ~0 kernel movement**: the
+CI streams bypass the L1 (0xA0000000 `.pdcp_src`; `.dram` empty), so cache-internal fixes gate on the
+calib TB; they become kernel-visible with P2.13 (0xA0000000 through the cache) — which is now clearly the
+pivotal item for kernel-level calibration. Commits: core `16373523`, pulp `b243c37`. Doc:
+`prompt/cachepool_p1_4_5_pend_clamp_write_ack_2026-07-26.md`.
+
+**Next:** P1.3+P2.1 (per-cell serialization + coalescer merge — the shared-L1 contention pair, biggest
+remaining P1 item).
+
+---
+
 **STATUS 2026-07-26 (P1.2):** E1 MSB address rotation DONE (core `3c9b95ab`, pulp `72af12a`) — the 2^N
 per-bank capacity collapse is fixed and proven (capacity A/B on the 4-bank structural tile: sweep-2 hits
 0/2048 → 2048/2048, data_err=0; BANKS=1 calib 67/10 exact; 16-core sweep 9/9 data-correct). Kernel cycles
