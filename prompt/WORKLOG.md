@@ -6,6 +6,44 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-27 (R1 SOLVED + fixed):** the linked-list "12× slow" was **100% the ELF-loader artifact**
+— ElfLoader segments rode the narrow AXI (bw=8): 16.8 MB `.pdcp_src` → ~2.1M simulated cycles before any
+instruction runs (RTL fesvr ≈ 0). Fixed (pulp `f4df56c`: loader → wide_axi bw=64 + catch-all map). The RTL
+diff transforms: **load-store +4.9% (IN TARGET)**, everything else model 1.6–2.9× too FAST (the issue-side
+family: B3/F1/J1), linked-list's residual is its 262k loader (work phase: model 38k vs RTL 70.5k = 1.85×
+fast). Cache fully exonerated by the new latency-budget counters (L1+AMO = 2.3% of the anomaly; core
+`f31afd03`). Full trail + new table: `prompt/cachepool_rtl_kernel_diff_2026-07-27.md` (v2). Next: R3
+(B3 AMO occupancy, spin-lock 2.7× fast) → R4 (F1 flush, fft 2.9×) → R5 (issue-side J1/VLSU) → R2 (E3,
+deprioritized) → P3.1.
+
+---
+
+## 2026-07-27 (cont'd 2) — R1 SOLVED: the linked-list 12× = ELF-loader bandwidth artifact
+
+**Investigation trail** (each step eliminated a suspect): (1) New stop() latency-budget counters (core
+`f31afd03`): L1 91% hits, ALL L1+AMO latency = 49k of 2.14M cycles (2.3%) → cache exonerated; AMOs are
+~2 cyc to the requester (the B3 "too free" gap, opposite direction). (2) Ablations: 16≈8≈2 cores (not
+contention); VLSU lanes 4→1 +1% (not the vector path); coalescer on/off identical. (3) libdw-symbolized
+instruction trace: cores execute ZERO instructions for the first ~2.1M cycles; the whole kernel runs in
+the last ~35k. (4) Kernel's own prints: work phase = 24,132 cycles (2-core); `.pdcp_src` = 16.8 MB ≈
+2.1M cycles at 8 B/cyc ⇒ **the ElfLoader over narrow_axi (bw=8)**. RTL loads via fesvr backdoor ≈ 0
+cycles → the entire anomaly was a load-time accounting difference. (5) RTL log cross-check: RTL work
+phase ≈ 70,480 (16-core).
+
+**Fix (pulp `f4df56c`):** loader → wide_axi (bw=64) + catch-all map for the entry write. Load 8× faster
+(16.8 MB: 2.1M → 262k). 9/9 re-verified data-correct.
+
+**The transformed RTL diff (v2, wide loader):** **load-store 106,129 = +4.9% vs RTL (IN TARGET)**;
+byte-enable −14.7%; fdotp M32768 −41.9%, M8192 −52.1%, gemv −43.7%, fmatmul −37.7%, spin-lock −63.0%,
+fft −65.6% (all model-too-fast); linked-list +105.7% but 262k of it is the loader (work phase 1.85×
+fast). **The model is now uniformly too FAST** — the remaining work is the issue-side/occupancy family:
+R3 (B3 AMO occupancy, spin-lock 2.7×), R4 (F1 flush, fft 2.9×), R5 (J1 scalar-LSU/VLSU issue geometry),
+R2 (E3 partitioning — deprioritized since load-store is in-target), P3.1 (DRAM timing). Also removed a
+stray [VLSU-LAT] debug print committed with A1 (hygiene). Docs:
+`prompt/cachepool_rtl_kernel_diff_2026-07-27.md` (v2), worklog.
+
+---
+
 **STATUS 2026-07-27 (E4.4 — first RTL kernel diff!):** found RTL QuestaSim [EOC] references in the RTL
 repo (`reports/sweep_2026-05-29_05-54/cachepool_4t_fpu_512/logs/`, 1.0 ns clock → cycles=T/1000) and ran
 the FIRST per-kernel RTL-vs-model diff (doc: `prompt/cachepool_rtl_kernel_diff_2026-07-27.md`). **gemv

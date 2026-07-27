@@ -1,59 +1,77 @@
-# First RTL-vs-GVSoC per-kernel cycle diff (16-core, streams through cache)
+# RTL-vs-GVSoC per-kernel cycle diff (16-core) — v2, loader-artifact-aware
 
-**Date:** 2026-07-27 · **Status:** provisional reference — model side final (post-E4); RTL side from an
-older revision sweep (see caveat).
+**Date:** 2026-07-27 (v2, supersedes the morning's v1 table in this file's §A) · **Status:** provisional
+RTL reference (older revision sweep); model post-R1.
 **RTL reference:** `ManyRVData_rebase/reports/sweep_2026-05-29_05-54/cachepool_4t_fpu_512/logs/*.log`
-(insitu-cache `2710920`, CombLoop-fix sweep, 4-tile/16-core fpu_512 — same geometry + same binary set as
-the model). EOC line: `Simulation ended at <T> (retval = 0)`; `tb_cachepool.sv` `ClockPeriod = 1.0ns`
-→ **cycles = T/1000**. All 9 kernels retval=0.
-**Model:** post-E4 build (A1+E1+D1+D2+B1+C1+E4), 16-core 4×4, cache ON, streams cached.
+(insitu-cache `2710920`, 4-tile/16-core fpu_512; `ClockPeriod = 1.0ns` → cycles = EOC-time/1000; all
+retval=0).
+**Model:** post-R1 build (A1+E1+D1+D2+B1+C1+E4 + wide-AXI ELF loader), 16-core 4×4, cache ON, streams
+cached.
 
-## 1. The table
+## 1. The current table (v2 — wide-AXI loader)
 
-| Kernel | RTL cyc (ref) | GVSoC cyc | Δ (model−RTL) | model ×RTL | verdict |
-|---|---|---|---|---|---|
-| gemv-opt_M512_N128_K32 | 56,448 | 62,427 | +10.6% | 1.11× | ✅ within ~10% |
-| byte-enable | 237,889 | 204,981 | −13.8% | 0.86× | ✅ close |
-| fdotp-32b_M32768 | 48,213 | 58,515 | +21.4% | 1.21× | 🔶 ~20% |
-| fdotp-32b_M8192 | 37,544 | 26,963 | −28.2% | 0.72× | 🔶 ~30% fast |
-| fmatmul-32b_M32_N32_K32 | 56,689 | 38,117 | −32.8% | 0.67× | 🔶 ~30% fast |
-| fft-32b_M1024_N16 | 130,217 | 53,514 | **−58.9%** | 0.41× | ⛔ 2.4× fast |
-| spin-lock | 68,368 | 26,636 | **−61.0%** | 0.39× | ⛔ 2.6× fast |
-| load-store_M16 | 101,208 | 566,576 | **+459.8%** | 5.60× | ⛔ 5.6× SLOW |
-| linked-list_M1_N1350_K10 | 183,228 | 2,216,153 | **+1109.6%** | 12.1× | ⛔ 12× SLOW |
+| Kernel | RTL cyc | GVSoC cyc | Δ | verdict |
+|---|---|---|---|---|
+| **load-store_M16** | 101,208 | 106,129 | **+4.9%** | ✅ **within target** |
+| byte-enable | 237,889 | 203,001 | −14.7% | ✅ close |
+| fdotp-32b_M32768 | 48,213 | 28,001 | −41.9% | ⛔ 1.7× fast |
+| fdotp-32b_M8192 | 37,544 | 17,997 | −52.1% | ⛔ 2.1× fast |
+| gemv-opt_M512_N128_K32 | 56,448 | 31,770 | −43.7% | ⛔ 1.8× fast |
+| fmatmul-32b_M32_N32_K32 | 56,689 | 35,329 | −37.7% | ⛔ 1.6× fast |
+| spin-lock | 68,368 | 25,265 | −63.0% | ⛔ 2.7× fast (B3) |
+| fft-32b_M1024_N16 | 130,217 | 44,752 | −65.6% | ⛔ 2.9× fast (F1 + issue-side) |
+| linked-list_M1_N1350_K10 | 183,228 | 376,919 | +105.7% | ⛔ 2.1× slow — **but 262k of it is the 16 MB loader**; ex-loader −37% fast |
 
-## 2. What the errors line up with (each maps to a known gap)
+**The picture after R1:** the "model 5–12× too slow" readings were the ELF-loader artifact (§2).
+Corrected, the model is **uniformly too FAST** (1.6–2.9×) except load-store (+4.9%, in target).
+The too-fast family maps to the review's issue-side/occupancy gaps: B3 (AMO free), F1 (flush free),
+B2 (xbar arbitration free), J1/I-items (scalar LSU + VLSU issue geometry / MLP), C2, G-refill
+overlap. Attack order: **R3 (B3, spin-lock) → R4 (F1, fft) → R5 (issue-side: J1 scalar LSU
+outstanding + VLSU width/I-items) → R2 (E3 partitioning, deprioritized: load-store is in-target)
+→ DRAM timing (P3.1)**.
 
-- **load-store 5.6× slow → E3 (runtime partitioning).** The kernel calls `l1d_part` and runs its main
-  phases half-half (RTL: private-region traffic = local banks, no remote hops; model: everything sprays
-  all 16 banks + remote hops). The review predicted exactly this dominance for this kernel.
-- **spin-lock 2.6× fast → B3 (AMO RMW lane occupancy).** RTL holds the bank-shared scalar lane for the
-  full RMW (~15–20 cy); the model's AMO shim resolves atomically in-call. B1's +10.6% was only the
-  pipeline serialization; the RMW occupancy is unmodeled.
-- **fft 2.4× fast → F1 (flush FSM) + P3.1 (DRAM timing).** fft is the warm-cache/flush-heavy kernel:
-  the model's flush is a zero-cycle stub (RTL: ~21+256 cy/bank + per-dirty eviction), and the flat
-  fixed-latency refill ignores DRAM burst/conflict effects on multi-pass streams.
-- **linked-list 12× slow → NEW top mystery.** RTL ≈ 13.5 cyc/op (mostly L1 hits after warmup — the
-  node region is ~21 KiB, trivially resident); model ≈ 164 cyc/op (everything misses + serializes).
-  Capacity math says it should fit (E1 rotation is on) — so this smells like a *placement/aliasing or
-  sync-protocol bug*, not a calibration knob. Highest-investigation-value item: likely a model bug.
-- **fdotp/fmatmul ~20-30% fast, gemv/byte-enable ~10-15%.** The cross-cutting remainder is the
-  idealized backing store (flat fixed-latency refill vs real DRAM burst/channel timing) — **P3.1**
-  (L2 channel demux + DDR4/DRAMSys), plus possibly C2 window effects on the hit path.
+## 2. The R1 finding — the ELF-loader artifact (why v1 was wrong)
 
-## 3. Re-prioritized attack order (from measured error, largest first)
+GVSoC's `ElfLoader` writes ELF segments through the interconnect as real IO requests. Pre-R1 it rode
+the **narrow AXI (bw=8)**: load time ≈ `section_bytes / 8` cycles *before any instruction executes* —
+invisible unless you compare against a simulator whose load is free (RTL fesvr/DPI ≈ 0 cycles).
 
-1. **R1: linked-list 12× anomaly** — diagnose (suspected model bug, not calibration).
-2. **R2: E3 `l1d_part` runtime partitioning** — load-store 5.6× (plumbing exists in route.hpp).
-3. **R3: B3 AMO RMW lane occupancy** — spin-lock 2.6× (~30 lines + 1 knob per the review).
-4. **R4: F1 flush FSM** — fft 2.4× (transcription already exists: insitu_cache_sync_fsm.hpp).
-5. **R5: P3.1 L2 channel demux + DRAM timing** — the ±20-30% residue on fdotp/fmatmul/gemv.
+| Kernel | .pdcp_src | narrow-loader cost | share of the old total |
+|---|---|---|---|
+| linked-list_M1_N1350_K10 | 16.8 MB | **~2.10M cyc** | **95%** of 2.22M (the "12× slow" anomaly) |
+| load-store_M16 | 3.0 MB | ~393k | **69%** of 566k (the "5.6× slow" reading) |
+| gemv-opt_M512 | 258 KB | ~33k | 52% of 62k |
+| fdotp-32b_M32768 | 256 KB | ~33k | 56% of 59k |
+| fdotp-32b_M8192 | 64 KB | ~8k | 30% of 27k |
+| fft | 64 KB | ~8k | 15% of 54k |
+
+Fix (pulp `f4df56c`): loader → wide_axi (bw=64) + catch-all map (entry write still reaches the
+peripheral). Residual load time = bytes/64 (linked-list 262k — its EOC still can't be compared
+directly; use its kernel phase prints: **model work 38,040 vs RTL 70,480 = 1.85× fast**).
+
+### v1 table (superseded — kept for the record, narrow-AXI loader)
+gemv +10.6% · byte-enable −13.8% · fdotp M32768 +21.4% · fdotp M8192 −28.2% · fmatmul −32.8% ·
+fft −58.9% · spin-lock −61.0% · load-store **+459.8%** · linked-list **+1109.6%** — the last two were
+loader-dominated; the rest shift by §2's amounts.
+
+## 3. How the anomaly was pinned (R1 investigation trail)
+
+1. Cache counters at stop(): L1 91% hits, all L1+AMO latency ≈ **2.3%** of the anomalous cycles →
+   cache exonerated (not capacity, not D1/B1/winfo, not AMO cost — AMOs are ~free, the B3 gap).
+2. Ablations: 16≈8≈2 cores (not contention), VLSU lanes 4→1 (+1%, not the vector path), coalescer
+   on/off (identical).
+3. Instruction trace (libdw symbolization): cores execute **zero instructions** for the first
+   ~2.1M cycles, then the whole kernel runs in the last ~35k → something *before* the cores starts
+   dominates.
+4. Kernel's own prints: `[core 0]: start=2,103,820 end=2,127,952 total=24,132` — the work phase is
+   ~24k cycles; and `.pdcp_src` = 16.8 MB ≈ 2.1M cycles at 8 B/cyc → **the loader**.
+5. RTL log cross-check: RTL work phase ≈ 70,480 (16-core) — model 1.85× fast on the real work.
 
 ## 4. Caveats
 
-- The RTL numbers are from the **2026-05-29 sweep (insitu-cache `2710920`)**, not the current
-  `dev/multi-group @ 05e4671a` reference revision. The CombLoop fix was combinational-only
-  ("no perf change"), and the gross errors (≥2.4×) dwarf any revision drift — but before declaring
-  <10% on any kernel, re-run the RTL CI on the current revision for a definitive reference.
-- GVSoC EOC cycles are simulator cycles at 10 MHz (the model's clock domain); ratio comparison is
-  clock-rate-independent.
+- RTL numbers are from the **2026-05-29 sweep (`2710920`)**, not the current `05e4671a` revision —
+  re-run the RTL CI before declaring <10% anywhere.
+- The RTL total includes its own ~103k epilogue tail on linked-list (UART flush etc.); where a kernel
+  prints phase boundaries (linked-list only), compare work phases.
+- The remaining loader residual (bytes/64) still affects load-store (~49k) and linked-list (~262k)
+  EOC totals; a true backdoor loader is the clean end-state.
