@@ -17,7 +17,7 @@
 | fdotp-32b_M8192 | 37,544 | 31,443 | −16.2% | 🔶 |
 | fmatmul-32b_M32_N32_K32 | 56,689 | 46,001 | −18.9% | 🔶 |
 | load-store_M16 | 101,208 | 154,935 | +53.1% | ⛔ dependent-miss regime (E3 candidate) |
-| fft-32b_M1024_N16 | 130,217 | 59,001 | −54.7% | ⛔ 2.2× fast (issue-side, not memory) |
+| fft-32b_M1024_N16 | 130,217 | 61,001 | — | ✅ **compute −3.0%** (9,952+5,946 vs 8,216+7,212); EOC gap = scalar init/validate phases (J1), see `cachepool_fft_anomaly_resolved_2026-07-27.md` |
 | linked-list_M1_N1350_K10 | 183,228 | 653,001 | ⛔ | 262k loader + work-phase storm (issue-side) |
 
 **The R5 finding:** the plain backing store had **latency=0** — every miss/eviction/icache-fill paid

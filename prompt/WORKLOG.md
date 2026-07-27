@@ -6,6 +6,19 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-27 (#24 fft SOLVED):** fft's "2× fast" is **not a compute gap** — the RTL's own kernel
+prints show its butterfly compute window is only ~16k of its 130k EOC, and the model's compute matches
+within ~6% (8,216+7,212 vs RTL 9,952+5,946, sum −3.0%). The residual (~45k model vs ~114k RTL non-compute)
+is the scalar init/validate loops = the J1 scalar-LSU family (the roadmap's top issue-side item). The
+stride/bank-conflict hypothesis is DEAD — the model's bank distribution is fine. Added `[ARA-STATS]`
+per-core issue-side counters (vlsu loads/stores/bursts, vfpu insns/busy) dumped at sim stop — **trap: the
+cachepool cores are SnitchFast (`snitch_fast/snitch.cpp` IssWrapper), NOT the generic `iss.cpp` wrapper —
+editing `iss.cpp` compiles cleanly but is dead for this target** (cost me one full debug round). Also:
+the ISA-variant gen libs can rebuild with one stale object — verify print strings with `strings` when a
+fprintf "doesn't fire". Doc: `prompt/cachepool_fft_anomaly_resolved_2026-07-27.md`.
+
+---
+
 **STATUS 2026-07-27 (S1 — issue-side VLSU geometry):** the model's VLSU was 2× too wide (lane_width=8 →
 32 B/cycle vs RTL's 16 B/cycle at 32b/lane, SpatzDataWidth) with 8 outstanding vs RTL's 32. Fixed to the
 RTL values (pulp `1c96328`, env A/B knobs). **gemv +1.0%**, byte-enable −5.4%, fmatmul −9.0%, fdotp_M8192
