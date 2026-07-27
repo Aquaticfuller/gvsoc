@@ -6,6 +6,53 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-27 (P1 COMPLETE):** B1 per-cell serialization + C1 coalescer merge DONE (core `ce5e0455`,
+pulp `bfa076a`) — the shared-L1 contention pair landed together per the sequencing invariant. coal_merge
+gate: cold same-part **67,67,67,67** (one refill; B1-only: 67,77,77,77), warm **10,10,10,10** (B1-only:
+10,11,12,13), full-part writes **8,8,8,8** w/ correct read-back; isolated gates exact through the coalescer
+(67/10, cold_stream 0.0143). 16-core sweep 9/9 data-correct; spin-lock +10.6% (first kernel-visible
+contention). Two real bugs found by the gates + fixed: resp loopback on individual forwards (req() →
+req_forward) and the D1 clamp's virtual-time install leak (followers serve WITHOUT installing). Doc:
+`prompt/cachepool_p1_3_p2_1_cell_serialization_coalescer_2026-07-27.md`. **P1 phase complete (P1.1–P1.5);
+next: P2.x (0xA0000000 through the cache is the pivotal one).**
+
+---
+
+## 2026-07-27 — P1.3+P2.1 DONE: B1 per-cell serialization + C1 coalescer merge (P1 phase complete)
+
+**B1 (P1.3).** Sync path resolved every request in-call touching no shared state (up to 20 lookups/cell/
+cycle; RTL ≤1). Per-cell accept token (`cell_busy_until_`), all ports shared; D1 clamp waits don't hold
+the cell. Single-port isolated gates byte-identical (token never contended).
+
+**C1 (P2.1).** Coalescer reworked to the RTL merge + ENABLED (`cell_coalescer=True` in snitch_cluster,
+A/B env knob): 16 B part key (PartSplit=4, not the 64 B line), same-part write merge (full-coverage →
+ONE wide write; partial → individual forwards), member latency = wide latency − park→split slip (the
+calibrated knobs already contain the coalescer pipeline — the batch window's cycle must not double-
+charge), word-guard bypass.
+
+**Bugs found by the gate traces (fixed before commit).** (1) Individual forwards lost responses:
+`output_.req()` on a parked req pushed the coalescer's own resp context → upstream resp() looped into
+the coalescer's resp_handler and was dropped (writes vanished, watchdog abort) → `req_forward`. (2) D1
+clamp installed PEND lines at VIRTUAL time → later same-cycle followers took early hits (67,77,12,13)
+→ clamped followers serve from the PEND line WITHOUT installing. (3) Pool-exhaustion double-serve (A2
+latent) → mark consumed Pends. (4) **Build-graph trap: `TARGETS="insitu_cache_calib"` alone DROPS the
+coalescer gen lib** (gapy components scans the target Python without env vars) and silently stales the
+installed .so — always build `insitu_cache_calib cachepool` together.
+
+**Verified.** coal_merge: cold same-part 67×4 (one refill serves 4 lanes), warm 10×4 (merge cancels B1's
+per-lane serialization), writes 8×4 + read-back correct; isolated 67/10, cold_stream 0.0143, pend
+67,73,9,73,10 — coalescer exactly transparent at the calibrated boundary. B1-alone A/B: 67,77,77,77 /
+10,11,12,13 / 8,75,75,75 (the pessimism C1 recovers). 16-core sweep 9/9 data-correct; spin-lock 26,636
+(+10.6% — B1 lock contention, first kernel-visible effect); streams flat (0xA0000000 bypass). Doc:
+`prompt/cachepool_p1_3_p2_1_cell_serialization_coalescer_2026-07-27.md`.
+
+**P1 phase COMPLETE (P1.1 A1, P1.2 E1, P1.4 D1, P1.5 D2, P1.3 B1, P2.1 C1).** Next per roadmap: P2.x —
+**P2.13 (0xA0000000 through the cache) is the pivotal item**: three P1 fixes showed ~0 kernel movement
+because the CI streams bypass the L1; routing them through it makes the whole calibrated stack
+kernel-visible.
+
+---
+
 **STATUS 2026-07-26 (P1.4+P1.5):** D1 PEND-line ready-cycle clamp + D2 write-miss early ack DONE (core
 `16373523`, pulp `b243c37`) — followers no longer hit early through a refill (73 vs ~10 on the gate), store
 misses ack at the RTL winfo latency (8 vs ~67). Calib exact (67/10, cold_stream 0.0143, flat path
