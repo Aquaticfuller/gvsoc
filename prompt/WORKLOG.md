@@ -6,6 +6,42 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-27 (E4/P2.13 DONE — the pivotal one):** the full DRAM PMA now goes through the cache
+(pulp `594c27a`) — the 0xA0000000 bypass (an M32768-bug workaround) is RETIRED. **The M32768 eviction
+bug does NOT reproduce** against the P1 cache (A1's delayed commit + D1's PEND semantics removed the
+two plausible root causes). All 9 binaries data-correct at 16-core; streaming kernels **45–60% faster**
+(fdotp M8192 26,963 / M32768 58,515 / gemv 62,427 / fft 53,514) — the cache now captures cross-iteration
+stream reuse. A/B knob `CACHEPOOL_CACHE_ALL_DRAM=0` preserves the old bypass. New dirty-eviction-under-
+rotation gate data-exact (2048/2048 vs 0/2048 hits, data_err=0). Doc:
+`prompt/cachepool_e4_full_dram_through_cache_2026-07-27.md`. **Kernel tables are now RTL-comparable —
+next: RTL [EOC] numbers (E4.4), then E3 (l1d_part) / F1 (flush) as the top remaining kernel-visible gaps.**
+
+---
+
+## 2026-07-27 (cont'd) — E4/P2.13 DONE: full DRAM PMA through the cache; M32768 bug gone
+
+**Goal ladder for this arc (user-requested):** E4.1 reroute+reproduce → E4.2 diagnose/fix bug if it
+reproduces → E4.3 full re-validation + kernel tables → E4.4 RTL [EOC] reference numbers (needs user).
+
+**E4.1/E4.2.** Reroute was ~10 lines (`cache_region` → [DRAM_BASE, SPM_BASE); scalar+VLSU maps derive
+from it; refills ride wide_axi to the already-mapped `uncached` backing). **The M32768 eviction data
+bug does NOT reproduce** — 4-core fdotp_M32768 105,468 retval=0 (bypass: 148,212, −29%); 16-core sweep
+9/9 data-correct. Root-cause attribution: A1 (VLSU no longer consumes at issue) + D1 (followers no
+longer hit mid-refill lines) each independently closed a real data-corruption path under eviction
+pressure — the workaround is retired at the root. A/B `CACHEPOOL_CACHE_ALL_DRAM=0` verified (148,248).
+
+**E4.3.** 16-core sweep with streams cached: **fdotp M8192 26,963 (−44.9%) / M32768 58,515 (−60.3%) /
+gemv 62,427 (−59.5%) / fft 53,514 (−51.0%)**; spin-lock/fmatmul/byte-enable/load-store/linked-list
+flat. fdotp_M32768 now BELOW the pre-A1 optimistic 87,346 — the full cache stack is both more faithful
+and faster (reuse capture + line refills + wide fabric vs the 8 B/cyc narrow link). New
+`capacity_dirty_2048` gate: dirty evictions + writebacks under rotation data-exact (2048/2048 vs
+0/2048 read-back hits, data_err=0 both). Calib gates untouched (pulp-side change).
+
+**Next:** E4.4 (RTL QuestaSim [EOC] per-kernel numbers — ask user) → then E3 (l1d_part runtime
+partitioning; load-store actually calls it) and F1 (flush FSM) as the top remaining kernel-visible gaps.
+
+---
+
 **STATUS 2026-07-27 (P1 COMPLETE):** B1 per-cell serialization + C1 coalescer merge DONE (core `ce5e0455`,
 pulp `bfa076a`) — the shared-L1 contention pair landed together per the sequencing invariant. coal_merge
 gate: cold same-part **67,67,67,67** (one refill; B1-only: 67,77,77,77), warm **10,10,10,10** (B1-only:
