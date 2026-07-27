@@ -6,6 +6,18 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-27 (R5/P3.1 — the backing-store discovery):** the "model too fast" family's dominant
+term was the **0-latency plain backing store** (every miss/eviction/icache-fill ~free). `CACHEPOOL_MEM_LATENCY`
+(default 50) prices it: **fdotp_M32768 +5.8%, gemv −4.3%, byte-enable −5.4% vs RTL — within ~6%**; spin-lock
++12.3%; fdotp_M8192 −16.2%, fmatmul −18.9%; load-store overshoots +53% (dependent-miss regime → E3), fft
+−54.7% (issue-side, not memory). ALSO: the RTL tb itself backs L2 with DRAMSys (4× DDR4, 1 KiB interleave) —
+our `CACHEPOOL_DRAMSYS=1` now routes the whole DRAM range through N DRAMSys channels behind an Interleaver
+(+ loader/interleaver DENIED resilience core `e6486d52`, mux clock bind; DRAMSys bring-up run in progress —
+wall-clock 10-100×). Doc: `prompt/cachepool_rtl_kernel_diff_2026-07-27.md` (v3). Commits: core `e6486d52`,
+pulp `8acfc99`.
+
+---
+
 **STATUS 2026-07-27 (R4/F1 DONE):** flush-all implemented end-to-end (core `590fc2c9`, pulp `f88c790`) —
 COMMIT (0x38) fans out to all 16 cells; each writes back dirty lines (real evictions, l2-unrotated — data
 SURVIVES the flush: fft wrote back 758 lines), invalidates, gates traffic for the walk (277 + 20×dirty,
