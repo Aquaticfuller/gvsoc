@@ -6,6 +6,19 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-27 (multi-user linked-list sweep + a real bug found):** ran the user's updated
+multi-user kernel (M48_N800_K300: 48 UEs, 810 B PDUs, 300 pkgs) across 8 configs — **all pass**
+(retval=0, zero ERROR lines). Scaling: producers bottleneck first (2→4 producers: 1.53× at 2×4),
+consumers pay off once producers suffice (4→8 at 4×4: +20%), tiles help via more banks (P4C4 2×4→4×4:
++13%; P2C2 1×4→4×4: +29%). Best config P4/C8: work phase 250,210 (2.15× the P2/C2 baseline 538,635).
+**The sweep exposed a real model bug (fixed, core `47d99557`):** the coalescer's merge-group member
+mapping matched parked reqs by PORT alone — but the port index is the port-CLASS (every core's lane-j
+shares it), so one req could be claimed by two groups → double resp() → arg_pop on empty in the VLSU →
+SIGSEGV at 4-core. Fixed by matching only unconsumed (!done) requests; coal_merge gate exact, fdotp
+unchanged, the 4-core run now passes (1,002,001). Report: `prompt/multiuser_llist_sweep_2026-07-27.md`.
+
+---
+
 **STATUS 2026-07-27 (#24 fft SOLVED):** fft's "2× fast" is **not a compute gap** — the RTL's own kernel
 prints show its butterfly compute window is only ~16k of its 130k EOC, and the model's compute matches
 within ~6% (8,216+7,212 vs RTL 9,952+5,946, sum −3.0%). The residual (~45k model vs ~114k RTL non-compute)
