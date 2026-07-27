@@ -6,6 +6,16 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-27 (R3/B3 DONE):** AMO RMW lane occupancy implemented (core `1883d2ae`) — **16-core
+spin-lock 69,409 vs RTL 68,368 = +1.5%** (was 2.7× too fast). Key implementation detail: the busy window
+must CHAIN (`max(prev,now)+total` — `now+total` lets overlapping windows shrink the serialization). Full
+sweep 9/9 data-correct. Documented side effect: linked-list work phase 38k→239k (RTL 70k) — its back-to-back
+empty-poll TAS storm (13,265 RMWs) now pays real occupancy; the storm exists because the consumer drains too
+fast (the unresolved issue-side gap R5), B3 only prices it. R2/E3 deprioritized (load-store in target).
+Next: R4 (F1 flush FSM, fft 2.9× fast).
+
+---
+
 **STATUS 2026-07-27 (R1 SOLVED + fixed):** the linked-list "12× slow" was **100% the ELF-loader artifact**
 — ElfLoader segments rode the narrow AXI (bw=8): 16.8 MB `.pdcp_src` → ~2.1M simulated cycles before any
 instruction runs (RTL fesvr ≈ 0). Fixed (pulp `f4df56c`: loader → wide_axi bw=64 + catch-all map). The RTL
