@@ -6,6 +6,16 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-27 (R4/F1 DONE):** flush-all implemented end-to-end (core `590fc2c9`, pulp `f88c790`) —
+COMMIT (0x38) fans out to all 16 cells; each writes back dirty lines (real evictions, l2-unrotated — data
+SURVIVES the flush: fft wrote back 758 lines), invalidates, gates traffic for the walk (277 + 20×dirty,
+knobs), FLUSH_STATUS spins on the slowest. fdotp/fft retval=0 (32 flushes each); sweep 9/9. Cycle deltas
+bounded (+0.7k fdotp / +1.2k fft / +13.9k load-store — its dirty volume). fft's 2.9×-fast gap confirmed NOT
+flush (moved +1.2k only) — it's the issue-side/DRAM family. Next: R5 (the "model too fast" family: issue-side
+J1/VLSU geometry + P3.1 DRAM timing).
+
+---
+
 **STATUS 2026-07-27 (R3/B3 DONE):** AMO RMW lane occupancy implemented (core `1883d2ae`) — **16-core
 spin-lock 69,409 vs RTL 68,368 = +1.5%** (was 2.7× too fast). Key implementation detail: the busy window
 must CHAIN (`max(prev,now)+total` — `now+total` lets overlapping windows shrink the serialization). Full
