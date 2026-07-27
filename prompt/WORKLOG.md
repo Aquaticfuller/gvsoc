@@ -6,6 +6,16 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-27 (S1 — issue-side VLSU geometry):** the model's VLSU was 2× too wide (lane_width=8 →
+32 B/cycle vs RTL's 16 B/cycle at 32b/lane, SpatzDataWidth) with 8 outstanding vs RTL's 32. Fixed to the
+RTL values (pulp `1c96328`, env A/B knobs). **gemv +1.0%**, byte-enable −5.4%, fmatmul −9.0%, fdotp_M8192
+−13.5%, fdotp_M32768 +15.0% (on correct hardware; residual = issue-depth/burst shape), spin-lock +12.3%,
+fft −53.2% (separate cause: stride/bank-conflict fidelity — 98% hit, compute-bound; the model's idealized
+distribution dodges the RTL's power-of-2-stride bank conflicts). DRAMSys ground-truth run still grinding
+in background (its per-transaction wall cost is ~50-100×; will refine ML when it lands).
+
+---
+
 **STATUS 2026-07-27 (R5/P3.1 — the backing-store discovery):** the "model too fast" family's dominant
 term was the **0-latency plain backing store** (every miss/eviction/icache-fill ~free). `CACHEPOOL_MEM_LATENCY`
 (default 50) prices it: **fdotp_M32768 +5.8%, gemv −4.3%, byte-enable −5.4% vs RTL — within ~6%**; spin-lock
