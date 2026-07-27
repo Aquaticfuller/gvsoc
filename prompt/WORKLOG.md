@@ -6,6 +6,17 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-07-27 (E4.4 — first RTL kernel diff!):** found RTL QuestaSim [EOC] references in the RTL
+repo (`reports/sweep_2026-05-29_05-54/cachepool_4t_fpu_512/logs/`, 1.0 ns clock → cycles=T/1000) and ran
+the FIRST per-kernel RTL-vs-model diff (doc: `prompt/cachepool_rtl_kernel_diff_2026-07-27.md`). **gemv
++10.6%, byte-enable −13.8%, fdotp_M32768 +21.4%, fdotp_M8192 −28.2%, fmatmul −32.8%** — and four
+gap-mapped outliers: **load-store 5.6× slow (E3 partitioning), spin-lock 2.6× fast (B3 AMO occupancy),
+fft 2.4× fast (F1 flush + P3.1 DRAM), linked-list 12× slow (NEW top mystery — smells like a model bug,
+not calibration)**. Caveat: RTL sweep is the older `2710920` revision; re-run RTL CI on `05e4671a` for
+the definitive reference. Next ladder: R1 linked-list → R2 E3 → R3 B3 → R4 F1 → R5 P3.1.
+
+---
+
 **STATUS 2026-07-27 (E4/P2.13 DONE — the pivotal one):** the full DRAM PMA now goes through the cache
 (pulp `594c27a`) — the 0xA0000000 bypass (an M32768-bug workaround) is RETIRED. **The M32768 eviction
 bug does NOT reproduce** against the P1 cache (A1's delayed commit + D1's PEND semantics removed the
