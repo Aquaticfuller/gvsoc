@@ -88,9 +88,7 @@ CXX=g++-14.2.0 CC=gcc-14.2.0 CMAKE=cmake-3.18.1 make all TARGETS="cachepool"
 source sourceme.sh     # puts install/bin on PATH; once per shell
 ~~~~~
 
-The Python code needs **Python >= 3.10**. If your default `python3` is older, shim it:
-`ln -sf /usr/bin/python3.12 /tmp/py312_shims/python3 && export PATH=/tmp/py312_shims:$PATH`.
-Required pip packages are listed in the *Python requirements* section above.
+The Python code needs **Python >= 3.10**. Required pip packages are listed in the *Python requirements* section above.
 
 ### 2. Run a kernel
 
@@ -154,7 +152,48 @@ Useful extra diagnostics, printed at the end of every run:
 `[INSITU-CORE ...]` per-bank cache statistics (hits/misses/refills/evictions/flushes plus a
 latency budget) and `[ARA-STATS ...]` per-core vector issue counters.
 
-### 5. Cross-check against the RTL reference numbers
+### 5. Reference runs — RLC multi-user thread scaling (16 cores)
+
+Copy-pasteable sweep of the producer/consumer variants at the standard 4x4 = 16-core
+topology. The P/C split is **compiled into the ELF** (the `_P<p>_C<c>` variants); only the
+topology comes from the environment:
+
+~~~~~shell
+B=<ManyRVData>/software/build/CachePoolTests
+K=test-cachepool-multi_producer_single_consumer_double_linked_list_M48_N800_K300
+
+for V in "" _P2_C8 _P4_C4 _P4_C8; do            # "" = the default 2P/2C build
+  mkdir -p /tmp/rlc/$V && cd /tmp/rlc/$V && rm -f gvsoc_config.json
+  CACHEPOOL_NB_TILE=4 CACHEPOOL_CORES_PER_TILE=4 \
+    gvsoc --target=cachepool --binary $B/$K$V run > run.log 2>&1
+  echo "$V: $(grep -oE 'retval=[0-9]+ cycles=[0-9]+' run.log | tail -1)" \
+       "work=$(grep -oE 'total cycles = [0-9]+' run.log | head -1 | grep -oE '[0-9]+')" \
+       "errs=$(grep -cE 'ERROR|Check Failed' run.log)"
+done
+~~~~~
+
+Expected results (current model, 48 UEs / 810 B PDUs / 300 packets, pacing off):
+
+| Variant | Active cores | EOC cycles | Work phase | vs 2P/2C |
+|---|---|---|---|---|
+| default `2P/2C` | 4 (+12 idle) | 937,001 | 538,635 | 1.00x |
+| `_P2_C8` | 10 (+6 idle) | 904,001 | 505,146 | 1.07x |
+| `_P4_C4` | 8 (+8 idle) | 700,001 | 301,139 | 1.79x |
+| `_P4_C8` | 12 (+4 idle) | 648,001 | 250,210 | **2.15x** |
+
+All four must report `retval=0` with **zero** `ERROR` / `Check Failed` lines. Reading the
+scaling: producers saturate first (2->4 producers is worth ~1.7x; adding consumers on top of
+2 producers only ~1.07x), and consumers pay off once producers keep up (4->8 consumers at 4
+producers: +20%). More tiles help too, via more cache banks — the same `_P4_C4` binary runs
+340,633 at 2x4 vs 301,139 at 4x4. Full sweep incl. 1x4/2x4 topologies:
+`prompt/multiuser_llist_sweep_2026-07-27.md`.
+
+> The work-phase figure above is the **first** core's `total cycles` line (what the one-liner
+> greps). Cores finish within ~0.1% of each other; if you need the exact parallel-region span
+> use `max(end cycle) - min(start cycle)` across all cores instead — e.g. `_P4_C8` gives
+> 250,426 rather than 250,210.
+
+### 6. Cross-check against the RTL reference numbers
 
 Measured with the current model at 16 cores (4x4), against the reference figures in the RTL
 kernel README:
@@ -173,7 +212,7 @@ root cause of each remaining outlier.
 > model, so the model does not currently reproduce that failure — do not treat a passing
 > GVSoC run of those variants as validation of the RTL configuration.
 
-### 6. Notes and troubleshooting
+### 7. Notes and troubleshooting
 
 - **Do not background the simulation.** If a run appears to hang, kill it and inspect the log;
   prefix with `stdbuf -oL -eL` to capture output before an abort.
