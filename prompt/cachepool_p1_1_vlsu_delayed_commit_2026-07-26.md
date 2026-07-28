@@ -1,7 +1,7 @@
 # P1.1 — A1: VLSU delayed-commit (vector traffic consumes cache latency) + the SoC-DRAM bandwidth fix
 
 **Date:** 2026-07-26 · **Status:** DONE, verified, committed
-**Commits:** core `e49c12b9` (A1 delayed-commit) · pulp `cdc4aa8` (bandwidth fix) · pulp `a0dfa38` (calib xbar knob)
+**Commits:** core `bab9e078` (A1 delayed-commit) · pulp `6b7cf09` (bandwidth fix) · pulp `44ad448` (calib xbar knob)
 **Roadmap:** item P1.1 (gap A1) of `prompt/cachepool_architecture_gap_review_2026-07-26.md`
 
 ---
@@ -59,7 +59,7 @@ VLSU stream of a 4-core tile. The stamp ran further and further ahead of real ti
 latencies grew linearly with traffic volume: a bandwidth model that had silently
 degenerated into an unbounded queueing delay.
 
-Fix (pulp `cdc4aa8`): `width_log2` 2→**6** (64 B/cycle) on **both** `mem` (cached DRAM) and
+Fix (pulp `6b7cf09`): `width_log2` 2→**6** (64 B/cycle) on **both** `mem` (cached DRAM) and
 `uncached` (the 0xA0000000 region). Burst latencies immediately bounded (max ~13) and the
 collapse disappeared. Note this is still an idealized fixed-latency store — the realistic
 DRAM timing point remains DRAMSys (P3.1) — but at least its bandwidth term no longer lies.
@@ -80,7 +80,7 @@ DRAM timing point remains DRAMSys (P3.1) — but at least its bandwidth term no 
   confirmed by exact reproduction of the references.
 - The structural 68/11 at the new xbar=1 default is **not a regression**: it is step-4's
   calibrated interco hop, which the RTL *standalone* calib TB (one ctrl, no interco) does
-  not include. New pulp knob `INSITU_CALIB_XBAR_LAT` (`a0dfa38`) selects the boundary:
+  not include. New pulp knob `INSITU_CALIB_XBAR_LAT` (`44ad448`) selects the boundary:
   0 for the 1:1 RTL-TB diff (10/67), 1 for production fidelity (11/68 at the driver).
 - **Methodology traps (re-)learned:** (1) `gvsoc` needs the py312 shim on `PATH` or the
   target Python dies on `str | None` — silently, if stdout is redirected, leaving stale

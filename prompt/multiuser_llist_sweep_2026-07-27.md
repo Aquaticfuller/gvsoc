@@ -1,6 +1,6 @@
 # Multi-user linked-list (M48_N800_K300) — config sweep on the GVSoC model
 
-**Date:** 2026-07-27 · **Model:** `--target=cachepool`, current build (post-S1 + coalescer member-mapping fix `47d99557`)
+**Date:** 2026-07-27 · **Model:** `--target=cachepool`, current build (post-S1 + coalescer member-mapping fix `c05b9450`)
 **Kernel:** updated `multi_producer_single_consumer_double_linked_list` (multi-user: **48 UEs**, 810 B PDUs,
 300 pkgs; `ManyRVData_rebase/software/tests/...`, binaries from `software/build/CachePoolTests`).
 Consumer `c` owns users `{u : u % stride == c % stride}` (stride = min(consumer count, 48); producers share one
@@ -35,7 +35,7 @@ self-test path adds no measurable overhead.
 - **EOC minus work ≈ ~0.4–0.4M cycles everywhere**: the ELF load (~11.7 MB `.pdcp_src` over the wide AXI,
   ~180k) + boot + the final barrier/drain — the known loader artifact, same as the M1 kernel (R1).
 
-## 3. The model crash this sweep found (and fixed) — core `47d99557`
+## 3. The model crash this sweep found (and fixed) — core `c05b9450`
 
 The **1×4 (4-core) config segfaulted the simulator** (SIGSEGV, no output). Root cause: the coalescer's
 merge-group member mapping matched parked requests by **port alone** — but the coalescer input index is

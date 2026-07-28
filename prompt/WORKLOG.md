@@ -11,7 +11,7 @@ multi-user kernel (M48_N800_K300: 48 UEs, 810 B PDUs, 300 pkgs) across 8 configs
 (retval=0, zero ERROR lines). Scaling: producers bottleneck first (2→4 producers: 1.53× at 2×4),
 consumers pay off once producers suffice (4→8 at 4×4: +20%), tiles help via more banks (P4C4 2×4→4×4:
 +13%; P2C2 1×4→4×4: +29%). Best config P4/C8: work phase 250,210 (2.15× the P2/C2 baseline 538,635).
-**The sweep exposed a real model bug (fixed, core `47d99557`):** the coalescer's merge-group member
+**The sweep exposed a real model bug (fixed, core `c05b9450`):** the coalescer's merge-group member
 mapping matched parked reqs by PORT alone — but the port index is the port-CLASS (every core's lane-j
 shares it), so one req could be claimed by two groups → double resp() → arg_pop on empty in the VLSU →
 SIGSEGV at 4-core. Fixed by matching only unconsumed (!done) requests; coal_merge gate exact, fdotp
@@ -34,7 +34,7 @@ fprintf "doesn't fire". Doc: `prompt/cachepool_fft_anomaly_resolved_2026-07-27.m
 
 **STATUS 2026-07-27 (S1 — issue-side VLSU geometry):** the model's VLSU was 2× too wide (lane_width=8 →
 32 B/cycle vs RTL's 16 B/cycle at 32b/lane, SpatzDataWidth) with 8 outstanding vs RTL's 32. Fixed to the
-RTL values (pulp `1c96328`, env A/B knobs). **gemv +1.0%**, byte-enable −5.4%, fmatmul −9.0%, fdotp_M8192
+RTL values (pulp `23b655a`, env A/B knobs). **gemv +1.0%**, byte-enable −5.4%, fmatmul −9.0%, fdotp_M8192
 −13.5%, fdotp_M32768 +15.0% (on correct hardware; residual = issue-depth/burst shape), spin-lock +12.3%,
 fft −53.2% (separate cause: stride/bank-conflict fidelity — 98% hit, compute-bound; the model's idealized
 distribution dodges the RTL's power-of-2-stride bank conflicts). DRAMSys ground-truth run still grinding
@@ -48,13 +48,13 @@ term was the **0-latency plain backing store** (every miss/eviction/icache-fill 
 +12.3%; fdotp_M8192 −16.2%, fmatmul −18.9%; load-store overshoots +53% (dependent-miss regime → E3), fft
 −54.7% (issue-side, not memory). ALSO: the RTL tb itself backs L2 with DRAMSys (4× DDR4, 1 KiB interleave) —
 our `CACHEPOOL_DRAMSYS=1` now routes the whole DRAM range through N DRAMSys channels behind an Interleaver
-(+ loader/interleaver DENIED resilience core `e6486d52`, mux clock bind; DRAMSys bring-up run in progress —
-wall-clock 10-100×). Doc: `prompt/cachepool_rtl_kernel_diff_2026-07-27.md` (v3). Commits: core `e6486d52`,
-pulp `8acfc99`.
+(+ loader/interleaver DENIED resilience core `bb5ab74b`, mux clock bind; DRAMSys bring-up run in progress —
+wall-clock 10-100×). Doc: `prompt/cachepool_rtl_kernel_diff_2026-07-27.md` (v3). Commits: core `bb5ab74b`,
+pulp `cb7e40c`.
 
 ---
 
-**STATUS 2026-07-27 (R4/F1 DONE):** flush-all implemented end-to-end (core `590fc2c9`, pulp `f88c790`) —
+**STATUS 2026-07-27 (R4/F1 DONE):** flush-all implemented end-to-end (core `122c8d33`, pulp `9fa9252`) —
 COMMIT (0x38) fans out to all 16 cells; each writes back dirty lines (real evictions, l2-unrotated — data
 SURVIVES the flush: fft wrote back 758 lines), invalidates, gates traffic for the walk (277 + 20×dirty,
 knobs), FLUSH_STATUS spins on the slowest. fdotp/fft retval=0 (32 flushes each); sweep 9/9. Cycle deltas
@@ -64,7 +64,7 @@ J1/VLSU geometry + P3.1 DRAM timing).
 
 ---
 
-**STATUS 2026-07-27 (R3/B3 DONE):** AMO RMW lane occupancy implemented (core `1883d2ae`) — **16-core
+**STATUS 2026-07-27 (R3/B3 DONE):** AMO RMW lane occupancy implemented (core `85011e1b`) — **16-core
 spin-lock 69,409 vs RTL 68,368 = +1.5%** (was 2.7× too fast). Key implementation detail: the busy window
 must CHAIN (`max(prev,now)+total` — `now+total` lets overlapping windows shrink the serialization). Full
 sweep 9/9 data-correct. Documented side effect: linked-list work phase 38k→239k (RTL 70k) — its back-to-back
@@ -76,11 +76,11 @@ Next: R4 (F1 flush FSM, fft 2.9× fast).
 
 **STATUS 2026-07-27 (R1 SOLVED + fixed):** the linked-list "12× slow" was **100% the ELF-loader artifact**
 — ElfLoader segments rode the narrow AXI (bw=8): 16.8 MB `.pdcp_src` → ~2.1M simulated cycles before any
-instruction runs (RTL fesvr ≈ 0). Fixed (pulp `f4df56c`: loader → wide_axi bw=64 + catch-all map). The RTL
+instruction runs (RTL fesvr ≈ 0). Fixed (pulp `5350ae2`: loader → wide_axi bw=64 + catch-all map). The RTL
 diff transforms: **load-store +4.9% (IN TARGET)**, everything else model 1.6–2.9× too FAST (the issue-side
 family: B3/F1/J1), linked-list's residual is its 262k loader (work phase: model 38k vs RTL 70.5k = 1.85×
 fast). Cache fully exonerated by the new latency-budget counters (L1+AMO = 2.3% of the anomaly; core
-`f31afd03`). Full trail + new table: `prompt/cachepool_rtl_kernel_diff_2026-07-27.md` (v2). Next: R3
+`9d98fe87`). Full trail + new table: `prompt/cachepool_rtl_kernel_diff_2026-07-27.md` (v2). Next: R3
 (B3 AMO occupancy, spin-lock 2.7× fast) → R4 (F1 flush, fft 2.9×) → R5 (issue-side J1/VLSU) → R2 (E3,
 deprioritized) → P3.1.
 
@@ -89,7 +89,7 @@ deprioritized) → P3.1.
 ## 2026-07-27 (cont'd 2) — R1 SOLVED: the linked-list 12× = ELF-loader bandwidth artifact
 
 **Investigation trail** (each step eliminated a suspect): (1) New stop() latency-budget counters (core
-`f31afd03`): L1 91% hits, ALL L1+AMO latency = 49k of 2.14M cycles (2.3%) → cache exonerated; AMOs are
+`9d98fe87`): L1 91% hits, ALL L1+AMO latency = 49k of 2.14M cycles (2.3%) → cache exonerated; AMOs are
 ~2 cyc to the requester (the B3 "too free" gap, opposite direction). (2) Ablations: 16≈8≈2 cores (not
 contention); VLSU lanes 4→1 +1% (not the vector path); coalescer on/off identical. (3) libdw-symbolized
 instruction trace: cores execute ZERO instructions for the first ~2.1M cycles; the whole kernel runs in
@@ -98,7 +98,7 @@ the last ~35k. (4) Kernel's own prints: work phase = 24,132 cycles (2-core); `.p
 cycles → the entire anomaly was a load-time accounting difference. (5) RTL log cross-check: RTL work
 phase ≈ 70,480 (16-core).
 
-**Fix (pulp `f4df56c`):** loader → wide_axi (bw=64) + catch-all map for the entry write. Load 8× faster
+**Fix (pulp `5350ae2`):** loader → wide_axi (bw=64) + catch-all map for the entry write. Load 8× faster
 (16.8 MB: 2.1M → 262k). 9/9 re-verified data-correct.
 
 **The transformed RTL diff (v2, wide loader):** **load-store 106,129 = +4.9% vs RTL (IN TARGET)**;
@@ -124,7 +124,7 @@ the definitive reference. Next ladder: R1 linked-list → R2 E3 → R3 B3 → R4
 ---
 
 **STATUS 2026-07-27 (E4/P2.13 DONE — the pivotal one):** the full DRAM PMA now goes through the cache
-(pulp `594c27a`) — the 0xA0000000 bypass (an M32768-bug workaround) is RETIRED. **The M32768 eviction
+(pulp `661e345`) — the 0xA0000000 bypass (an M32768-bug workaround) is RETIRED. **The M32768 eviction
 bug does NOT reproduce** against the P1 cache (A1's delayed commit + D1's PEND semantics removed the
 two plausible root causes). All 9 binaries data-correct at 16-core; streaming kernels **45–60% faster**
 (fdotp M8192 26,963 / M32768 58,515 / gemv 62,427 / fft 53,514) — the cache now captures cross-iteration
@@ -159,8 +159,8 @@ partitioning; load-store actually calls it) and F1 (flush FSM) as the top remain
 
 ---
 
-**STATUS 2026-07-27 (P1 COMPLETE):** B1 per-cell serialization + C1 coalescer merge DONE (core `ce5e0455`,
-pulp `bfa076a`) — the shared-L1 contention pair landed together per the sequencing invariant. coal_merge
+**STATUS 2026-07-27 (P1 COMPLETE):** B1 per-cell serialization + C1 coalescer merge DONE (core `b5832082`,
+pulp `5f9c956`) — the shared-L1 contention pair landed together per the sequencing invariant. coal_merge
 gate: cold same-part **67,67,67,67** (one refill; B1-only: 67,77,77,77), warm **10,10,10,10** (B1-only:
 10,11,12,13), full-part writes **8,8,8,8** w/ correct read-back; isolated gates exact through the coalescer
 (67/10, cold_stream 0.0143). 16-core sweep 9/9 data-correct; spin-lock +10.6% (first kernel-visible
@@ -207,7 +207,7 @@ kernel-visible.
 ---
 
 **STATUS 2026-07-26 (P1.4+P1.5):** D1 PEND-line ready-cycle clamp + D2 write-miss early ack DONE (core
-`16373523`, pulp `b243c37`) — followers no longer hit early through a refill (73 vs ~10 on the gate), store
+`f5f7fb3c`, pulp `2a0e34c`) — followers no longer hit early through a refill (73 vs ~10 on the gate), store
 misses ack at the RTL winfo latency (8 vs ~67). Calib exact (67/10, cold_stream 0.0143, flat path
 byte-identical); 16-core sweep 9/9 data-correct (cycles ~flat — the streams bypass the L1; cache-internal
 fixes gate on the calib TB until P2.13). Doc: `prompt/cachepool_p1_4_5_pend_clamp_write_ack_2026-07-26.md`.
@@ -234,7 +234,7 @@ follower **73** (was ~10), write miss **8** (was ~67), read-after-write 73 w/ co
 16-core sweep 9/9 data-correct; cycles ~flat (+0.0-0.3%) — **third P1 item with ~0 kernel movement**: the
 CI streams bypass the L1 (0xA0000000 `.pdcp_src`; `.dram` empty), so cache-internal fixes gate on the
 calib TB; they become kernel-visible with P2.13 (0xA0000000 through the cache) — which is now clearly the
-pivotal item for kernel-level calibration. Commits: core `16373523`, pulp `b243c37`. Doc:
+pivotal item for kernel-level calibration. Commits: core `f5f7fb3c`, pulp `2a0e34c`. Doc:
 `prompt/cachepool_p1_4_5_pend_clamp_write_ack_2026-07-26.md`.
 
 **Next:** P1.3+P2.1 (per-cell serialization + coalescer merge — the shared-L1 contention pair, biggest
@@ -242,7 +242,7 @@ remaining P1 item).
 
 ---
 
-**STATUS 2026-07-26 (P1.2):** E1 MSB address rotation DONE (core `3c9b95ab`, pulp `72af12a`) — the 2^N
+**STATUS 2026-07-26 (P1.2):** E1 MSB address rotation DONE (core `6bf12514`, pulp `15739d4`) — the 2^N
 per-bank capacity collapse is fixed and proven (capacity A/B on the 4-bank structural tile: sweep-2 hits
 0/2048 → 2048/2048, data_err=0; BANKS=1 calib 67/10 exact; 16-core sweep 9/9 data-correct). Kernel cycles
 ~unchanged — the CI streams live in the uncached `.pdcp_src` @0xA0000000 (bypasses the L1), so E1 becomes
@@ -270,17 +270,17 @@ retval=0 (N=2 all-private branch). 16-core sweep 9/9 data-correct, cycles byte-i
 gvsoc_config.json). **Why ~0 kernel impact:** readelf shows `.pdcp_src` (256 KiB streams) at 0xA0000000
 uncached (bypasses the L1), `.dram` EMPTY — nothing cacheable can thrash. E1 pays off at P2.13 (0xA0000000
 through the cache); landing it first keeps that A/B clean. Doc:
-`prompt/cachepool_p1_2_msb_rotation_2026-07-26.md`. Commits: core `3c9b95ab`, pulp `72af12a`.
+`prompt/cachepool_p1_2_msb_rotation_2026-07-26.md`. Commits: core `6bf12514`, pulp `15739d4`.
 
 **Next:** P1.4+P1.5 (PEND-line ready-cycle clamp + write-miss early ack).
 
 ---
 
-**STATUS 2026-07-26 (P1.1):** A1 VLSU delayed-commit DONE (core `e49c12b9`) + the SoC-DRAM bandwidth
-divergence it exposed FIXED (pulp `cdc4aa8`, width_log2 2→6). All 9 kernel binaries PASS data-correct at
+**STATUS 2026-07-26 (P1.1):** A1 VLSU delayed-commit DONE (core `bab9e078`) + the SoC-DRAM bandwidth
+divergence it exposed FIXED (pulp `6b7cf09`, width_log2 2→6). All 9 kernel binaries PASS data-correct at
 16-core cache-ON with vector traffic now paying the calibrated cache latency; calib TB exact (async 67/10,
 structural 67/10 @xbar=0; 68/11 @xbar=1 = the intended step-4 interco hop — new `INSITU_CALIB_XBAR_LAT`
-boundary knob, pulp `a0dfa38`). Doc: `prompt/cachepool_p1_1_vlsu_delayed_commit_2026-07-26.md`.
+boundary knob, pulp `44ad448`). Doc: `prompt/cachepool_p1_1_vlsu_delayed_commit_2026-07-26.md`.
 
 ---
 
@@ -293,7 +293,7 @@ First item of the gap-review roadmap (`prompt/cachepool_architecture_gap_review_
 return), all vector loads/stores were ~0-cycle: the calibrated cache latency never reached the scoreboard,
 and chained consumers could logically read unwritten elements.
 
-**Fix (core `e49c12b9`).** Ported the Ara variant's delayed-burst pattern to the Spatz `AraVlsu`
+**Fix (core `bab9e078`).** Ported the Ara variant's delayed-burst pattern to the Spatz `AraVlsu`
 (`CONFIG_GVSOC_ISS_USE_SPATZ` branch — NOT the `#else` branch, which already had it; first attempt edited
 the wrong class, build error caught it): OK bursts with full_latency>0 are held in `delayed_bursts` with
 timestamp=now+latency, args left on the req; `fsm_handler` drains ALL eligible per firing (VLSU issues
@@ -305,13 +305,13 @@ Latency-0 OK keeps the issue-time commit.
 `cachepool.py` had BOTH SoC memories at `width_log2=2` (4 B/cyc) — an 8× under-provision vs the ~32 B/cyc
 aggregate VLSU stream, so memory.cpp's `next_packet_start` busy-stamp diverged and `get_full_latency()`
 grew without bound. Pre-A1 nobody consumed that latency on the commit path (it only inflated cache-miss
-refills), so it went unnoticed. Fix (pulp `cdc4aa8`): `width_log2` 2→6 on `mem` AND `uncached` → latencies
+refills), so it went unnoticed. Fix (pulp `6b7cf09`): `width_log2` 2→6 on `mem` AND `uncached` → latencies
 bounded (max ~13).
 
 **Verified.** (a) Calib TB exact: async controller 67/10 (warm/cold @ML50, RTL refs 10/67); structural
 67/10 @xbar=0 — A1 is ISS-only, provably can't touch the trace-replay TB, confirmed empirically. The
 structural 68/11 @xbar=1 is step-4's intended interco hop (RTL standalone TB has no interco); added
-`INSITU_CALIB_XBAR_LAT` (pulp `a0dfa38`) to select the diff boundary. (b) Full 16-core (4×4) cache-ON
+`INSITU_CALIB_XBAR_LAT` (pulp `44ad448`) to select the diff boundary. (b) Full 16-core (4×4) cache-ON
 sweep, ALL 9 binaries retval=0 + zero FAIL lines (+ spin-lock result 120=gold, byte-enable PASSED):
 fdotp_M32768 147,383 (pre-A1 87,346, +69% = the delayed-commit effect), gemv 154,115 (+72%), fft 109,226
 (+89%), fdotp_M8192 48,877 — vs load-store 567,257 (−49%), linked-list 2,215,363 (−49%), fmatmul 37,858

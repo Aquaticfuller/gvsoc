@@ -33,7 +33,7 @@ storm + loader; not memory).
 The RTL tb itself backs the L2 with **DRAMSys (4× DDR4, `ddr4-example.json`, 1 KiB interleave)** —
 the [EOC] references already contain real DRAM timing. `CACHEPOOL_DRAMSYS=1` now routes the whole
 DRAM range through N DRAMSys channels behind an `Interleaver` (1 KiB stripes), with the loader and
-interleaver made DENIED-resilient (core `e6486d52`) and the mux clock bound. Wall-clock is
+interleaver made DENIED-resilient (core `bb5ab74b`) and the mux clock bound. Wall-clock is
 10–100× slower — use it to refine `CACHEPOOL_MEM_LATENCY` per access regime rather than for sweeps.
 
 ## 3. History

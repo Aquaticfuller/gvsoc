@@ -1,7 +1,7 @@
 # E4 / P2.13 — 0xA0000000 through the cache: the bypass is retired (and the M32768 bug does not reproduce)
 
 **Date:** 2026-07-27 · **Status:** DONE, verified, committed
-**Commits:** pulp `594c27a` (+ parent pointer bump)
+**Commits:** pulp `661e345` (+ parent pointer bump)
 **Roadmap:** item P2.13 (gap E4) of `prompt/cachepool_architecture_gap_review_2026-07-26.md` —
 the pivotal item that makes the whole calibrated cache stack kernel-visible.
 
