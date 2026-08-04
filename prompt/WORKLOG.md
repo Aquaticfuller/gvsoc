@@ -6,6 +6,30 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-08-05 (J1 scalar-LSU depth + a real ISS AMO bug it exposed):** brought the scalar
+LSU outstanding depth to the RTL value — `snitch_max_trans=16` (`cachepool_fpu_512.mk:87`) vs the
+ISS default 1. Scoping: the plumbing already existed (scoreboard always on; the
+`NB_OUTSTANDING` machinery is production code used elsewhere at depth 8), so the intended change
+was one line (`snitch_cluster.py`: `nb_outstanding=16` for cachepool targets only — gated on
+`arch.cachepool_num_tiles`; env `CACHEPOOL_LSU_OUTSTANDING`, build-time like the other knobs).
+**The 16-core sweep then exposed a real ISS bug:** spin-lock blew up 76.8k → 1.62M (data still
+correct) with the AMO shims processing 43,170 RMWs (norm ~3.3k) — the sync-OK branch of
+`Lsu::atomic()` under `NB_OUTSTANDING` freed the slot after the AMO latency but never marked the
+destination register pending, so a result-consuming spin loop (`amoswap/bnez`) free-ran at
+16-deep poll rate and flooded the lock bank (the RTL Snitch blocks on the AMO response). Fix:
+`scoreboard_reg_set_timestamp(reg_out, latency+1)` in that branch (composes with the slot-busy
+window; relative + max-combining). Post-fix spin-lock 76,628 (+12.1% ≈ pre-J1), RMWs 3,267.
+**Sweep (all 9 data-correct):** fmatmul −18.9%→**−10.0%**, fdotp_M8192 −16.2%→**−13.0%**,
+linked-list −27.4% (937k→680k; still 3.7× — loader+drain), fdotp_M32768 +17.1→+16.2%, gemv
++8.8→+9.8%, byte-enable unchanged, spin-lock ≈unchanged; **fft + load-store flat → the J1
+hypothesis is REFUTED for them** (fft's scalar-phase residual is instruction-issue-side, not
+memory-depth; load-store stays with flush-gating/hash-way/scalar-check terms per the E3.6
+decomposition). The AMO stall-on-use gap is upstreamable (any nb>1 core + AMO spin loops hits
+it). Report: `prompt/cachepool_j1_lsu_outstanding_2026-08-05.md`. Commits: core (lsu.cpp) + pulp
+(snitch_cluster.py) + parent docs below.
+
+---
+
 **STATUS 2026-08-04 (E3.6 — partition-aware load-store kernel validated against RTL):** the one CI
 kernel that actually drives runtime partitioning (`load-store_M16`, Diyou Shen 2026, Parts 1–3)
 now has a complete E3 sign-off. Bring-up finding: the prebuilt binary (May-18, rebase_ori) already
