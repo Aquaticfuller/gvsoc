@@ -6,6 +6,38 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-08-04 (E3.5 calib partition gate — caught a real int32-truncation bug):** added the
+mixed-partition calib gate (the cachepool CI kernels only ever run all-shared, so the mixed route
+was never exercised). Elaboration-frozen partition knobs `INSITU_CALIB_NUM_TILES`/`_NUM_PRIVATE`/
+`_PRIVATE_START` (the TB has no peripheral; RTL short-circuits partitioning at NumTiles==1 so
+NUM_TILES=4 is required) + two 2-sweep private-range traces (2048/4096 lines). **First sweep found
+a real bug:** `private_start_addr` (0x80000000/0xA0000000) was read via
+`js::ConfigObject::get_child_int()` — returns **`int`** (json.cpp:319) — wrapping negative and
+sign-extending to `0xFFFFFFFF80000000`, so `is_private` was false for every address and the whole
+private range routed to the shared banks (ctrl_0/1 idle; ctrl_2/3 took 512/3584 — the exact
+mixed-mode-shared-branch distribution). Invisible in every deployed config (all-private/all-shared
+branches never read `private_start`). Fixed with the 64-bit `cfg->get(...)->get_int()` path
+(core, see today's commit); scanned the other insitu models — only such address-typed read.
+**After the fix, every gate value is mechanism-explained** (m=1..4 × 2 traces): 2048-line
+0/0/1024/2048, 4096-line 0/0/2048/4096 — the fold (`addr_bank % num_private`, non-pow2 m=3 puts
+half the footprint on bank 0: confirmed via per-bank counters 2048/1024/1024) × the RTL's
+**hash-way-only** lookup/allocate (multi-residue banks collapse to ≤2 effective ways/set on
+sequential streams — the model now reproduces this RTL quirk instead of reporting naive 4-way
+capacity). data_err=0 everywhere (mixed-mode rotation N round-trip data-exact). Regression:
+capacity gate 2048/2048; full battery byte-exact (67/10, 67, 0.0143, 67,73,9,73,10,
+67×4/10×4/8×4); 16-core fdotp_M32768 smoke 56,484 = E3.3 value (tile.py's explicit
+`num_private_cache` pass = the xbar's own default for all existing targets; the fix is inert in
+all-shared). **Methodology note:** the structural battery gates run with
+`INSITU_CALIB_INLINE_SYNC=1` (calibrated sync-slave); the default async open-loop FSM reports
+emergent timing (miss 55, hit 2-3) — fine for hit counting, wrong for absolute-latency gates.
+Docs: `prompt/cachepool_e3_5_partition_gate_2026-08-04.md` + new structure map
+`prompt/insitu_cache_structure_map_2026-08-04.md`. Files: core
+`insitu_cache_xbar.cpp` (fix) + `insitu_cache_tile.py` (partition overrides, explicit
+num_private_cache pass); pulp `insitu_cache_calib/__init__.py` (3 env knobs) + `gen_traces.py` +
+2 traces. Next: E3.6 (new load-store kernel bring-up with real l1d_part calls + RTL reference).
+
+---
+
 **STATUS 2026-08-04 (E3 runtime partitioning E3.0–E3.3):** the runtime L1 partition config is now LIVE
 in the structural path (E3.0 overflow fix pulp `2f36120` · E3.1 setters + class-selective flush core
 `f6cbfade` + insn-routing fix pulp `3bf960f` · E3.2 config broadcast core `3ec397bb` · E3.3 commit
