@@ -6,6 +6,31 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-08-04 (E3.6 — partition-aware load-store kernel validated against RTL):** the one CI
+kernel that actually drives runtime partitioning (`load-store_M16`, Diyou Shen 2026, Parts 1–3)
+now has a complete E3 sign-off. Bring-up finding: the prebuilt binary (May-18, rebase_ori) already
+contains Parts 1–3 (it's what the sweeps always ran) — nothing to port. **Functional: all 7
+sub-tests PASS** (5 partition modes + private-flush isolation + shared-flush isolation), exactly
+matching the RTL's verdicts in the May-29 sweep log (`sweep_2026-05-29_05-54/cachepool_4t_fpu_512/
+logs/load-store_M16.log`, `[EOC] 101208000` ps = **101,208** cyc, retval=0). **Counter-level
+isolation proof (exact, zero free parameters):** the kernel's flush stream predicts 39 all-class
+walks/bank + 4 private-only + 2 shared-only → private banks (ctrl_0/1) flush=**43**, shared
+(ctrl_2/3) flush=**41** — measured exactly that; class-selective flush (E3.1) banks outside the
+target class skip the walk entirely. The accounting only closes against the **older** runtime: the
+rebase tree's Jul-28 rebuild adds one `l1d_flush()` inside `l1d_xbar_config` (7 call sites → +7
+walks ≈ +2–3k cycles) — documented in the report for anyone rebuilding fresh. **Cycle diff:
+183,757 vs RTL 101,208 = +81.6%** (trajectory: +459.8% v1 loader artifact → +4.9% v2 → +53.1% v3
+→ +81.6% post-E3 — the partition now engages, costing flushes + hash-way-collapsed associativity
+that v3 measured as no-ops). Decomposition: flush gating ~11–15k (39 walks/bank), miss path
+(rd_miss=2,902, 87% hits) through the serialized refill fabric + the RTL-faithful hash-way
+collapse (RTL's unmodeled forwarding buffer absorbs part), and the J1 scalar-check serialization
+(core-0 `check_const` while 15 cores barrier-wait). No single dominant term; named follow-ups (J1,
+forwarding buffer) tracked in the structure map. Report:
+`prompt/cachepool_e3_6_loadstore_kernel_2026-08-04.md`. E3 ladder complete: E3.0–E3.6 done;
+remaining partition work = RTL re-verification on `05e4671a` + the staged E2 newer-layout block.
+
+---
+
 **STATUS 2026-08-04 (E3.5 calib partition gate — caught a real int32-truncation bug):** added the
 mixed-partition calib gate (the cachepool CI kernels only ever run all-shared, so the mixed route
 was never exercised). Elaboration-frozen partition knobs `INSITU_CALIB_NUM_TILES`/`_NUM_PRIVATE`/
