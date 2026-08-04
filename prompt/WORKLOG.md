@@ -6,6 +6,23 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-08-04 (E3 runtime partitioning E3.0–E3.3):** the runtime L1 partition config is now LIVE
+in the structural path (E3.0 overflow fix pulp `2f36120` · E3.1 setters + class-selective flush core
+`f6cbfade` + insn-routing fix pulp `3bf960f` · E3.2 config broadcast core `3ec397bb` · E3.3 commit
+semantics pulp `f7d0651` · parent `ecc40cd`). The kernels' `l1d_xbar_config` / `l1d_part` / private
+flush now take effect (were no-ops). Key discoveries along the way: (a) `cp_l1d[16]` overrun (a REAL
+live bug, every newer-block access ≥0x70 corrupting the F1 machinery); (b) `CFG_L1D_INSN @0x2c` was
+swallowed by the perf-scratch range (flush insn never reached the cache — masked until the flush became
+class-selective); (c) **group components are dropped from the build graph unless the build env carries
+the group topology** (`CACHEPOOL_NB_TILE>1`) — config-scan defaults to 1 tile → stale remote-xbar lib →
+bind failure on the new config port. Verified: calib battery + capacity gate byte-exact; fdotp 55,440
+(correct flush charging restored); linked-list 937,001 (default unchanged). Effect of the feature:
+fdotp offset=12 +1.9%, gemv offset=7 +8.8% (was accidentally-optimal at offset-6 no-op), load-store
+partition +18.6% (partition + private flush now engage) — all data-correct. The contention calibration
+under the new routing + RTL-reference re-verification are follow-ups.
+
+---
+
 **STATUS 2026-07-27 (multi-user linked-list sweep + a real bug found):** ran the user's updated
 multi-user kernel (M48_N800_K300: 48 UEs, 810 B PDUs, 300 pkgs) across 8 configs — **all pass**
 (retval=0, zero ERROR lines). Scaling: producers bottleneck first (2→4 producers: 1.53× at 2×4),
