@@ -176,22 +176,24 @@ Expected results (current model, 48 UEs / 810 B PDUs / 300 packets, pacing off):
 
 | Variant | Active cores | EOC cycles | Work phase | vs 2P/2C |
 |---|---|---|---|---|
-| default `2P/2C` | 4 (+12 idle) | 937,001 | 538,635 | 1.00x |
-| `_P2_C8` | 10 (+6 idle) | 904,001 | 505,146 | 1.07x |
-| `_P4_C4` | 8 (+8 idle) | 700,001 | 301,139 | 1.79x |
-| `_P4_C8` | 12 (+4 idle) | 648,001 | 250,210 | **2.15x** |
+| default `2P/2C` | 4 (+12 idle) | 954,001 | 550,721 | 1.00x |
+| `_P2_C8` | 10 (+6 idle) | 919,001 | 514,686 | 1.07x |
+| `_P4_C4` | 8 (+8 idle) | 710,001 | 306,523 | 1.80x |
+| `_P4_C8` | 12 (+4 idle) | 659,001 | 255,565 | **2.16x** |
 
 All four must report `retval=0` with **zero** `ERROR` / `Check Failed` lines. Reading the
-scaling: producers saturate first (2->4 producers is worth ~1.7x; adding consumers on top of
+scaling: producers saturate first (2->4 producers is worth ~1.8x; adding consumers on top of
 2 producers only ~1.07x), and consumers pay off once producers keep up (4->8 consumers at 4
-producers: +20%). More tiles help too, via more cache banks — the same `_P4_C4` binary runs
-340,633 at 2x4 vs 301,139 at 4x4. Full sweep incl. 1x4/2x4 topologies:
-`prompt/multiuser_llist_sweep_2026-07-27.md`.
+producers: +20%). More tiles help too, via more cache banks. Full sweep incl. 1x4/2x4
+topologies and the 64/256-core large-config runs with throughput/TTI analysis:
+`prompt/multiuser_llist_sweep_2026-08-05.md` (16-core table of
+`prompt/multiuser_llist_sweep_2026-07-27.md` for the pre-J1 model state).
 
-> The work-phase figure above is the **first** core's `total cycles` line (what the one-liner
-> greps). Cores finish within ~0.1% of each other; if you need the exact parallel-region span
-> use `max(end cycle) - min(start cycle)` across all cores instead — e.g. `_P4_C8` gives
-> 250,426 rather than 250,210.
+> The work-phase figures above are the full parallel-region span — `max(end cycle) -
+> min(start cycle)` across all cores' prints. The one-liner greps the **first** core's
+> `total cycles` line instead, which reads ~0.1% lower (e.g. `_P4_C8`: 255,340 vs 255,565) —
+> either is fine for a pass/fail eyeball. Numbers are the post-J1 model state (scalar LSU
+> nb_outstanding=16); the 07-27 report's table is ~2% lower.
 
 ### 6. Cross-check against the RTL reference numbers
 

@@ -6,6 +6,28 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-08-05 (RLC large-config sweep — interim: 16/32-core + throughput/TTI framework):**
+the user-requested larger-config RLC sweep is underway. **New SW configs** (RTL repo
+`ManyRVData_rebase`, uncommitted working-tree edits — documented in the sweep report):
+`tests/CMakeLists.txt` gains 3 `add_spatz_test_rlc` variants — P16/C48 (all-64-work),
+P48/C48 (M48 ceiling, 96 active), M256 P128/C128 (all-256-work) — plus
+`script/pdcp_pkg_256_800_300.json` + generated `data/data_256_800_300.h` (same 300 pkgs /
+243 kB wire bytes as TC2). **16-core reference table re-run at the post-J1 model state** (all
+rc=0, 0 fails): P2/C2 954,001 (work 550,721), P2/C8 919,001 (514,686), P4/C4 710,001 (306,523),
+P4/C8 659,001 (255,565) — ≲2% above the 07-27 numbers (J1 backpressure). **32-core (8×4) P4/C8:
+690,001, work 239,737 (−6% vs 16c — more banks spread the list contention).** 64-core (16×4)
+P4/C8 + P16/C48 and 256-core (64×4) P48/C48 + P128/C128 are running in background (healthy,
+ISS-confirmed advancing; wall-clock scales steeply — the 32-core took ~8 min, the 64-core runs
+are >2 h: per-cycle component ticks ×16 tiles + idle-core barrier-spin instruction stream; a
+monitor fills the table on completion). **Throughput/TTI framework** (the user's actual ask):
+payload = 300 pkgs × 810 B = 243,000 B; requirement = 7 MB/s aggregate at 1 GHz + 1 ms TTI (job
+= 34.7 TTIs at the required rate). Every completed config lands **60–145× above the required
+throughput** and finishes in ≪1 TTI — the HW is not the binding constraint (the SW pacing loop
+is, and it's off by default). README §5 reference table refreshed to the post-J1 numbers.
+Report: `prompt/multiuser_llist_sweep_2026-08-05.md` (supersedes the 07-27 table).
+
+---
+
 **STATUS 2026-08-05 (J1 scalar-LSU depth + a real ISS AMO bug it exposed):** brought the scalar
 LSU outstanding depth to the RTL value — `snitch_max_trans=16` (`cachepool_fpu_512.mk:87`) vs the
 ISS default 1. Scoping: the plumbing already existed (scoreboard always on; the
