@@ -6,6 +6,48 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-08-06 (RLC large-config sweep COMPLETE + the all-active retry storm found):** the
+64/256-core sweep is done and the report is final. Final table: **P4/C8 topology scaling
+255,565 (16c) → 239,737 (32c) → 236,394 (64c) → 2,201,761 (256c)** — extra banks help up to 16
+tiles, then the single-group remote fabric inverts hard (+832%; the RTL's 256-core is 16 groups
+of 4 tiles, so ours is the pessimistic bound). **The all-active configs (P16/C48 at 64,
+P48/C48 at 256) livelock on the kernel's retry storm** — killed after ~27 h each: SIGINT dumps
+show 22.9 G / 34.2 G read hits on one flag line with producers starved (the consumer failed-pop
+retry × 48+ consumers × J1's 16-deep polls × per-cell serialization = a three-way amplifier;
+the RTL should storm the same way — no all-64-work RTL reference exists yet). Verdict: the
+multi-user kernel's scaling ceiling is ~12–16 active cores; all-work ≥64 FAILS any TTI budget
+(job can't drain). Kernel-side recommendations recorded (gate failed-pop retry on a nonempty
+hint / stripe the descriptor stream). M256 P128/C128 not attempted (same storm; binary built +
+registered for anyone who wants it). Report: `prompt/multiuser_llist_sweep_2026-08-05.md` (§6
+barrier deadlock + §7 retry storm sidebars). Commits: pulp `b0ef656` + `92f699f` (barrier) +
+parent docs. Also: 256-core platform boots + completes correctly end-to-end (256/256 core
+prints, zero fails) — the counting barrier holds at 256.
+
+---
+
+**STATUS 2026-08-05 (the >32-core barrier hang — found + fixed):** the 64/256-core RLC runs (and a
+64-core fdotp probe) sat at 100% CPU for 6+ hours with **zero output of any kind** — not slow,
+*deadlocked*. Diagnosis chain: (a) SIGINT dump → every cache bank shows ~zero data traffic
+(wr_miss≈1/bank = the cores' boot stack writes, then nothing) → the program never reached its
+first data phase; (b) one bank (`tile_7/ctrl_0`) shows **rd_hit=19.5 billion** — 256 cores
+spinning a single cached line = the bootrom park flag, never released; (c) the culprit is the
+peripheral counting barrier (`cluster_registers.cpp`): `vp::reg_32 barrier_status` (32-bit!),
+`1 << core_access` (UB at ≥32), and the completion mask `(1ULL << nb_cores) - 1` — **`1ULL << 64`
+is UB (=1 on x86) → mask 0 → the barrier never completes at NB_CORE=64/256**; every core parks
+IO_REQ_PENDING forever. Explains the exact boundary: 8×4=32 cores works (`1ULL<<32` fine), 16×4=64
+hangs. **Fix round 1** (pulp `b0ef656`): widened the barrier state to 64-bit + `core_mask()` —
+64-core fdotp went from 6+ h stuck to **3.2 s**; 16-core P2/C2 byte-identical (954,001). **But
+256 cores then SIGSEGV'd** in `hw_barrier_req`: 64-bit state still overflows at NB_CORE=256 —
+`1ULL << id` aliases at ≥64 → the mask completed early AND parked cores were lost → NULL
+`waiting_reqs` deref. **Fix round 2 (final): the RTL-faithful COUNTING barrier** — arrival count
+in the debug reg, completion = count == nb_cores, respond to all parked (non-null) reqs; no
+bitmask anywhere in the logic (clint IPI registers stay 32-bit — >32-hart clint noted as a
+limitation, unused by the suite). Also notable: the wall-clock "cliff" was never a scaling
+problem — the engine was spinning stalled cores; post-fix the 64-core run is minutes, not hours.
+The 64/256-core RLC sweep re-launched; results land in `prompt/multiuser_llist_sweep_2026-08-05.md`.
+
+---
+
 **STATUS 2026-08-05 (RLC large-config sweep — interim: 16/32-core + throughput/TTI framework):**
 the user-requested larger-config RLC sweep is underway. **New SW configs** (RTL repo
 `ManyRVData_rebase`, uncommitted working-tree edits — documented in the sweep report):
