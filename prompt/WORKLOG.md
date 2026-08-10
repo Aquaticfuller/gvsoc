@@ -6,6 +6,34 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-08-10 (v3-P1 — L1 mesh wired, cross-group routing PROVEN, R3 not yet passing):**
+core `95aa0290` + pulp `5f53399`. The remote crossbar became group-aware (`num_groups` /
+`tiles_per_group` / `group_id`): the address TileID field is now CLUSTER-GLOBAL, its top bits being
+the group, so a "remote" target is either a tile in this group (local slot, as before) or another
+group (new `noc_out_{r}` egress). Off-group arrivals enter on `noc_in_{r}` and are routed on to the
+owning local tile. `num_groups==1` is byte-identical to before and creates no NoC ports.
+Cluster: one `FlooNoc2dMeshNarrowWide` per TCDM port class. **No address converter needed, unlike
+v2** — our native layout puts the routing fields in ascending contiguous bits, so each group owns one
+window repeating every `period`, which is exactly what FlooNoc's `period` mapping expresses. Both
+DRAM windows mapped (an unmatched window drops the burst and wedges the NI — v2's lesson).
+**Two bring-up bugs fixed:** (a) the tile created remote ports only when `nb_tiles_per_group>1`, but
+a 1-tile-per-group multi-group build needs them for other groups → "an unbound interface was called";
+(b) each tile's cache `tile_id` must be the CLUSTER-GLOBAL id — with a local index a tile in group>0
+never recognises its own lines, re-emits them as remote, its group's crossbar sees the target group as
+its own and sends them back: an **infinite request loop** (engine spinning in
+`NetworkInterface::handle_request` → `InsituCacheXbar::req_handler`).
+**Verified by instrumentation:** a request leaves group 0 (`at=2, local=0, out=remote`), crosses the
+mesh, and is served by the owning bank in group 2 (`local=1, status=OK`) — cross-group routing is
+correct end to end.
+**R3 still fails:** the burst does not complete back through the NI (first cross-group attempt
+DENIED, then PENDING, response never returns) → the run hangs with no output. Next step is the
+NI/burst-completion contract: FlooNoc accounts a burst by `REQ_REM_SIZE` and owns fixed arg slots, so
+the cache's request/response shape has to match what the NI expects (v2 fed it converter-built
+requests, we forward the core's own IoReq). Scope: response path only — the routing and mapping are
+done.
+
+---
+
 **STATUS 2026-08-10 (cell coalescer: two real bugs fixed, then enabled at 16 cores — big calibration
 shift):** the C1 par_coalescer (RTL `i_par_coalescer_for_spatz`, `cachepool_cache_ctrl.sv:354`) was
 only ever enabled on v1's SINGLE-TILE path; the multi-tile group path never set it, so **every
