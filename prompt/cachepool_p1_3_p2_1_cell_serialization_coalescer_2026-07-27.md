@@ -85,7 +85,17 @@ write-miss 9 vs direct 8 — +1 winfo/batch accounting, within tolerance; the me
 exact 8,8,8,8). coal=0 (B1 alone) isolated gates all byte-identical to pre-B1 (the token never
 bites single-port traffic).
 
-### Kernel sweep (16-core 4×4, cache ON, full stack A1+E1+D1+D2+B1+C1)
+### Kernel sweep (16-core 4×4, cache ON — A1+E1+D1+D2+B1; **C1 NOT active**, see correction)
+
+> **Correction (2026-08-10).** This sweep did **not** include C1. `cell_coalescer` defaults to
+> `False` and `snitch_cluster.py` only sets it on the SINGLE-TILE path (env
+> `CACHEPOOL_CELL_COALESCER`, default 1); the multi-tile **group** path never sets it. Verified by
+> elaboration: a 1-tile/4-core v1 config instantiates the coalescers, a 4-tile/16-core one
+> instantiates **zero**. So every 16-core number in this project — this table, the RTL-vs-model
+> kernel diff, the RLC ±4% match, the J1 sweep — was produced **without** the coalescer, even though
+> the RTL has it (`i_par_coalescer_for_spatz` in `cachepool_cache_ctrl.sv`). The C1 verification
+> below (calib TB / `coal_merge`) stands; its *deployment at 16 cores* does not. The deltas in this
+> table are the B1 effect alone, as the per-row notes in fact say.
 
 All 9 retval=0, zero FAIL lines (spin-lock `result: 120; gold: 120`, byte-enable `PASSED`):
 
