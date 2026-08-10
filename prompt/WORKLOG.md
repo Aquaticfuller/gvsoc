@@ -6,6 +6,40 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-08-10 (cachepool_v3 P0 — structural cache in a multi-group shell; R1+R2 green):**
+new target `cachepool_v3` = v1's calibrated structural InSitu cache inside a v2-style multi-group
+shell (pulp `3a57ebc` + `9fb96dd`). v2 untouched. Hierarchy: tile = cores + L1 I$ + private stacks +
+this tile's cache slice (5 per-port-class xbars, per-bank AMO, per-cycle cores); group = tiles +
+per-port-class remote xbars; cluster = X×Y groups with separate narrow/wide egress per group so the
+L1 mesh (P1) and L2 mesh (P4) attach without re-plumbing. **P2 came free**: v3 uses v1's
+`ClusterRegisters` peripheral, which already carries the L1D partition/flush block + the >32-core
+counting barrier — wired the flush fan-out (one master per bank) and the config broadcast
+(nb_config endpoints, asserted against the wiring count).
+**Four boot-contract bugs found during bring-up, all from v2 and v1 answering DIFFERENT software
+contracts:** (a) v2's peripheral map (barrier 0x00, EOC 0x14) vs the CI binaries' snRuntime map
+(barrier 0x10, BOOT_CONTROL 0x20, EOC 0x24) — running these binaries on v2's map silently makes the
+barrier a no-op (the read lands on BOOT_CONTROL) and drops the EOC write, so the sim never ends;
+(b) cores must RESET into the bootrom (`boot_addr=0x1000`, `fetch_enable=False`) — v2 pushes the
+entry over a `bootaddr` wire instead, so boot_addr defaulted to 0 and every core fetched from 0;
+(c) the wake must be MSIP not MEIP (the bootrom WFIs with `mie=0xF` = MSIE); (d) the per-core
+peripheral port needs `rm_base` (the barrier needs per-core identity via `i_CORE_INPUT`, and the
+peripheral expects offsets — absolute addresses give "Accessing invalid register 0xc0000020").
+**R1** (1 group × 1 tile × 4 cores): fdotp_M8192 retval=0, EOC 66,214, per-bank counters live.
+**R2** (1 group × 4 tiles × 4 cores = 16): fdotp_M8192 47,196 · fmatmul 94,225 · fdotp_M32768
+70,438 — all retval=0, zero fails, cross-tile shared L1 exercised.
+**Two calibration findings from the v1-vs-v3 diff:** (1) `cell_coalescer` must stay OFF to match v1
+— the factory default is False and v1's group path never sets it, so **the ±4% RLC calibration was
+achieved WITHOUT the coalescer**; enabling it also segfaults in the 4-tile context
+(`split_and_resp` → `AraVlsu::data_response`), a latent bug the single-tile calib path never
+exercises (tracked, do not enable before fixing). (2) The remaining cycle gap is the **per-tile
+icache**, not the data cache: kernel-internal cycles fdotp 1,236→1,310 (+6%), fmatmul
+1,900→2,679 (+41%); an A/B with one icache shared by all 16 cores (v1's arrangement, same total L1
+data capacity) brings fmatmul internal to **1,780** and EOC to **44,190** — below v1. So v1's single
+shared icache flatters instruction-heavy kernels; v3's per-tile L1 I$ is the RTL-faithful one.
+Plan + gates: `prompt/cachepool_v3_implementation_plan_2026-08-10.md`. Next: P1 (L1 mesh, R3).
+
+---
+
 **STATUS 2026-08-06 (RLC large-config sweep COMPLETE + the all-active retry storm found):** the
 64/256-core sweep is done and the report is final. Final table: **P4/C8 topology scaling
 255,565 (16c) → 239,737 (32c) → 236,394 (64c) → 2,201,761 (256c)** — extra banks help up to 16
