@@ -6,6 +6,77 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 01:5x +0200 — R3 characterised: the mesh is not the problem; async atomics starve
+
+**Commit:** core `ffb1368e` "insitu: hold the whole lane for an in-flight RMW, not just atomics"
+(parent pointer bumped with this worklog entry).
+
+**Goal of the round.** Split the fdotp R3 wedge into "cross-group vector traffic is broken" vs
+"something else", starting with the cheapest A/B.
+
+**Result: the L1 mesh is exonerated for vector traffic.** At 2x2 groups x 1 tile x 4 cores:
+
+| kernel | R3 (4 groups) | note |
+|---|---|---|
+| `cache-test-scalar`  | **PASS** 1,043,518 | |
+| `cache-test-vector`  | **PASS** 1,867,150 | cross-group VECTOR traffic works |
+| `cache-vector-rw`    | **PASS** 317,959   | cross-group vector read+write works |
+| `byte-enable`        | **PASS** 530,445   | |
+| `load-store_M16`     | **PASS** 164,537   | 7/7 partition+flush |
+| `fdotp_M8192`        | HANG (no progress) | |
+| `spin-lock`          | HANG (progresses to 180M+ cyc) | |
+
+So "cross-group vector traffic" as a class is fine, and the two failures are the two kernels
+that synchronise through atomics.
+
+**Then the decisive split — spin-lock does not need the mesh at all.** At ONE group
+(4 tiles x 4 cores, no mesh in the picture): sync **PASSES** at 125,833 cycles, async **HANGS**.
+So the spin-lock failure is an ASYNC-ATOMICS problem, entirely independent of multi-group, and it
+is a *different* bug from the R3 fdotp wedge. Two problems, not one.
+
+**What the async spin-lock failure actually is: starvation, not deadlock.** With per-core LSU
+tracing: pe0 and pe3 are parked on the barrier (0xc0000010) having finished, while pe1 and pe2 are
+still issuing `amoswap` (opcode 4) at cycle **179,844,920** and still *receiving responses*. The
+simulation progresses; two cores never win the lock. 180M+ cycles against 125,833 in sync mode is
+pathological, and it is consistent with the async path's documented over-prediction under
+saturation — the same retry-storm shape as the RLC all-active configs.
+
+**The RMW machinery itself is correct.** `INSITU_AMO_DEBUG=1` shows a clean cadence: issue ->
+phase 1 (AMO_READ) resp -> phase 2 (AMO_WRITE) resp -> complete, every 2 cycles, with the first
+amoswap correctly returning old=0x0 (that core acquires) and the contenders correctly seeing
+old=0x1 while it is held.
+
+**Change kept from this round.** The park gate now holds the whole lane for an in-flight RMW
+instead of only atomics — a plain store landing between an RMW's read and its write-back is lost,
+since the write-back rewrites the pre-store value. Zero window on a synchronous slave, real on the
+async path. Parked requests no longer get B3's occupancy stamp (they already waited), and
+req_handler drains the park queue when an RMW resolves synchronously. Verified free on the
+calibrated path: v1 16-core exact on all four reference kernels (49,001 / 225,001 / 154,001 /
+76,628) and the v3 async trio unchanged (44,055 / 164,129 / 496,382).
+
+**Two wrong turns worth not repeating.**
+1. `CACHEPOOL_V3_CORES_PER_TILE=2` is NOT a usable A/B knob. At 2x2 groups x 2 cores even
+   `byte-enable` hangs, though it passes at 4 cores/tile — the 8-core multi-group config is broken
+   for its own reason (CLAUDE.md already flags 2 as the marginal minimum for the icache sizing
+   math). The control failed in the same config, so that A/B was void.
+2. The gate was widened on a wrong diagnosis. I read "old=0x1 forever" as the holder's release
+   store being overwritten, but instrumenting plain writes showed **zero** writes to the lock
+   address reaching the shim, and the "forever" was an artifact of a 400-event debug budget
+   covering ~300 cycles. The widened gate is still right on atomicity grounds and costs nothing,
+   so it stays — but it fixed nothing here.
+
+Also: zsh does not word-split unquoted parameters, so `env $ENVSTRING cmd` passes the whole string
+as one assignment and the target's `int(os.environ[...])` throws. Use explicit `VAR=v` prefixes.
+
+**Where this leaves v3-P1.** Two separate open items, both now sharply scoped:
+- **fdotp at 4 groups**: genuine no-progress wedge. Not the NoC map, not a dropped request (the
+  destination bank serves it), not the response network, not sync-vs-async, and not vector traffic
+  as a class. Next: instrument the gap between the destination bank's `resp()` and
+  `NetworkInterface::handle_response`, plus the per-class pending-burst release.
+- **async atomics starvation**: reproduces at one group, so it can be debugged without the mesh.
+  Likely wants fairness/backoff in how the shim and the core's accept queue order competing
+  atomics. Belongs with the async calibration work, since it is a saturation-behaviour problem.
+
 ## 2026-08-11 00:33 +0200 — v3 async throughout: the async cache path made correct; L1 mesh runs at 4 groups
 
 **Commits:** core `aae083eb` "insitu: make the async cache path functionally correct" ·
