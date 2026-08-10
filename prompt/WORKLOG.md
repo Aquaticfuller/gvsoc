@@ -6,6 +6,39 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-08-10 (v3-P1 — found and fixed the in-place-rotation/NoC conflict; R3 still blocked):**
+core `624a7072`. Two suspects from the previous entry were settled by instrumentation (probes since
+removed; upstream `floonoc` restored untouched):
+
+- **`get_entry` NULL — ELIMINATED.** The `period` mapping resolves every cross-group burst; the
+  `entry == NULL` branch never fires. So the address→group mapping on our native layout is correct
+  and no v2-style address converter is needed.
+- **A genuine, previously-unknown bug — FIXED.** The NI was being handed requests carrying
+  **rotated** addresses: `0xa8000380`, `0x1800040c`, `0xd80003c0` … none of which are DRAM addresses.
+  Verified numerically: `rotate(0x80003a80, n=4, dyn_offset=6)` = `0x8000_0380 | 0xA000_0000` =
+  **`0xA8000380`**, exactly the observed value. Cause: E1 rotation mutates the request address **in
+  place** and never restores it. That is invisible inside a single group (nothing outside the cache
+  reads the address afterwards), but with the L1 NoC in the path the network interface still owns the
+  in-flight burst and re-derives routing from `req->get_addr()`; a rotated address matches no window,
+  so the response cannot get home and the NI's single pending-burst slot wedges — after which the NI
+  re-delivers the same (now corrupted) request, which is what the probe captured. Fix: restore the
+  caller's address once the bank has resolved the access. Correct for the synchronous-slave path (the
+  deployed one); an async cache would need to restore at response time.
+  **Regression-checked:** 16-core single-group unchanged (fdotp_M32768 49,001, byte-enable 225,001,
+  both 0 fails).
+
+**R3 still does not pass.** The corruption-on-re-delivery is fixed, but the *first* delivery's burst
+still does not complete, so the run hangs. That is now the single open question: the target returns OK
+(`status=0` at `target->req`), the response packet is generated, yet only ~2 of 12 bursts reach
+`REQ_REM_SIZE == 0` at the origin. Remaining suspect from the earlier list: the IoReq arg-slot budget
+— our path spends 4 slots on the per-lane Router before the NI pushes its own (`REQ_SRC_NI`,
+`REQ_BURST`, `REQ_WIDE`, `REQ_REM_SIZE`, `REQ_IS_ADDRESS`) against `IO_REQ_NB_ARGS = 16`, and an
+overflow would corrupt exactly this bookkeeping. Next step: count slots on the cross-group path and,
+if tight, drop the per-lane Router from the off-group route (the tile xbar can address-decode the
+lane directly) or raise the arg budget.
+
+---
+
 **STATUS 2026-08-10 (v3-P1 continued — localized the mesh blocker; one important v2 caveat found):**
 core `f678aad7`, pulp `8862425`. Instrumented the FlooNoc NI (probes since removed; upstream
 `floonoc_network_interface.cpp` restored untouched) and got the decisive numbers.
