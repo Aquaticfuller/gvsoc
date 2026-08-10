@@ -23,7 +23,7 @@ Legend: **✓** exists and is calibrated · **≈** exists, not tuned · **✗**
 | 1 AMO per bank, on that bank's scalar input | ✓ `amo_{cb}` | ✗ | — |
 | 4 InSitu banks (coalescer + core) | ✓ | ≈ flat `InsituCacheController` | — |
 | flush-class mask (private / shared / all) | ✓ | ✗ | — |
-| **L1 I$ per tile** | ✗ — one cluster-wide icache | ✓ per tile | **T1** |
+| **L1 I$ per tile** | ✗ — one cluster-wide icache | ✓ per tile | **T1 — inherited free from v2** |
 | tile barrier | ≈ flattened into cluster | ≈ | T2 (defer) |
 
 ### Group
@@ -115,8 +115,9 @@ Port the L1D register block (partition CSRs, flush insn/commit/status, config br
 - **Gate:** the partition-aware load-store kernel passes on v3 with all five modes and both flush
   isolations — the same seven verdicts it produces on v1.
 
-### P3 — refill aggregation + instruction hierarchy (T1, G2, G3, G4)
-Per-tile L1 I$; 4→1 icache mux; group L2 I$; 17→1 refill mux with a real arbiter.
+### P3 — refill aggregation + instruction hierarchy (G2, G3, G4)
+4→1 icache mux; group L2 I$; 17→1 refill mux (instruction-priority, data round-robin).
+T1 is inherited: v2's tile already carries a per-tile icache.
 - **Gates:** refill/eviction counts conserved end-to-end (sum of per-bank counters == mux output ==
   memory-side count); L2 I$ hit/miss counters plausible against instruction-fetch volume;
   **instruction-vs-data contention visible** at the 17→1 mux (a knob to disable the L2 I$ path should
@@ -152,7 +153,18 @@ So v3 is a **calibrated cache on an uncalibrated fabric**. Concretely:
 
 ---
 
-## 6. Open decisions for the user
+## 6. Decisions — settled 2026-08-10
+
+1. **17→1 arbitration:** **instruction has strict priority**; the sixteen data requesters
+   round-robin among themselves. So: if the L2 I$ port has a request, it wins; otherwise the next
+   data port in round-robin order goes.
+2. **Response routing:** the response **carries a requester id / user field**, so the demux is a
+   lookup — no transaction table in the mux.
+3. **Round scope:** **P0–P2 first**, then P3 and P4 as a second round.
+4. **v2:** kept untouched as the working reference. v3 is a separate target; where v3 shares v2 code
+   it does so behind a default-off flag, so v2's elaborated config stays byte-identical.
+
+## 6b. Remaining open items (not blocking)
 
 1. **17→1 arbitration policy.** Round-robin, instruction-priority, data-priority, or weighted? This
    is a real architectural choice: instruction misses stall a whole tile's fetch, data misses stall
