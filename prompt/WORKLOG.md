@@ -6,6 +6,121 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 00:33 +0200 — v3 async throughout: the async cache path made correct; L1 mesh runs at 4 groups
+
+**Commits:** core `aae083eb` "insitu: make the async cache path functionally correct" ·
+pulp `36b087f` "cachepool: v3 runs the cache async; enable the par-coalescer on the multi-tile path"
+
+**Motivation.** User decision: v3 should be async throughout, since a queue-based interconnect
+is the more faithful model. The structural cache core had an async path
+(`inline_sync_miss=False`) but it had never been run closed-loop — only the synchronous-slave
+path is deployed. Turning it on immediately segfaulted, and fixing that exposed two more bugs
+underneath.
+
+**Files touched.**
+- `core/models/cache/insitu/insitu_cache_core.cpp` — eviction data snapshot, in-flight
+  writeback guard + `evict_resp_handler`, removal of `save()`/`restore()` on the async
+  admission/response path, response-time address un-rotation, `INSITU_WATCH` instrumentation.
+- `core/models/cache/insitu/insitu_cache_amo_shim.cpp` — park queue so a second atomic cannot
+  overwrite an in-flight RMW's state.
+- `pulp/pulp/cachepool_v3/cachepool_v3_system.py` — async cache by default
+  (`CACHEPOOL_V3_SYNC_CACHE=1` restores the calibrated sync slave).
+- `pulp/pulp/snitch/snitch_cluster/snitch_cluster.py` — `cell_coalescer` on the multi-tile path
+  (it was only ever set on the single-tile branch).
+
+**The three async bugs, in the order they were found.**
+
+1. **Async writebacks wrote zeros over L2.** `evic_fifo_` queued only the line ADDRESS; the
+   drain then handed `evict_data_buf_` to the request — a buffer that only the sync-miss and
+   flush paths ever fill, so on this path it was still the zero-initialised vector from the
+   constructor. Every async writeback pushed 64 zero bytes to memory, and the next refill of
+   that line read them back. Symptom: fdotp printed `----- (0) sp fdotp -----` and
+   `0 OP/1000cycle`, because `dotp_l.M` (0x80003f40, `.data`) went 0x2000 -> 0 mid-run; the
+   kernel then computed `elem_per_core = 0`, did no work, and still reported `retval=0` by
+   verifying zeros against zeros. Cycle count was LOWER than sync, which is what gave it away.
+   Fix: the queue carries a snapshot of the line's bytes taken before the refill overwrites the
+   way, held alive while the request is in flight; plus the one-in-flight guard and response
+   handler an async L2 needs (`evict_itf_` had no resp method at all).
+
+2. **`req->save()` clobbered the requester's arguments.** `save()` arg_push'es 4 slots at
+   `current_arg`, which is 0 for a scalar-LSU request — but the LSU keeps its request id in
+   ABSOLUTE slot 0 (`req_id = *((int *)req->arg_get(0))`, `iss/src/lsu.cpp`), and `arg_get()`
+   applies no `current_arg` offset. So save() overwrote the id with the address, and `restore()`
+   only pops the depth back — it never repairs the slot's contents. The LSU then dispatched
+   `stall_callback[req_id]` against the wrong outstanding access. On a VLSU port the aliased
+   index segfaulted inside `AraVlsu::data_response` -> `vp::Queue::push_back`. Fix: drop the
+   save/restore pair entirely (the core never mutates addr/size/data/is_write on a parked
+   request) and un-rotate the address at response time instead — which the sync path gets from
+   the xbar, and which the L1 NoC needs since its NI re-derives routing from `req->get_addr()`.
+
+3. **The AMO shim assumed RMWs cannot overlap.** True only because a synchronous cache resolves
+   the whole read-modify-write inside `req_handler`. Async leaves `phase_` at `AMO_READ` across
+   ticks, and a second atomic overwrote `phase_`/`orig_`/`scratch_`/`amo_addr_`, so two RMWs
+   completed into each other's result buffers. Fix: atomics arriving on a busy lane are parked
+   and re-issued on completion (what `core_ready` does in the RTL). The gate is deliberately
+   limited to atomics — plain accesses never touch that state and B3's occupancy stamp already
+   models the lane being held, so parking them too would charge the same wait twice. This
+   matters on the calibrated path as well: the cell coalescer below the shim answers PENDING by
+   design even when the cache itself is a synchronous slave.
+
+**New instrumentation.** `INSITU_WATCH=0x<addr>` traces one cache line end-to-end through the
+structural core (refill / serve-rd / serve-wr, with bank path and rotation count). Zero cost
+when unset. It is what localised all three bugs, and it is what proved the destination bank
+serves cross-group reads correctly in the R3 investigation below.
+
+**Verification.**
+- Async, 1 group x 4 tiles x 4 cores: fdotp_M8192 prints `(8192)` at 96% utilisation
+  (44,055 cyc), load-store_M16 passes all 7 partition/flush cases (164,129), byte-enable clean
+  (496,382). All three were previously wrong or crashing.
+- No regression on the calibrated paths: v3 sync is bit-identical to its baseline (load-store
+  195,734 / fdotp 47,196 / byte-enable 526,512) and the deployed v1 `cachepool` 16-core target
+  reproduces its numbers exactly (fdotp_M32768 49,001 / byte-enable 225,001 /
+  load-store_M16 154,001).
+- NOTE on the v1 check: a first run showed fdotp_M32768 at 239,001, which looked like a 4.9x
+  regression. It was not — v1 defaults to a 4-core/1-tile MINIMAL config; the 16-core numbers
+  need `CACHEPOOL_NB_TILE=4 CACHEPOOL_CORES_PER_TILE=4`. Worth remembering before diagnosing a
+  v1 "regression" again.
+
+**R3 gate (multi-group L1 mesh) — mostly PASSES, one kernel short.**
+At 2x2 groups x 1 tile x 4 cores (16 cores, 4 groups, 5 FlooNoc meshes):
+- `byte-enable` **PASS** — 530,445 cyc, 0 FAIL.
+- `load-store_M16` **PASS** — 164,537 cyc, 0 FAIL, all 7 partition/flush cases (compare 164,129
+  at 1 group x 4 tiles: the mesh costs ~0.2%).
+- `fdotp_M8192` **HANGS** — deterministic wedge, no output.
+
+So the multi-group shell is functional: cross-group routing, the remote crossbars, both DRAM
+windows on the mesh, the barrier and the L1D CSR fan-out all work at 4 groups. What remains is
+specific to fdotp, i.e. to cross-group **vector (VLSU)** traffic.
+
+**What the fdotp wedge is NOT** (each ruled out with evidence, so it is not re-litigated):
+- *Not* sync-vs-async. Both modes wedge identically: 29 barrier arrivals, 27 stalls, the same
+  per-core pattern (cores 0-3 and 7 arrive once, the other twelve twice), at cycle ~4,838 (sync)
+  / ~4,880 (async). The async work above neither caused nor fixed it.
+- *Not* the NoC address map. `0x80003e0c` belongs to gid 2 by both decodes — `(0x3e0c/0x100) mod
+  4 = 2` and the xbar's TileID field bits[9:8] = 2 — and the NI delivered it to mesh node (1,0),
+  which IS gid 2: creation and mapping share `gid = gx*nb_y_groups + gy`, so `group_1_0` is gid
+  2, not gid 1.
+- *Not* a dropped request. `INSITU_WATCH=0x80003e0c` shows the destination bank
+  (`group_1_0/tile_0/l1/ctrl_0`) serving that exact address at cycle 5133. The request arrives.
+- *Not* a broken response network. The response mesh is live (1038 `rsp_router` events) and 68
+  remote bursts completed before the wedge.
+
+**Where it actually stops:** the last NoC event is `ni_1_0` "Sending request to target" for
+`0x80003e0c`, the bank serves it, and no response burst follows. Cross-group traffic works for
+thousands of NoC events and then one response stops coming — resource-exhaustion-shaped rather
+than a wiring error. Prime suspect is the FlooNoc NI's single pending read burst + single
+pending write burst per port under 4 concurrent VLSU lanes, or the remote crossbar's slot
+accounting for the vector lanes (`nrpc=2` remote ports per core per lane). Next step is to
+instrument the NI's pending-slot occupancy and the rxbar's slot allocation rather than to trace
+further — the remote xbar's per-request message is `LEVEL_TRACE`, which plain `--trace` does not
+emit (that cost a wrong "zero traffic through the rxbar" reading mid-session; a second wrong
+reading came from unflushed trace buffers when the run is killed by `timeout`, fixed by running
+the launcher under `stdbuf -oL -eL`).
+
+**Calibration status unchanged:** the async path is UNCALIBRATED and documented to over-predict
+under saturation. No sync-path number (RLC +/-4%, fdotp +1.6% vs RTL) carries over to it;
+re-calibration is a prerequisite before quoting any v3 async number.
+
 **STATUS 2026-08-10 (v3-P1 — livelock confirmed, two more suspects eliminated, mesh robustness caveat):**
 No code change beyond core `624a7072`; this entry records what the instrumentation settled.
 
