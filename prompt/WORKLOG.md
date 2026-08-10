@@ -6,6 +6,42 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-08-10 (v3-P1 continued — localized the mesh blocker; one important v2 caveat found):**
+core `f678aad7`, pulp `8862425`. Instrumented the FlooNoc NI (probes since removed; upstream
+`floonoc_network_interface.cpp` restored untouched) and got the decisive numbers.
+
+**What the data says.** At 2×2 groups × 1 tile × 4 cores, 12 cross-group bursts are injected — the
+12 cores in the three groups that do not own the contended line — and **only 2 ever complete**
+(`REQ_REM_SIZE` reaching 0). The request direction is fully correct (verified earlier: leaves group 0,
+crosses the mesh, served by the owning bank in group 2 with status OK). Grants and responses were
+confirmed to auto-route past `req_forward` — the NI issues them via `req->get_resp_port()`, so no
+relay is needed in our crossbars (my earlier hypothesis that v2 fed the NI converter-built requests
+was **wrong**: v2's converter also uses `req_forward`, it only rewrites the address).
+
+**Control experiment that separates our bug from the NoC: v2 at the same 2×2 topology.** v2 runs the
+kernel to completion there (results printed, **25** burst completions) and then hangs — but for an
+unrelated reason: **v2's peripheral answers EOC at 0x14 while the CachePool binaries write 0x24**, so
+*v2 can never reach EOC with these binaries at any topology*. Two conclusions: (a) the mesh + NI
+genuinely works for this traffic shape, so the remaining fault is in how v3 feeds it; (b) **"v2 runs
+the CI kernels at 256 cores" needs qualification** — it runs them, it does not terminate on them.
+Worth remembering before any v2 number is quoted.
+
+**Refinement made:** one NoC egress/ingress port per port class instead of two
+(`source % nrpc`). The NI is a single injection point with one pending read burst and one pending
+write burst, so two masters only doubled contention on that slot and deviated from v2's
+one-master-per-NI arrangement. Did not by itself unblock R3.
+
+**Next, precisely:** find why our bursts stop completing after the first per NI. The release path is
+`narrow_read_pending_burst` cleared in the FSM once `narrow_read_pending_burst_nb_req` hits 0, that
+counter being decremented per returning response packet through a pointer stored on the packet. So
+the question is whether our response packets return at all after the first burst — the likely
+suspects are (i) `noc->get_entry(burst_base, size)` failing for some address under the `period`
+mapping (v2's documented silent-drop-and-wedge), which a probe on the `entry == NULL` branch settles
+immediately, and (ii) the IoReq arg-slot budget: our path already spends 4 slots on the per-lane
+Router before the NI adds its own, against `IO_REQ_NB_ARGS = 16`.
+
+---
+
 **STATUS 2026-08-10 (v3-P1 — L1 mesh wired, cross-group routing PROVEN, R3 not yet passing):**
 core `95aa0290` + pulp `5f53399`. The remote crossbar became group-aware (`num_groups` /
 `tiles_per_group` / `group_id`): the address TileID field is now CLUSTER-GLOBAL, its top bits being
