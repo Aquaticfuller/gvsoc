@@ -6,6 +6,42 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-08-10 (cell coalescer: two real bugs fixed, then enabled at 16 cores — big calibration
+shift):** the C1 par_coalescer (RTL `i_par_coalescer_for_spatz`, `cachepool_cache_ctrl.sv:354`) was
+only ever enabled on v1's SINGLE-TILE path; the multi-tile group path never set it, so **every
+16-core number in this project was produced without a structure the RTL has** (see the correction
+appended to `prompt/cachepool_p1_3_p2_1_cell_serialization_coalescer_2026-07-27.md`). Enabling it
+exposed two genuine bugs (core `d8855c98`):
+
+1. **Double response → SIGSEGV.** `CoalGroup::ports` can list the same port index twice
+   (`ports.push_back(a.port)` is unconditional) because the coalescer's input index is the PORT
+   CLASS — two cores/tiles hitting the same 16 B part on the same lane in the same cycle land in ONE
+   group with a duplicated index. The member-matching loop set `p.done` only AFTER the whole loop, so
+   both iterations re-found the SAME parked request → one `IoReq*` twice in `grp.members` →
+   responded twice → `arg_pop` on empty in `AraVlsu`. Fix: claim each match immediately; plus a
+   permanent duplicate-member guard. (Same family as the July `c05b9450` fix, one level deeper.)
+2. **Sub-word write corruption.** The merge copies `word_bytes` from the request buffer to
+   `word_index*word_bytes`, honouring neither the in-word byte offset nor the request size — a
+   1/2-byte store over-read its buffer and clobbered neighbouring bytes. byte-enable produced **29
+   FAIL lines** the moment the coalescer went live. Fix: sub-word writes bypass the window (the RTL
+   coalescer merges the lanes' 32-bit word accesses).
+
+**RTL check that mattered:** `NumPorts-1` / "Only spatz vlsu goes through coalescer" — the RTL
+coalescer sits inside the per-bank ctrl downstream of the xbar, so merging across *different cores*
+is faithful, not a modelling error. Our placement is right.
+
+**16-core sweep with the coalescer active (9/9 data-correct, 0 fails):** fdotp_M32768
+56,001→**49,001** (+16.2% → **+1.6%** vs RTL) · load-store 183,001→**154,001** (+80.8% → **+52.2%**)
+· fft 62,001→51,937 · linked-list 680,001→673,001 · byte-enable 225,001 and spin-lock 76,628
+unchanged (their traffic doesn't merge). Two kernels overshoot: gemv 62,001→**49,878** (+9.8% →
+**−11.6%**) and fmatmul 51,001→**44,001** (−10.0% → **−22.4%**) — the merge is real, so what it
+reveals is that other gaps (no forwarding buffer, simplified xbar arbitration) were previously
+*offsetting* the missing merge. Net: the biggest outlier moved decisively toward RTL and the
+vector-compute pair now needs the next fidelity item rather than a missing structure.
+Enabled on both paths via `CACHEPOOL_CELL_COALESCER` (default 1) — A/B still available.
+
+---
+
 **STATUS 2026-08-10 (cachepool_v3 P0 — structural cache in a multi-group shell; R1+R2 green):**
 new target `cachepool_v3` = v1's calibrated structural InSitu cache inside a v2-style multi-group
 shell (pulp `3a57ebc` + `9fb96dd`). v2 untouched. Hierarchy: tile = cores + L1 I$ + private stacks +
