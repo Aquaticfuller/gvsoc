@@ -69,8 +69,12 @@ contenders. The binary + data header are built and registered for anyone who wan
 - **Topology scaling at fixed 12-thread P4/C8:** 255,565 (16c) → 239,737 (32c) → 236,394 (64c)
   → **2,201,761 (256c)**. Extra banks help up to 16 tiles; at 64 tiles the single-group remote
   fabric inverts hard (+832%) — cross-tile hop latency × contention on every shared-list line.
-  The RTL's 256-core is 16 GROUPS of 4 tiles (hierarchical), not one 64-tile group — our
-  single-group 256-core is the pessimistic bound.
+  **Caveat on the 256-core point:** it is a *single flat group of 64 tiles*, which is not a
+  topology the RTL implements — `cachepool_pkg.sv` declares `NumGroups` but no module uses it,
+  and `config/config.mk` errors out above `num_tiles=16` (= 64 cores). So the 256-core row has
+  no RTL counterpart and should be read as an all-to-all-fabric upper bound on contention, not
+  as a prediction for a future hierarchical 256-core CachePool (that topology exists only in
+  the `cachepool_v2` GVSoC model's FlooNoc 2D mesh — see the structure map's roadmap).
 - **Active-core scaling inverts at ~12–16:** P4/C8-class (12) completes everywhere; P16/C48
   (64) and beyond livelock on the retry storm (§7). The kernel's practical ceiling is ~16
   active cores.
