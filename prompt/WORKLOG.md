@@ -6,6 +6,39 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+**STATUS 2026-08-10 (v3-P1 — livelock confirmed, two more suspects eliminated, mesh robustness caveat):**
+No code change beyond core `624a7072`; this entry records what the instrumentation settled.
+
+**It is a livelock, not slowness.** Same binary (`fdotp-32b_M8192`, ~1,300 kernel cycles / ~47 k
+total) and the same 16 cores: v3 at 1 group × 4 tiles finishes in **seconds** (47,196 cycles); v3 at
+2×2 groups × 1 tile produces **no output in 15 minutes**. Only the topology differs, so "maybe it's
+just slow" is off the table.
+
+**Two more suspects eliminated by probing (probes removed; upstream `floonoc` restored):**
+- *Burst accounting is correct.* At the NI, `REQ_REM_SIZE` is written and read back at the **same**
+  `current_arg` (0) and the same slot address, going 4 → 0. Bursts do complete.
+- *Arg-slot overflow/clobber is not happening.* `save()` pushes 4 slots exactly where the NI keeps its
+  scratch (`arg_get_last` is relative to the top and the NI never reserves), which would be a real
+  hazard — but the deployed sync path never calls `save()`, and slot counting leaves the NI writing at
+  index 6–7 of 16.
+
+**Mesh robustness caveat worth recording.** I tried to shrink the repro to 2 groups × 1 tile × 2
+cores; v3 deadlocks there — **and so does v2**, with the same zero-output signature. So a degenerate
+2×1 (one-dimensional) mesh is broken for *both* targets and is not a valid minimal repro. v2's
+behaviour by topology: 4×4 (its validated config) works, 2×2 × 1 tile × 4 cores runs the kernel
+(25 bursts) but cannot reach EOC because of its 0x14-vs-0x24 peripheral map, 2×1 hangs outright.
+**The valid A/B is therefore 2×2 × 1 tile × 4 cores**, where v2 runs the kernel and v3 does not.
+
+**Next:** chase the two remaining differences between v2 and v3 at that config — (a) v2 rewrites the
+address into a contiguous NOC space via `L1NocAddressConverter` while v3 relies on FlooNoc's `period`
+mapping on raw addresses (the mapping resolves, but the NI may depend on contiguity elsewhere, e.g.
+when splitting a burst or computing `burst_base`); (b) v2's target behind the NI is an **async** flat
+controller whereas v3's is a **synchronous** slave returning OK in-call, which changes when
+`handle_response` runs relative to the router FSM. Test (b) first: it is a one-line A/B —
+`controller.inline_sync_miss = False` in the v3 cache config.
+
+---
+
 **STATUS 2026-08-10 (v3-P1 — found and fixed the in-place-rotation/NoC conflict; R3 still blocked):**
 core `624a7072`. Two suspects from the previous entry were settled by instrumentation (probes since
 removed; upstream `floonoc` restored untouched):
