@@ -6,6 +6,48 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 20:xx +0200 — #34 step 4: the miss side calibrated against the RTL, per class
+
+**Commits:** core `c492974c` "insitu: calibrate the miss side against the RTL, measured per class" ·
+pulp `454a474` "cachepool v3: adopt the calibrated miss-side term"
+
+**Measure per class before adding a knob.** A hit and a miss cannot share one response-latency
+constant, so the core now reports served latency separately for hits and for accesses that waited on a
+refill, with the **minimum** as well as the mean — the RTL figures are ISOLATED costs, and a mean
+overstates them once several accesses queue behind one refill. On byte-enable at 1 group x 4 tiles x 4
+cores:
+
+| class | measured (min / mean) | RTL reference | verdict |
+|---|---|---|---|
+| HIT | **10** / 10.2 | 10 isolated (7 streaming) | **already exact** |
+| MISS | **62** / 64.2 | MemLatency + 17 = **67** | 5 cycles short |
+
+The hit side needed nothing, which **independently confirms `resp_latency_cycles = 8`** — the earlier
+blended average of 10.76 could not distinguish hit from miss, so that agreement was weaker evidence
+than it looked.
+
+**Sweep of the new `miss_extra_cycles`** (via `INSITU_MISS_EXTRA`): 4 -> min miss 66, **5 -> 67**,
+6 -> 68, with min hit unchanged at 10 throughout — so the two sides are genuinely independent. Default
+5, and 0 whenever `inline_sync_miss`. Implementation: `resp_done_cyc_` now holds each entry's READY
+cycle rather than its completion cycle, so hit and miss carry different delays through one queue.
+
+**Kernel effect** (1 group x 4 tiles x 4 cores, all data-correct): fdotp_M8192 31,719 -> 32,183,
+load-store_M16 155,109 -> 157,664, byte-enable 257,586 -> 257,731, spin-lock 73,799 -> 73,824.
+v1 cachepool 16-core exact on all four reference kernels (49,001 / 154,001 / 225,001 / 76,628).
+
+**What changed about the basis of the calibration — this matters more than the numbers.** The isolated
+hit and miss costs are now anchored to **the RTL's own figures** rather than to the synchronous path.
+Against sync the deltas are now fdotp +3.4%, byte-enable +1.9%, spin-lock -3.9%, load-store -9.4%, and
+some of those moved slightly further from sync while moving ONTO the RTL reference. That is the right
+trade: the sync path is itself only partly RTL-calibrated (v1's load-store over-predicts RTL by 52%),
+so matching it was never the goal.
+
+**#34 remaining on my side:** the L1/L2 NoC hop costs, the 256 B channel granularity and the L2 I$
+geometry are still placeholders with no reference; and `xbar_latency_cycles` / `hop_latency_cycles`
+(both 1) are live on the sync path but dead on async, needing a structural equivalent rather than
+deletion. **Blocked on the user:** RTL anchors for a v3-comparable configuration — without them the
+placeholders above cannot be resolved at all.
+
 ## 2026-08-11 19:xx +0200 — calibration refresh caught a sync-path regression I had introduced in P3
 
 **Commit:** pulp `585817a` "cachepool v3: keep the synchronous path flat — the refill mux and L2 mesh
