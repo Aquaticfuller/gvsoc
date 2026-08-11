@@ -6,6 +6,58 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 16:2x +0200 — P4 WORKS: the L2 refill mesh is live; the stall was the functional write-through
+
+**Commits:** core `e9b80da7` "insitu: treat a DENIED writeback as in flight" ·
+pulp `7770039` "cachepool v3: L2 refill mesh ON by default; functional write-through OFF"
+
+**The stall was never the mesh.** `functional_write_mem` mirrors every write hit straight to L2 using
+**one shared request object**, fire-and-forget with the status **ignored**
+(`(void)evict_itf_.req(&funcwr_req_)`). That is safe only while the downstream answers OK inside the
+call. Once anything in the path can queue — the P3 refill mux, then the P4 mesh — the slave takes
+ownership of that object while the next write reuses it, so the network interface accumulates **phantom
+outstanding bursts**: 32 at one NI, where the cache can only have about **five** genuinely in flight per
+group (one refill per bank plus the L2 I$). At cycle 21,105 the count sat at the 32 cap with the slot
+pointer free, nothing left to decrement it, and the denied request never drained.
+
+Proven by a config-only A/B: mesh ON + write-through OFF completes immediately.
+
+**How the diagnosis went, including the wrong turns** — worth recording because three hypotheses failed
+before the right one:
+1. *Missing `fsm_event.enqueue()` on FlooNoc's DENIED path.* Plausible (the drain lives in
+   fsm_handler), implemented, **changed nothing** — same stall cycle. Reverted rather than left in a
+   model v2 shares.
+2. *Eviction mishandling DENIED.* Real bug, found and fixed (`e9b80da7`) — the drain marked the
+   writeback in flight only on PENDING, so a DENIED re-issued the same `evict_req_` next tick. But the
+   run was **bit-identical** with and without the fix, so eviction never actually got DENIED here. Kept
+   anyway: it is the same latent defect one line over.
+3. Only then did the counter instrumentation show the repeated same-pointer WRITE submissions, which
+   pointed at the one remaining shared write object: `funcwr_req_`.
+
+The lesson generalises: **any single shared request object submitted fire-and-forget is a time bomb
+that only goes off when something downstream starts queueing.** That is now three of them found this
+session — the flush writeback loop, the eviction queue, and this one.
+
+**Results with the new defaults** (mesh ON, write-through OFF), 2x2 groups x 1 tile x 4 cores, all
+data-correct:
+
+| kernel | mesh ON | flat per-group path | delta |
+|---|---|---|---|
+| fdotp_M8192 | **38,640** | 31,736 | **+21.8%** |
+| load-store_M16 | **163,799** (7/7 partition + flush) | 159,432 | +2.7% |
+| byte-enable | **294,633** | 257,573 | +14.4% |
+
+The +21.8% is the *point* of P4: refills now cross a shared mesh to a memory channel on the perimeter
+instead of every group having its own private full-bandwidth router straight to memory. Dropping the
+write-through costs nothing by itself (mesh off: fdotp 31,719, load-store 155,109, byte-enable 257,586).
+
+**P4 status: the structure of the design is now complete** — two NoC levels, the group hub (4->1 icache
+mux, L2 I$, 17->1 refill mux with instruction priority), and memory channels on the mesh perimeter.
+
+**Next:** re-verify at 4x4 / 64 cores and then the 256-core gate with the mesh on, since every number
+in the P3 and calibration entries predates it. Expect the 256-core runs to be slow — the mesh adds 48
+routers per plane-set and every refill now takes a multi-hop round trip.
+
 ## 2026-08-11 14:4x +0200 — P4 started: L2 refill mesh scaffolding in, traffic not flowing yet (default OFF)
 
 **Commit:** pulp `b658f2c` "cachepool v3: L2 refill mesh scaffolding (P4, WIP — default OFF, currently
