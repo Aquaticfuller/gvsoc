@@ -6,6 +6,62 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 09:2x +0200 — #34 step 1: the async path's per-access latency is measured and calibrated
+
+**Commits:** core `d11cf08f` "insitu: measure and calibrate the async path's per-access latency" ·
+pulp `8dc0f29` "cachepool v3: adopt the calibrated async response latency"
+
+**The audit that starts #34.** Which components model delay structurally (real simulated time) and
+which by stamping? On the v3 async datapath the stamp sites are `insitu_cache_xbar`'s
+`xbar_latency_cycles`, `insitu_cache_remote_xbar`'s `hop_latency_cycles`, and the AMO shim's
+`inc_latency` — and **all of them are discarded**, because `iss/src/lsu.cpp`'s `data_response`
+zeroes `pending_latency` on the outstanding-capable path where the synchronous branch honours
+`req->get_latency() + 1`. What actually counts on the async path is only real time spent in queues
+and FSMs: the cache core's per-cycle pipeline, the FlooNoc routers (2 cycles/hop), and — since
+`7c953a3e` — the AMO lane window.
+
+**Measured before tuning.** The core now reports **served latency** at stop(): accept cycle to
+response cycle in real simulated time, i.e. exactly what the requester experiences. On byte-enable at
+1 group x 4 tiles x 4 cores: **2.76 cycles** over 4,457 accesses, against the RTL-derived reference
+of **10 isolated / 7 streaming**. The async path was under-charging every access by 4-7 cycles, which
+is why its cycle counts kept coming out BELOW the calibrated synchronous path.
+
+**Fix + sweep.** `resp_latency_cycles` spends that cost structurally: a completed access is not
+eligible to respond until the delay elapses. Swept with `INSITU_RESP_LAT` (env override, no rebuild):
+
+| D | byte-enable | served_lat | vs sync 526,512 |
+|---|---|---|---|
+| 0 | 496,382 | 2.76 | -5.7% |
+| 4 | 513,562 | 6.75 | -2.5% |
+| **8** | **530,895** | **10.76** | **+0.8%** |
+
+Two independent references agree on **D=8**: served latency 10.76 vs the RTL's 10-cycle isolated
+read-hit, and byte-enable within 1% of the calibrated synchronous path. Adopted as the async default
+(0 when `inline_sync_miss`, and the synchronous path never touches `resp_fifo_`, so it cannot be
+perturbed — confirmed: v1 16-core fdotp_M32768 49,001 and spin-lock 76,628, both exact).
+
+**Async vs the calibrated synchronous path**, 1 group x 4 tiles x 4 cores:
+
+| kernel | async D=8 | sync | delta | was |
+|---|---|---|---|---|
+| fdotp_M8192 | 47,464 | 47,196 | **+0.6%** | -6.5% |
+| byte-enable | 530,895 | 526,512 | **+0.8%** | -5.7% |
+| load-store_M16 | 177,199 | 195,734 | -9.5% | -16.3% |
+| spin-lock | 150,768 | 125,833 | +19.8% | no completion |
+
+**Residuals, deliberately left open and NOT tuned away:**
+- **spin-lock +19.8%** — the structural AMO window is derived from sub-operation latencies that now
+  include the +8, so the lane is held too long. It wants its own pass, not a fudge to this knob.
+- **load-store -9.5%** — still under-charging.
+- A single constant cannot separate hit from miss cost. The RTL's cold miss is MemLatency + 17; this
+  reaches roughly +11, so a miss-side term is the next refinement.
+- The discarded stamps in the xbar and remote xbar are still discarded; converting them to structural
+  delay (or dropping them as dead code) is the remaining half of the audit.
+
+**Still true and worth repeating:** the reference here is the *synchronous* path, which is itself
+only calibrated where v1 was measured against RTL (fdotp +1.6%, but load-store was +52%). Matching it
+is necessary, not sufficient. RTL numbers for the v3 topologies do not exist yet.
+
 ## 2026-08-11 08:1x +0200 — #35 fixed: AMO lane occupancy must BLOCK, not stamp, on the async path
 
 **Commit:** core `7c953a3e` "insitu: hold the AMO lane in real time when the cache answers
