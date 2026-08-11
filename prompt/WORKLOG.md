@@ -6,6 +6,60 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 13:0x +0200 — P3 data half: group refill arbiter + per-bank wide egress
+
+**Commits:** core `21e38504` "insitu: group refill mux (v3-P3, data half) + per-bank wide egress" ·
+pulp `961d529` "cachepool v3: per-bank refill ports into a group-level arbiter (P3, data half)"
+
+**What landed.** `InsituCacheRefillMux`: N wide refill masters share one downstream port, instruction
+inputs (the last `nb_priority_inputs`) take **strict priority**, data inputs are served
+**round-robin**, **one request per cycle**, and `set_initiator` stamps the winning input as the
+requester id (the RTL's user field). `per_bank_l2_ports` makes the banks leave their tile on separate
+wide ports so the group can arbitrate all of them — a bare fan-in is not a shared resource at all,
+just a name several masters bind to. v3 now wires 16 bank ports (4 tiles x 4 banks) into one group
+arbiter. The instruction port becomes input 16 when the group L2 I$ lands.
+
+**Two latent bugs the mux exposed**, both the same kind — a cost or hazard that only appears once
+something in the path can answer PENDING:
+
+1. **The mux must spend the DOWNSTREAM latency as real time.** Memory answers a refill with
+   `IO_REQ_OK` + an `inc_latency()` stamp, and the cache core converts that stamp into a deferred
+   install only on its own OK path. Responding in the same cycle threw ~50 cycles away — kernels got
+   **faster** when arbitration was added (fdotp 47,711 -> 43,781) and load-store's data broke. Matured
+   responses now come out of a delay queue. Fourth instance this session of "a stamp had to become
+   real time".
+2. **`run_flush()` reused one request object and one data buffer for every dirty line.** Safe only
+   while the downstream completes inside the call — as the comment there already said. With the mux
+   queueing them, all of a flush's writebacks shared one in-flight object and carried the last line's
+   bytes; load-store failed 3 checks. Flush writebacks now go through the same eviction queue as
+   ordinary evictions, each with its own snapshot, no depth check (a flush must be able to queue every
+   dirty line).
+
+Note the diagnosis order here: I first suspected the functional write-through (also a single shared
+request fired fire-and-forget) and tested it by switching it off — **still 3 FAILs**, so that
+hypothesis was wrong and the flush loop was the real one. Worth recording, because both look identical
+from the outside.
+
+**Results** (1 group x 4 tiles x 4 cores, all data-correct):
+
+| kernel | pre-mux | with 16-way arbiter |
+|---|---|---|
+| load-store_M16 | 178,448 | 180,209 (7/7 partition + flush) |
+| fdotp_M8192 | 47,711 | 47,808 |
+| byte-enable | 531,159 | 531,214 |
+| spin-lock | 122,958 | 122,970 |
+| cache-test-vector | 1,975,357 | 1,970,712 |
+
+Arbitration is real but modest at this scale — the group arbiter forwarded **1.07M** requests with a
+peak queue of **130** on the vector kernel, so the port is busy without being the binding constraint.
+v1 cachepool 16-core exact on all four reference kernels including the flush-heavy load-store_M16
+(154,001 / 49,001 / 225,001 / 76,628), which is the check that matters since the flush path is shared.
+
+**Still open for P3 (instruction half):** the 4->1 aggregation of the tiles' L1 I$ refills, the
+group-level **L2 instruction cache**, and wiring its refill as input 16 with `nb_priority_inputs=1`.
+The arbiter already supports it; what is missing is the L2 I$ itself and the tile-side icache egress
+(today the L1 I$ refill still rides the tile AXI).
+
 ## 2026-08-11 12:1x +0200 — 256-CORE GATE PASSES: the full target configuration runs
 
 **No code change** — this entry records the scale gate (worklog + parent pointer only).
