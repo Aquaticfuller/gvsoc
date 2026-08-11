@@ -6,6 +6,62 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 06:3x +0200 — fdotp bounce loop fixed (orphaned rxbar config); remaining cause is the static NoC map
+
+**Commits:** core `4007f878` "insitu: routing-decision traces that expose a geometry disagreement" ·
+pulp `5d7975b` "cachepool v3: give the remote crossbars their partition-config endpoint"
+
+**Found the bounce loop.** The new geometry traces (`INSITU_XBAR_DEBUG=N` /
+`INSITU_RXBAR_DEBUG=N`, both printing dyn_offset/bank_bits/tile_width/num_tiles with every
+decision) showed, for one address at one cycle:
+
+```
+[RXBAR group_3_2/rxbar_4] addr=0x80003e0c target=14 tgt_grp=14 my_grp=14 out=0 ->local  geom(dyn=6 ...)
+[XBAR  group_3_2/tile_0/xbar_4] addr=0x80003e0c my_tile=14 target=7 local=0 out=5       geom(dyn=9 ...)
+```
+
+Same address, same bank_bits/tile_width/num_tiles — but **dyn_offset 6 on the remote crossbar and 9
+on the cache crossbar**. `addr_tile()` shifts by `dyn_offset + bank_bits`, so the two disagreed about
+which tile owns the line: the crossbar routed it into its own group and the tile called it foreign
+and sent it straight back, forever.
+
+**Why the offsets differed.** fdotp programs `l1d_xbar_config(offset)` with
+`offset = log2(dim * sizeof(float))` = log2(512) = **9** — choosing an interleaving granularity that
+matches its working set, which is exactly what the XBAR_OFFSET CSR is for. Every cache crossbar
+applied it. The remote crossbars did not, because their config endpoint was gated on
+`tiles_per_group > 1` in TWO places (endpoint count + fan-out in `cachepool_v3_system.py`, boundary
+forwarding in `cachepool_v3_cluster.py`) while the crossbars themselves are built whenever there is
+any off-tile traffic, cross-group included. At 1 tile per group the port was silently orphaned —
+GVSoC creates a placeholder VirtualPort for an unrecognised self-referenced name instead of failing,
+the trap already documented in CLAUDE.md. Fixed both gates to use the group's own condition.
+
+**Result:** the 4x4 / 64-core stack overflow is gone (SIGSEGV -> no crash). Regression at
+4x4 / 64 cores is bit-identical: cache-test-vector 1,901,038 · load-store_M16 188,269 ·
+byte-enable 583,429.
+
+**Remaining cause of the fdotp failure, now precise.** With the offsets agreeing, the tail shows:
+
+```
+[RXBAR group_3_2/rxbar_4] in=2 addr=0x80003e0c target=7 tgt_grp=7 my_grp=14 out=2 ->NOC geom(dyn=9 ...)
+```
+
+`in=2` is the NoC ingress slot: **the mesh delivered a group-7 address to group 14**, which correctly
+bounced it back out. The L1 NoC's address map is built in Python at elaboration time from the
+BUILD-TIME interleaving granularity (`group_window = (1 << (line_off + bank_bits)) * tiles_per_group`
+= 256 B for offset 6), but the runtime moves the field to offset 9, where the window should be 2 KiB.
+A static map cannot follow a runtime-programmable interleaving, so cross-group routing is wrong
+whenever software calls `l1d_xbar_config` with anything other than the build-time value. This is an
+architectural gap in the model, not a small bug — and it explains why the kernels that pass at
+4 groups are the ones that do not reprogram the offset.
+
+**Fix direction:** stop routing cross-group traffic by re-decoding the address in the NoC. The remote
+crossbar already computes the destination tile/group correctly at runtime, so it should inject with an
+EXPLICIT destination instead. FlooNoc already supports that shape — `REQ_DEST_X`/`REQ_DEST_Y` are
+carried on the request and the NI honours them on the non-address path — so the map becomes
+irrelevant and always consistent with the runtime decode. That also matches the hardware, where the
+L1 NoC routes by TileID rather than re-decoding an address. Group -> mesh node is available as
+`gx = gid / nb_y_groups`, `gy = gid % nb_y_groups`.
+
 ## 2026-08-11 05:1x +0200 — FIXED the async word loss (a VLSU dependency bug); 4x4 mesh green on 5/6 kernels
 
 **Commit:** core `3707f7ce` "spatz vlsu: do not start a vector memory op while elements are still
