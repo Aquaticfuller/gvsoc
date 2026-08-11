@@ -44,9 +44,29 @@ memory channels on the 6x6 mesh perimeter:
 So the whole designed topology runs at full scale and stays data-correct — every structural element of
 the architecture is now exercised together at 256 cores.
 
-The mesh-off arm at 256 cores is running to give a clean A/B (both arms write-through off). The earlier
-256-core numbers (fdotp 77,493, load-store 323,879) were taken with write-through ON and no mesh, so
-they are NOT a valid comparison — the same confound that made me misread the 4x4 result.
+**Clean A/B, both arms write-through off** (the earlier 256-core numbers — fdotp 77,493, load-store
+323,879 — were taken with write-through ON and are NOT comparable):
+
+| kernel | config | mesh off | mesh on | delta |
+|---|---|---|---|---|
+| fdotp_M32768 | 2x2 (8 chan) | 31,736 | 38,640 | +21.8% |
+| fdotp_M32768 | 4x4 / 64c (16 chan) | 48,008 | 51,923 | +8.2% |
+| fdotp_M32768 | 256c (16 chan) | 61,761 | 64,501 | **+4.4%** |
+| load-store_M16 | 2x2 (8 chan) | 159,432 | 163,799 | +2.7% |
+| load-store_M16 | 256c (16 chan) | 185,740 | 200,130 | **+7.7%** |
+
+**What this does and does not show.** The mesh costs single digits to low double digits and, importantly,
+**does not blow up at 256 cores** — the two-level NoC is not becoming the bottleneck as groups are
+added. But the per-kernel trends run in OPPOSITE directions (fdotp 21.8 -> 8.2 -> 4.4%, load-store
+2.7 -> 7.7%), so this is not yet evidence of clean bandwidth scaling. fdotp's shrinking share is partly
+because it is **not memory-bound** at 256 cores: M32768 over 256 cores is 128 elements per core and only
+24% utilisation, so the refill path is a smaller fraction of the runtime. A genuinely memory-bound
+workload at full scale is what would actually test the mesh's channel bandwidth, and we do not have one
+in the current kernel set.
+
+Also worth stating plainly: with the mesh on, the L1-NoC and L2-NoC hop costs, the channel granularity
+(256 B) and the L2 I$ geometry are all **uncalibrated placeholders**. The structure is right; the
+magnitudes are not anchored to RTL.
 
 ## 2026-08-11 16:2x +0200 — P4 WORKS: the L2 refill mesh is live; the stall was the functional write-through
 
