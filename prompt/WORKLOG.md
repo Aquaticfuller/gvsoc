@@ -6,6 +6,77 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 05:1x +0200 — FIXED the async word loss (a VLSU dependency bug); 4x4 mesh green on 5/6 kernels
+
+**Commit:** core `3707f7ce` "spatz vlsu: do not start a vector memory op while elements are still
+missing".
+
+**Root cause of task #36 — and it was not the cache.** The VLSU started the next vector memory
+instruction as soon as the previous one's bursts had all been *issued* (`pending_size == 0`), with no
+check that any data had *arrived*. Safe with a synchronous interconnect (a burst is already filled
+when req() returns OK); wrong with an asynchronous one, especially since `insn_commit()` is called
+per burst. `cache-test-vector`'s stress phase copies with `vle32.v v0,(src)` immediately followed by
+`vse32.v v0,(dst)` — a RAW on v0 every iteration — so the store issued before the load's bursts
+landed and wrote stale register elements to memory.
+
+**How it was localised.** A new `INSITU_SHADOW=1` mode records, per bank, the last value written to
+each 4-byte word and checks every read serve against it. It found **zero** mismatches while the test
+still reported 81 — i.e. the cache served exactly what had been written through it. That plus "the
+test rewrites the same pattern every pass, so reordering is idempotent and only a dropped store is
+observable" moved the search off the cache and onto the core. (An in-order-response experiment was
+built and then discarded: even perfect ordering cannot fix a dependency violation, since the store
+issues independently of whether the load's data arrived. The dead code was removed, not committed.)
+
+**The fix.** `nb_unfilled_bursts` counts bursts the interconnect answered PENDING/DENIED for, and
+gates the start of the next vector memory instruction. Deliberately NOT counting `delayed_bursts`
+(sync completions with a latency, whose data is already in the register file and only the commit is
+deferred) — counting those would serialize the calibrated path for nothing. `in_delayed_drain` stops
+that drain decrementing a counter it never incremented. Conservative: any unfilled burst blocks the
+next vector memory op rather than only a true register overlap; a precise dependency check is a
+calibration-time refinement.
+
+**Results — every failing configuration now passes, at ~0.1-0.3% cycle cost:**
+
+| config | before | after |
+|---|---|---|
+| 8 tiles / 32 cores (2x2 grp x 2 tiles) | FAIL 81 mismatches, 1,784,650 | **PASS 1,779,611** |
+| 64 cores, 2x2 grp x 4 tiles | FAIL 32, 2,467,834 | **PASS 2,467,268** |
+| 64 cores, **4x4 mesh** x 1 tile | FAIL 32, 1,903,111 | **PASS 1,901,038** |
+
+Calibrated paths untouched: v1 cachepool 16-core exact on all four reference kernels (fdotp_M32768
+49,001 / byte-enable 225,001 / load-store_M16 154,001 / spin-lock 76,628). Note v1 exercises the
+gate (its cell coalescer answers PENDING) and is still bit-identical.
+
+**Multi-group status after this fix.** At the target **4x4 mesh / 64 cores**: `cache-test-scalar`,
+`cache-test-vector`, `byte-enable`, `load-store_M16` (7/7 partition+flush) all PASS. At 64 cores
+2x2x4tiles also `cache-vector-rw`. The remaining kernel is fdotp.
+
+**New, sharper finding on the fdotp failure: a proven bounce loop.** At 4x4 / 64 cores fdotp now
+SIGSEGVs instead of freezing, and the backtrace is unambiguous — a stack of ~14+ identical
+`InsituCacheRemoteXbar::req_handler` frames, i.e. runaway recursion until the stack dies. The
+missing intermediate frames are tail calls: `InsituCacheXbar::req_handler` ends in
+`return outputs_[out]->req_forward(req)` (tail-callable, no frame), while the remote crossbar keeps
+a frame because it uses the returned status afterwards. So the loop is
+**rxbar -> destination tile xbar -> rxbar -> ...**: the destination tile re-emits as remote a
+request that the crossbar had already decided belongs to it.
+
+Verified NOT the cause, each from the elaborated config rather than the Python:
+- rxbar `group_id` and its tile's `xbar.tile_id` agree pairwise for all 16 groups (0..15), with
+  `tiles_per_group=1`, `num_tiles=16`.
+- Group/tile/l1 bindings are correct end to end
+  (`rxbar_4->out_0` -> `tile_0->remote_in_4_0` -> `l1` -> `xbar_4->in_4`), and each group's
+  `noc_out_4_0` goes to its own NI, whose output returns to that group's `noc_in_4_0`.
+- The rxbar's C++ port indexing matches those names: `outputs_[n_local_slots_]` IS `noc_out_0`.
+- The FlooNoc NI does not mangle the address: `set_addr(burst_base - remove_offset)` with
+  remove_offset 0, and the periodic `rel` is used only to clamp a burst against an entry boundary.
+- NI input and output port names are distinct (`narrow_input_{x}_{y}` vs `ni_narrow_{x}_{y}`), so
+  there is no accidental loop-back binding.
+
+**Next step:** instrument the *destination* tile xbar's routing decision (budgeted stderr, like the
+rxbar's `INSITU_RXBAR_DEBUG`, since its own message is LEVEL_TRACE) for requests arriving on a
+remote_in slot: address, own tile_id, computed target, local flag, chosen output. That names why it
+re-emits, which is the last unknown in this loop.
+
 ## 2026-08-11 03:5x +0200 — multi-group scale sweep: mesh works at 4x4/64 cores; a 4th async bug found
 
 **No code change** — this entry records a measurement round (parent pointer + worklog only).
