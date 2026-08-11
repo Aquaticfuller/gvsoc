@@ -32,9 +32,21 @@ which is the direction one expects.
 parallel paths to memory, roughly a third of the penalty — the mesh scales the way the design intends
 rather than becoming a bottleneck as groups are added.
 
-**256-core gate with the mesh is running** (4x4 groups x 4 tiles x 4 cores, 64 tiles, 256 banks, 6x6
-mesh, 16 channels). Expect it to be slow: every refill now takes a multi-hop round trip and the mesh
-adds 48 routers per plane-set.
+**256-CORE GATE PASSES WITH THE COMPLETE STRUCTURE.** 4x4 groups x 4 tiles x 4 cores = 256 cores, 64
+tiles, 256 banks, both NoC levels, the group hub (4->1 icache mux + L2 I$ + 17->1 refill mux), and 16
+memory channels on the 6x6 mesh perimeter:
+
+| kernel | cycles | verdict |
+|---|---|---|
+| `fdotp_M32768` | **64,501** | retval 0, prints `(32768)`, 24% utilisation |
+| `load-store_M16` | **200,130** | **7/7** partition + flush, `Cores:256 Tiles:64` |
+
+So the whole designed topology runs at full scale and stays data-correct — every structural element of
+the architecture is now exercised together at 256 cores.
+
+The mesh-off arm at 256 cores is running to give a clean A/B (both arms write-through off). The earlier
+256-core numbers (fdotp 77,493, load-store 323,879) were taken with write-through ON and no mesh, so
+they are NOT a valid comparison — the same confound that made me misread the 4x4 result.
 
 ## 2026-08-11 16:2x +0200 — P4 WORKS: the L2 refill mesh is live; the stall was the functional write-through
 
