@@ -6,6 +6,54 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 02:4x +0200 — 4-group fdotp: frozen, not starving; localised to the NoC delivery handshake
+
+**Commit:** core `00838e9b` "insitu: env-gated routing trace on the remote crossbar".
+
+**Question settled: frozen vs starving.** Spin-lock showed that async atomic starvation looks
+*identical* to a freeze through a peripheral trace (cores hammer amoswap, no peripheral traffic,
+sim advancing). So the earlier "no progress" claim for R3 fdotp needed a real measurement. Over a
+**200 s** wall-clock window with a core-exec trace: 350 exec lines total and the last simulated
+timestamp is **5,276,000 ps = cycle 5,276** — the same value seen minutes earlier. Simulated time
+does not advance. R3 fdotp is a genuine **freeze**, and it is a different bug from the spin-lock
+starvation (which advances to 180M+ cycles). Two problems, confirmed separate.
+
+**It is a same-cycle loop inside one event handler, not an empty event queue.** A true deadlock
+with nothing pending would make GVSoC *exit*; instead it burns ~100% CPU. gdb on the live process
+(all-thread bt) puts the engine thread in
+`Router::fsm_handler` -> `NetworkInterface::handle_request` -> `InsituCacheRemoteXbar::req_handler`
+every time it is sampled, with **RSS flat at ~90 MB** across samples — so nothing is leaking and
+the *same small set* of requests is being delivered repeatedly.
+
+**Pinned with the new rxbar trace.** At cycle 5281 `group_1_0/rxbar_4` (the SCALAR lane) is handed
+the same request endlessly — `addr=0x80003e0c target=2 tgt_grp=2 my_grp=2 out=0 ->local` — routes
+it correctly to the local tile every time, and the forward returns **IO_REQ_PENDING**, which is the
+correct answer from an async cache. Over the sampled window: 232 local decisions, 68 NoC egress
+decisions, 25 PENDING and 15 DENIED returns.
+
+So: the routing arithmetic is right (verified independently — rxbar props are consistent,
+`tiles_per_group=1`, `group_id` 0/1/2/3 for group_0_0/group_0_1/group_1_0/group_1_1, and both the
+NoC map and `addr_tile()` compute the owning group as `(addr >> 8) & 3`), the target answers
+correctly, and the defect is in the **delivery handshake above the crossbar**: the destination NI
+re-delivers the same flit within one cycle instead of yielding to the event engine.
+
+**Next step (concrete).** `NetworkInterface::handle_request` acts only on `IO_REQ_OK` and
+`IO_REQ_DENIED` from `target->req()`; `IO_REQ_PENDING` falls through both branches, leaving
+`is_stalled = false` so the router treats the flit as delivered while nothing records it as
+in flight (completion is supposed to arrive later via `narrow_response` -> `handle_response`).
+Instrument that site with flit pointer + returned status + `nb_pending_bursts` and the per-class
+pending-burst slot, and check `Router::fsm_handler`'s `continue` paths, which re-enqueue
+`fsm_event` and could re-run the handler at the same cycle.
+
+**Correction to record.** My first read of the status trace said the destination returns DENIED.
+That was a mislabelled printf: the real enum is `OK=0, INVALID=1, DENIED=2, PENDING=3` — I had 2
+and 3 swapped. It returns PENDING. The label is fixed in the committed print.
+
+**Two tooling traps hit this round** (both cost a wrong reading before being caught):
+- `pkill -f "gvsoc_launcher --config"` matches the *invoking shell's own command line* and kills
+  the shell. Use `pkill -9 -x gvsoc_launcher`.
+- zsh glob-expands unquoted `--include=*.hpp` and fails with "no matches found". Quote it.
+
 ## 2026-08-11 01:5x +0200 — R3 characterised: the mesh is not the problem; async atomics starve
 
 **Commit:** core `ffb1368e` "insitu: hold the whole lane for an in-flight RMW, not just atomics"
