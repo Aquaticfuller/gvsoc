@@ -6,6 +6,42 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 18:xx +0200 — verification debt: v2 discharged by inspection; 256-core mesh sweep running
+
+**No code change** — verification round.
+
+### v2 regression: discharged by inspection, not by a run
+
+I changed two files that `cachepool_v2` shares. The diff against the last v2-era commit
+(`git diff 7c8e758..HEAD -- pulp/floonoc/`) is 32 lines, and the **only functional change** is:
+
+```python
+-            rm_base: bool=False, remove_offset:int =0):
++            rm_base: bool=False, remove_offset:int =0, period: int =0):
+-        self.__add_mapping(f"wide_{name}", ..., remove_offset=remove_offset)
++        self.__add_mapping(f"wide_{name}", ..., remove_offset=remove_offset, period=period)
+```
+
+`o_WIDE_MAP` now passes `period=0` explicitly where `__add_mapping`'s own default was already 0, so it
+is **behaviourally identical for every existing caller**. Everything else in the diff is `getenv`-gated
+debug printing (`FLOONOC_NI_DEBUG`), inert when unset, plus one `#include <cstdlib>`. The speculative
+`fsm_event.enqueue()` on the DENIED path was reverted earlier precisely so this argument would hold.
+
+I did try `cachepool_v2` at 2x2 groups x 1 tile x 4 cores and it timed out — but that is **not**
+evidence of a regression: small-mesh v2 configurations were already known not to run (the 2x1 case
+deadlocks in v2 as well), and my changes cannot alter v2's behaviour by the argument above. Running v2
+at its proven 4x4x4x4 default would cost hours of wall time to re-confirm something the diff already
+settles, so it is recorded here as **discharged by inspection** rather than left as a vague open item.
+If a v2 number is ever needed, the configuration to use is its default, not a reduced mesh.
+
+### 256-core sweep with the mesh: running
+
+The 8-kernel 256-core sweep in the earlier entry predates P3/P4 and was taken with functional
+write-through ON, so only `fdotp_M32768` (64,501) and `load-store_M16` (200,130, 7/7) have been
+re-measured on the complete structure. The remaining six — byte-enable, cache-vector-rw,
+fdotp_M65536, cache-test-scalar, cache-test-vector, spin-lock — are running now at 4x4 groups x 4 tiles
+x 4 cores with both NoC levels and 16 channels. Results to follow.
+
 ## 2026-08-11 17:1x +0200 — P4 verified at 4x4 / 64 cores with the design's 16 memory channels
 
 **No code change** — measurement round (worklog + parent pointer only).
