@@ -6,6 +6,51 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 19:xx +0200 — calibration refresh caught a sync-path regression I had introduced in P3
+
+**Commit:** pulp `585817a` "cachepool v3: keep the synchronous path flat — the refill mux and L2 mesh
+are async-only"
+
+**The regression.** The 17->1 refill mux always answers `IO_REQ_PENDING`, but the synchronous-slave
+cache requires its refill to answer **OK inside the same call**: `inline_sync_miss` completes the miss
+there and returns OK to the core. With a queueing arbiter in that path the sync arm died — the ISS
+aborted with **"Trying to decrease zero stalled counter"** on fdotp, and byte-enable failed on an
+invalid peripheral register. The P4 mesh has the same incompatibility. **Neither had been re-run in sync
+mode since P3 landed**, so this sat undetected through two phases.
+
+This is the payoff for re-measuring stale numbers rather than just restating them: the task found a bug
+instead of refreshing figures.
+
+**The fix.** The synchronous path exists as a CALIBRATION REFERENCE, so it keeps the flat per-group
+fan-in it was measured with; the mux and mesh are gated on the cache being asynchronous. The group L2 I$
+is deliberately **not** gated that way — it is independent of the sync/async choice, so it stays in both
+arms and its refill joins the 17->1 mux when one exists or leaves on the group egress otherwise. That
+keeps the A/B a comparison of the CACHE, differing only by arbitration, rather than by a whole cache
+level.
+
+**Refreshed async-vs-sync** at 1 group x 4 tiles x 4 cores (L2 I$ in both arms, write-through off).
+These REPLACE the figures in the #34 entries, which predated P3:
+
+| kernel | sync | async | delta | stale figure |
+|---|---|---|---|---|
+| fdotp_M8192 | 31,125 | 31,719 | **+1.9%** | +1.1% |
+| byte-enable | 253,039 | 257,586 | **+1.8%** | +0.9% |
+| spin-lock | 76,826 | 73,799 | **-3.9%** | -2.3% |
+| load-store_M16 | 174,116 | 155,109 | **-10.9%** | -8.8% |
+
+Conclusions unchanged: hit-dominated kernels within ~2%, and load-store's gap is the memory-level
+-parallelism difference already recorded as a deliberate non-goal. Async is unperturbed by the
+restructure — every async number is bit-identical to before it, and 2x2 with the mesh is still 38,640.
+The 2x2 sync arm runs again (36,835).
+
+**Two notes on my own method:**
+- My first measurement script captured `$?` **after** a `grep`, so it printed `rc=0` for runs that had
+  actually aborted, with only the missing cycle count as a hint. Capture the status immediately.
+- `xbar_latency_cycles` and `hop_latency_cycles` are both **1**, not 0, so removing them is NOT a
+  no-op cleanup: they are live and calibrated on the synchronous path (v1 depends on them) and dead
+  only on the async path. Deleting them would break v1's calibration. The correct action is a
+  structural equivalent for async, which is a real change needing its own A/B — not a tidy-up.
+
 ## 2026-08-11 18:xx +0200 — verification debt: v2 discharged by inspection; 256-core mesh sweep running
 
 **No code change** — verification round.
