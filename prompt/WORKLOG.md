@@ -69,11 +69,31 @@ and nothing ever frees the slot to retry it. Since 216 writes and many reads did
 accounting works in general — something about this particular burst (or the state around it) leaves the
 per-class slot held.
 
-**Next step:** instrument the NI's per-class pending-burst slots and its denied-queue drain — which
-burst holds `narrow/wide_{read,write}_pending_burst` at 21,105, and why `handle_response` never clears
-it. Note this is one NI per group with ONE pending burst per class, so a group's whole refill stream is
-serialised through a single slot; if that is the intended bandwidth then the design wants several NIs
-per group, and if it is not, the slot is being leaked.
+**ROOT CAUSE FOUND: duplicate submission inflates the NI's outstanding-burst count.** Instrumented
+with the new `FLOONOC_NI_DEBUG` (pulp, env-gated, inert when unset), which prints every admission
+decision with the slot state and every completion decrement.
+
+At the stalling interface: **333 admissions against 335 decrements**, and the count oscillating
+**31<->32** rather than climbing — so not a simple leak. The mechanism is visible in the trace: the
+**same request pointer** is admitted and DENIED on consecutive cycles (`0x29324e8` at 20835, 20836,
+20837), so it lands on the denied queue repeatedly, and **every later drain does
+`nb_pending_bursts[1]++`**. The count therefore inflates to the 32-burst cap even though the cache can
+only have about **five** bursts genuinely in flight per group (one refill per bank plus the L2 I$). At
+21,105 the count sits at the cap with the slot pointer FREE (`held=(nil)`), no further responses arrive
+to decrement it, and the denied request is never drained. Deadlock.
+
+**Next step:** honour FlooNoc's DENIED/grant contract on the initiator side. A master that receives
+`IO_REQ_DENIED` must hold the request and wait for `grant()` — the NI calls
+`req->get_resp_port()->grant(req)` when it drains its denied queue — rather than letting it be
+re-driven. So: find who re-submits the same pointer each cycle (the refill mux forwards with
+`req_forward` and does not retry, so the re-drive is upstream of it or inside the NI's own retry path),
+and make that path wait for the grant. Sizing is a second question: one NI per group with a single
+pending burst per class serialises a group's entire refill stream, so if that is not the intended
+bandwidth the design wants several NIs per group.
+
+**Also reverted:** a speculative `fsm_event.enqueue()` on the DENIED path. It changed nothing (the
+stall stayed at the same cycle) and this model is shared with cachepool_v2 at 256 cores, so an
+unmotivated edit does not belong there.
 
 ## 2026-08-11 13:5x +0200 — P3 COMPLETE: group L2 I$ + instruction strict priority
 
