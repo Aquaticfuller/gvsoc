@@ -22,8 +22,19 @@ surfaced a real defect that was invisible one step down.
 | `spin-lock` | **PASS**, retval 0 | 3,020,539 |
 | `byte-enable` | **PASS**, retval 0 | 635,594 |
 
-(cache-test-vector, cache-test-scalar, cache-vector-rw and fdotp_M65536 were still running when this
-was written.)
+| `cache-test-vector` | **PASS**, vcache-basic + vcache-stress data integrity OK | 2,948,376 |
+| `cache-test-scalar` | **PASS**, cache-basic + cache-stress data integrity OK | 2,698,989 |
+| `cache-vector-rw` | **PASS**, retval 0 | 610,257 |
+| `fdotp_M65536` | **PASS** `----- (65536) sp fdotp -----`, 48% utilisation | 86,541 |
+
+**8 of 8 kernels pass.** One caveat on the two cache-test kernels: they cap their verification at
+`MAX_CORES = 32` (`[WARN] only first 32 cores checked`), so their data-integrity verdict at this scale
+covers 32 of the 256 cores. Cores 32+ run the traffic but are not checked — the same limit that mattered
+while diagnosing #36.
+
+**Utilisation recovers with problem size, as predicted.** fdotp goes 31% at M32768 (128 elements per
+core) to **48% at M65536** (256 per core), confirming the low figure was the workload rather than the
+model. Still not saturating; a larger problem would push it further.
 
 **What each of those actually proves at this scale:**
 - The **256-way barrier** works — the counting barrier from the earlier 64-bit rewrite holds at 256,
