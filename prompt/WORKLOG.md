@@ -6,6 +6,45 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 11:3x +0200 — remote ports: n per port-class crossbar, default n=1 (n*5 per tile)
+
+**Commit:** pulp `b8d6e84` "cachepool v3: default to one remote port per port-class crossbar (n*5 per tile)"
+
+**Architecture clarification (user).** The core-to-other-tile remote port count is not fixed at five.
+All five of a core's master ports (scalar + 4 VLSU lanes) go to their own tile-level crossbar, each
+crossbar has a CONFIGURABLE number of remote ports n, and with five parallel crossbars a tile has
+**n * 5** remote ports in total. Default n = 1.
+
+**State of the model.** The structure already matched: `num_remote_port_core` is exactly n, per
+port-class crossbar. Only the default was wrong — v3 inherited n = 2 from the canonical config and
+built ten remote ports per tile. Now set to 1 in v3 (overridden there, not in the canonical config, so
+v1's calibrated numbers measured with n = 2 stay untouched). Verified in the elaborated config:
+`nrpc=1` and exactly five ports, `remote_out_0_0 .. remote_out_4_0`, one per crossbar.
+`CACHEPOOL_V3_REMOTE_PORTS` sweeps it.
+
+**Measured effect of n:**
+
+| topology | kernel | n=2 | n=1 |
+|---|---|---|---|
+| 1 group x 4 tiles x 4 cores | load-store_M16 | 178,448 | 178,448 |
+| | byte-enable | 531,159 | 531,159 |
+| | spin-lock | 122,958 | 122,958 |
+| | fdotp_M8192 | 47,711 | 47,711 |
+| | cache-test-vector | 1,975,357 | 1,975,357 |
+| 4x4 groups x 1 tile x 4 cores | fdotp_M32768 | 59,289 | **63,555** (+7.2%) |
+| | cache-test-vector | 1,901,038 | **2,080,030** (+9.4%) |
+
+**Caveat that matters for interpreting those numbers.** The remote ports carry **no explicit
+occupancy**: the remote crossbar picks an output with `source % n` and forwards via `req_forward`, with
+no per-port arbitration or busy tracking. So n is structure and wiring, not modelled bandwidth — which
+is why it changes nothing at one group. The 4x4 sensitivity comes from how slots map onto tile inputs
+rather than from port contention, and **the exact mechanism is not yet traced**. If n is meant to act
+as parallel bandwidth, per-port occupancy has to be added — the same stamped-versus-structural
+distinction that steps 1-3 of the calibration kept hitting.
+
+**Also note:** the 4x4 numbers quoted in the earlier P1 and calibration entries were taken with n = 2.
+With the intended n = 1 default they are 63,555 (fdotp_M32768) and 2,080,030 (cache-test-vector).
+
 ## 2026-08-11 10:5x +0200 — #34 step 3: async flush gate; and the load-store residual is MLP, not a missing cost
 
 **Commit:** core `9c2dbe1f` "insitu: gate the async pipeline during a flush walk"
