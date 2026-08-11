@@ -6,6 +6,64 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 03:5x +0200 — multi-group scale sweep: mesh works at 4x4/64 cores; a 4th async bug found
+
+**No code change** — this entry records a measurement round (parent pointer + worklog only).
+
+**Why.** Two topologies had been verified separately (1 group x 4 tiles, and 4 groups x 1 tile, both
+16 cores). The product — multiple groups AND multiple tiles — was untested, and so was the target
+4x4 mesh. Testing it before starting P3/P4 was the whole point: it changes what is left to do.
+
+**Sweep results.**
+
+*2x2 groups x 4 tiles x 4 cores = 64 cores, 16 tiles:*
+
+| kernel | result |
+|---|---|
+| `cache-test-scalar` | PASS 2,166,365 |
+| `cache-vector-rw`   | PASS 322,748 |
+| `byte-enable`       | PASS 541,512 |
+| `load-store_M16`    | PASS 187,792 (7/7 partition + flush) |
+| `cache-test-vector` | **FAIL** — vcache-basic PASS, vcache-stress 32 mismatches |
+| `fdotp_M32768`      | HANG (the known freeze) |
+
+*4x4 groups x 1 tile x 4 cores = 64 cores, 16 tiles — the TARGET mesh size:*
+`cache-test-scalar` PASS 1,592,532 · `byte-enable` PASS 583,429 · `load-store_M16` PASS 188,431 ·
+`cache-test-vector` **FAIL** (32 mismatches).
+
+**The 4x4 mesh works.** This matters beyond core count: at 2x2 every column is a border column, so
+the router's X-step guard never fires and XY routing degenerates to Y-then-X. 4x4 has interior
+nodes and exercises genuine X-first dimension-ordered routing, 16 groups, and 16 NIs per plane.
+Scalar, byte-enable and the full partition/flush suite are clean there.
+
+**The new failure is ASYNC, not the mesh.** `cache-test-vector`'s stress phase fails at every
+config beyond the two 16-core/4-tile ones. Localised with a config-only flip at an identical
+topology (2x2 groups x 2 tiles x 4 cores = 32 cores, 8 tiles):
+- async: **FAIL**, 81 mismatches
+- sync : **PASS**, 2,000,810 cycles
+
+So this is a 4th async correctness bug (after the eviction-zeros, arg-clobber and AMO-overlap fixes
+in `aae083eb`), and it is concurrency-gated: invisible at 16 cores / 4 tiles, present from 32 cores
+/ 8 tiles upward. It is NOT the freeze — R3 fdotp wedges identically in sync and async.
+
+**Reading the failure correctly.** `total_errors` is a SUM over cores, so "32 mismatches" at 64
+cores is ~1 bad word per core, not wholesale corruption; 81 at 32 cores is ~2-3 per core. The test
+is safe at >32 cores — `active = (cid < MAX_CORES)` with MAX_CORES=32, so cores 32+ do not
+participate and never write the MAX_CORES-sized buffers. No out-of-bounds; the mismatches are real.
+The stress phase does STRESS_PASSES overlapping vector copies of each core's OWN slice with
+rotating offsets, then verifies — no cross-core sharing — so a handful of stale/lost words per core
+points at the async path's own read/write ordering under load, not at a coherence issue.
+
+**State of v3-P1 after this round.** The multi-group shell is functional at the target mesh size;
+what is left is not mesh work:
+1. `fdotp` freeze — NI delivery handshake ignoring IO_REQ_PENDING (sync+async, 4 groups).
+2. NEW: async vector-stress data loss under concurrency (>=32 cores / 8 tiles).
+3. async atomic starvation (task #35, reproduces at 1 group).
+4. The rxbar partition-config endpoint gate at `_TILES_PER_GROUP == 1` (latent).
+
+Items 2 and 3 are both async-under-load, and both must be closed before task #34 (calibration) can
+mean anything. Item 1 is independent of async.
+
 ## 2026-08-11 02:4x +0200 — 4-group fdotp: frozen, not starving; localised to the NoC delivery handshake
 
 **Commit:** core `00838e9b` "insitu: env-gated routing trace on the remote crossbar".
