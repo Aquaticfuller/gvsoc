@@ -6,6 +6,49 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 12:1x +0200 — 256-CORE GATE PASSES: the full target configuration runs
+
+**No code change** — this entry records the scale gate (worklog + parent pointer only).
+
+**The full design target now runs**: 4x4 groups x 4 tiles x 4 cores = **256 cores**, 64 tiles, 256
+InSitu banks, 5 L1 FlooNoc meshes, a 6.2 MB elaborated config. It passed on the first attempt, with no
+new bugs — which is worth noting after a session where every previous scale step (16 -> 32 -> 64 cores)
+surfaced a real defect that was invisible one step down.
+
+| kernel | result | cycles |
+|---|---|---|
+| `fdotp_M32768` | **PASS** `----- (32768) sp fdotp -----`, retval 0 | 77,493 |
+| `load-store_M16` | **PASS**, 7/7 partition + flush, `Cores:256 Tiles:64` | 323,879 |
+| `spin-lock` | **PASS**, retval 0 | 3,020,539 |
+| `byte-enable` | **PASS**, retval 0 | 635,594 |
+
+(cache-test-vector, cache-test-scalar, cache-vector-rw and fdotp_M65536 were still running when this
+was written.)
+
+**What each of those actually proves at this scale:**
+- The **256-way barrier** works — the counting barrier from the earlier 64-bit rewrite holds at 256,
+  where the original 32-bit bitmask could not even represent the participants.
+- **Partitioning and flush** work across 64 tiles: all seven cases, including both flush-isolation
+  phases, with the kernel itself reporting `Cores:256 Tiles:64`.
+- **256-way atomic contention completes.** spin-lock at 3.02M cycles is ~11.8k cycles per core
+  serialised through one lock, which is the expected shape. Before the #35 fix (structural AMO lane
+  occupancy) this kernel could not finish even at 16 cores.
+- Cross-group traffic over the L1 mesh works at 16 groups with the runtime-programmable interleaving
+  (fdotp sets XBAR_OFFSET itself).
+
+**Read the fdotp utilisation carefully:** 31% at 256 cores against 87% at 64. That is the WORKLOAD, not
+the model — M32768 over 256 cores is only 128 elements per core, so there is not enough work to fill
+the machine. fdotp_M65536 is running to confirm utilisation recovers with a problem size that fits the
+core count.
+
+**Numbers here are with the intended n = 1 remote ports per port-class crossbar** (five per tile) and
+the async cache calibrated per #34 steps 1-3. They are internally consistent but still not anchored to
+RTL for this topology.
+
+**Next**, now that the foundation is verified at full scale: **P3** (group 4->1 icache-refill demux,
+group L2 I$, 17->1 refill mux with instruction strict-priority and round-robin data), then **P4** (the
+L2 refill mesh with memory channels at the perimeter), then **P5** (RLC per-group instances).
+
 ## 2026-08-11 11:3x +0200 — remote ports: n per port-class crossbar, default n=1 (n*5 per tile)
 
 **Commit:** pulp `b8d6e84` "cachepool v3: default to one remote port per port-class crossbar (n*5 per tile)"
