@@ -6,6 +6,61 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 10:5x +0200 — #34 step 3: async flush gate; and the load-store residual is MLP, not a missing cost
+
+**Commit:** core `9c2dbe1f` "insitu: gate the async pipeline during a flush walk"
+
+**Third instance of the same pattern.** `run_flush()` stamps the walk's duration and
+`run_request_sync()` stamps the remaining wait for anything arriving during it — but nothing consulted
+`flush_busy_until_` on the async path, where stamps are discarded, so a flush cost nothing there.
+`stage0_arbitrate` now refuses to start new work until the walk ends (the RTL's `l1d_busy_i`), making
+the gate real time. Effect is real but small: load-store_M16 177,199 -> 178,448, i.e. -9.5% -> -8.8%.
+v1 unchanged, including the flush-heavy load-store_M16 at 154,001 (stage0_arbitrate is async-only).
+
+**The important result is why load-store is still 8.8% under, and it is NOT an under-charge.**
+Same kernel, same topology, both modes:
+
+| mode | rd_hit | rd_miss | wr_hit | wr_miss | refill | hit rate |
+|---|---|---|---|---|---|---|
+| sync | 12,137 | 2,525 | 6,721 | 465 | 2,990 | **86.3%** |
+| async | 1,251 | 13,411 | 544 | 6,642 | 3,130 | **8.2%** |
+
+Identical access count (21,848) and near-identical refills, so the WORK is the same. What differs is
+that the async path has genuinely pending lines: an access landing on an in-flight refill merges onto
+the MSHR and waits, where the synchronous path completes every refill inside the call so everything
+after the first access is a hit. Measured served latency is **693 cycles** on average — and yet the
+total cycle count is LOWER than sync, because the async path OVERLAPS those waits across outstanding
+requests. That is memory-level parallelism the synchronous model structurally cannot express.
+
+**So "match sync" is the wrong target for this kernel.** v1's load-store over-predicts the RTL by
+**+52%**; being below sync here plausibly moves toward the RTL, not away. Closing that 8.8% would be
+fitting to a known-bad reference. Recorded as a deliberate non-goal rather than an open defect.
+
+**Where #34 stands** (1 group x 4 tiles x 4 cores, async vs the calibrated synchronous path):
+
+| kernel | async | sync | delta | at session start |
+|---|---|---|---|---|
+| fdotp_M8192 | 47,711 | 47,196 | **+1.1%** | -6.5% |
+| byte-enable | 531,159 | 526,512 | **+0.9%** | -5.7% |
+| spin-lock | 122,958 | 125,833 | **-2.3%** | no completion |
+| load-store_M16 | 178,448 | 195,734 | -8.8% (MLP, see above) | -16.3% |
+
+Three calibration steps, all the same shape — find a cost modelled by stamping and make it structural:
+1. `d11cf08f` per-access response latency (measured 2.76 cycles vs the RTL's 10; now 10.76).
+2. `21603980` the AMO lane window, absolute from accept rather than additive.
+3. `9c2dbe1f` the flush walk gate.
+
+**Open:**
+- **Hit vs miss cannot be separated by one response-latency constant.** The RTL's cold miss is
+  MemLatency + 17; we reach about +11. A miss-side term is the next real refinement.
+- **Dead stamps**: the xbar's `xbar_latency_cycles` and the remote xbar's `hop_latency_cycles` are
+  still stamped and therefore discarded. Convert to structural or delete so they stop implying they
+  do something.
+- **The reference itself.** Everything above is measured against the synchronous path, which is only
+  RTL-calibrated where v1 was measured (fdotp +1.6%, load-store +52%). Getting RTL numbers for a
+  v3-comparable configuration is now the highest-value calibration work — without them, the
+  hit-dominated kernels are trustworthy to ~1% and the miss/MLP-dominated ones are not anchored at all.
+
 ## 2026-08-11 10:0x +0200 — #34 step 2: the AMO window is absolute; async now within ~2.5% on 3 of 4 kernels
 
 **Commit:** core `21603980` "insitu: make the structural AMO window absolute, not additive"
