@@ -6,6 +6,36 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 17:1x +0200 — P4 verified at 4x4 / 64 cores with the design's 16 memory channels
+
+**No code change** — measurement round (worklog + parent pointer only).
+
+**16 memory channels, exactly as designed.** At 4x4 groups the mesh is 6x6 and the boundary ring minus
+corners gives **2*(4+4) = 16** channel attach points; the elaborated config confirms 16 `chan_ico`
+routers. This is the configuration the architecture discussion specified ("for a 4x4 NoC there are 16
+outbound router ports at the edge, so at most 16 memory channels").
+
+**Clean A/B at 4x4 / 64 cores** (write-through off in BOTH arms, so the comparison is not confounded):
+
+| kernel | mesh OFF | mesh ON | delta |
+|---|---|---|---|
+| fdotp_M32768 | 48,008 | **51,923** | **+8.2%** |
+| load-store_M16 | — | **173,253** (data-correct) | — |
+
+**Correction to my first reading of this:** I initially compared the mesh-on number against the 63,555
+recorded earlier and reported it as 18% FASTER. That baseline was taken with functional write-through
+ON, so it was not comparable. Re-measured with both arms at write-through off, the mesh costs **+8.2%**,
+which is the direction one expects.
+
+**The channel count shows up in the cost, which is the encouraging part:** the mesh penalty is
+**+21.8% at 2x2** (8 channels) and **+8.2% at 4x4** (16 channels). Twice the perimeter, twice the
+parallel paths to memory, roughly a third of the penalty — the mesh scales the way the design intends
+rather than becoming a bottleneck as groups are added.
+
+**256-core gate with the mesh is running** (4x4 groups x 4 tiles x 4 cores, 64 tiles, 256 banks, 6x6
+mesh, 16 channels). Expect it to be slow: every refill now takes a multi-hop round trip and the mesh
+adds 48 routers per plane-set.
+
 ## 2026-08-11 16:2x +0200 — P4 WORKS: the L2 refill mesh is live; the stall was the functional write-through
 
 **Commits:** core `e9b80da7` "insitu: treat a DENIED writeback as in flight" ·
