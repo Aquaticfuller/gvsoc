@@ -6,6 +6,64 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 21:xx +0200 — CORES_PER_TILE=2 multi-group hang: characterised as a BOOT issue, not cache/NoC
+
+**No code change** — diagnosis only, deliberately stopping short of a fix (see the judgement call at
+the end).
+
+**It still reproduces** with everything current (tunnel routing, P3, P4): 2x2 groups x 1 tile x **2**
+cores hangs on byte-enable, which passes at 4 cores/tile.
+
+**It is not frozen — it is a software spin.** 110.9M instructions retired and simulated time reaching
+110.9M cycles in a 200 s window, so the engine is fine.
+
+**Where the cores are: PC 0x1038, forever.** From `bootrom_cachepool.dump` that is the bootrom's
+`<exception>` handler:
+
+```
+00001038 <exception>:
+    1038:  wfi
+    103c:  j 1038 <exception>
+```
+
+And **zero runtime peripheral accesses** — all 72 traced peripheral events are elaboration-time. So the
+cores never read BOOT_CONTROL, never reach the barrier, and never leave the ROM.
+
+**Why that is a trap, not the boot WFI.** The bootrom's sequence is:
+
+```
+1004: lw t1,120(t1)      # mtvec <- 0x1038
+1008: csrw mtvec,t1
+1018: csrwi mie,15       # enable MSIP
+101c: wfi                # wait for the wake
+1020..102c:              # then compute cluster_base + size + 0x20  (BOOT_CONTROL)
+1030: lw t2,0(t2)        # read the entry point
+1034: jr t2              # and jump to it
+```
+
+`mtvec` is 0x1038, so an interrupt that is **taken** vectors to the exception handler instead of the
+core resuming after the `wfi`. The intended behaviour is the opposite: with `mstatus.MIE` clear, a
+pending MSIP wakes WFI *without* being taken, and execution continues at 0x1020. Our cores are parked
+at 0x1038, so at this configuration the MSIP is being taken as a trap.
+
+Note 0x1038 is also the ROM's default `entry_addr` (0x1070 holds 0x1038), so "jumped to the default
+entry" and "trapped" land in the same place — but the absence of ANY peripheral access rules out the
+former: a core that reached 0x1030 would have read BOOT_CONTROL through the peripheral.
+
+**So the fault is in boot / interrupt delivery at this core count, not in the cache, the crossbars or
+either NoC.** That is the useful conclusion, because it says where NOT to look.
+
+**Next step if it is ever wanted:** compare MSIP delivery between 2 and 4 cores per tile — whether the
+wake is a level that stays asserted (so a second interrupt is taken after the first wake) versus a
+pulse, and what `mstatus.MIE` is at the wake. The v3 loader drives one `o_START` into every core's
+`msip` port, so a level/pulse mismatch would plausibly behave differently as the fan-out width changes.
+
+**Judgement call: stopping here.** This is a degenerate, non-target configuration — CLAUDE.md already
+records `CORES_PER_TILE>=2` as marginal, every target config uses 4, and all 8 kernels pass at 4 cores
+per tile up to 256 cores. Spending further time here would buy a configuration nobody runs, while the
+genuinely blocking item (RTL anchors) sits untouched. Recorded as characterised-not-fixed rather than
+quietly dropped.
+
 ## 2026-08-11 20:xx +0200 — #34 step 4: the miss side calibrated against the RTL, per class
 
 **Commits:** core `c492974c` "insitu: calibrate the miss side against the RTL, measured per class" ·
