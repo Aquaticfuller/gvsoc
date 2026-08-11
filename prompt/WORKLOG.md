@@ -6,6 +6,64 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 07:2x +0200 — v3-P1 DONE: fdotp completes on the mesh; 6/6 kernels at the target 4x4
+
+**Commits:** core `db9e2ab6` "insitu: route off-group L1 traffic through a tunnel instead of the
+mesh's address map" · pulp `e21d3b3` "cachepool v3: map the L1 NoC by tunnel window, one entry per
+group"
+
+**The last blocker, and why a map could never work.** Which tile — hence which group — owns a line
+depends on the interleaving granularity, and that granularity is RUNTIME-programmable via
+XBAR_OFFSET (fdotp sets `log2(dim * sizeof(float))`). A FlooNoc address map built at elaboration from
+the build-time granularity is therefore wrong the moment software reprograms it, which is exactly
+what the trace showed: the mesh handed a group-7 address to group 14, whose crossbar correctly sent
+it back out. No static map can follow a runtime-programmable interleaving.
+
+**Fix: tunnel the destination instead of re-deriving it.** The remote crossbar already computes the
+target group from the CURRENT geometry, so it re-addresses an off-group request to
+`noc_tunnel_base + tgt_group * noc_tunnel_stride + addr`, and the mesh routes on that. One static
+entry per group; the map's `remove_offset` strips the tunnel so the destination tile sees the
+untouched original address and re-decodes it with its own runtime geometry. Routing follows the
+runtime configuration for free.
+
+Also closer to the hardware, whose L1 NoC routes on a source-computed TileID rather than re-decoding
+an address at every hop. FlooNoc cannot express that directly — it honours a caller-supplied
+`REQ_DEST_X`/`REQ_DEST_Y` only on the RESPONSE path (`handle_rsp`), and an explicit-destination
+request mode would mean changing a model v2 shares at 256 cores — so the tunnel buys the same
+behaviour without touching it. Stride is a full 32-bit space per group, based above 4 GiB; the
+constants live in `insitu_cache_remote_xbar.py` and the cluster imports them so the two sides cannot
+drift; read as 64-bit because `get_child_int` truncates. Inert at `num_groups == 1`, so v1 is
+untouched.
+
+**Results — the mesh is now green, including the gate that started this.**
+
+| gate | kernel | result |
+|---|---|---|
+| R3: 2x2 groups x 1 tile x 4 cores (16c) | fdotp_M8192 | **PASS 48,251** (was a hang) |
+| **4x4 mesh** x 1 tile x 4 cores (64c) | fdotp_M32768 | **PASS 59,289**, 87% util (was hang, then stack overflow) |
+
+Full set at 4x4 / 64 cores, all clean: `cache-test-scalar` 1,592,532 · `cache-test-vector` 1,901,038 ·
+`cache-vector-rw` 474,929 · `byte-enable` 583,429 · `load-store_M16` 188,269 (7/7 partition+flush) ·
+`fdotp_M32768` 59,289. Four are bit-identical to their pre-tunnel values — as expected, since the
+tunnel is timing-neutral for kernels that keep the build-time offset.
+
+**Three bugs closed to get here**, all found this session and each hidden behind the previous one:
+1. `3707f7ce` — the VLSU started a vector memory op while earlier elements were still missing.
+2. `5d7975b` — the remote crossbars' partition-config endpoint was orphaned at 1 tile per group, so
+   they decoded addresses with a stale dyn_offset and bounced requests forever.
+3. `db9e2ab6` / `e21d3b3` — the mesh's static address map could not follow a runtime-programmable
+   interleaving.
+
+**What v3-P1 leaves open** (none of it mesh work):
+- **#35** async atomics starve under contention (reproduces at 1 group, no mesh needed).
+- **#34** the async path is uncalibrated — no v3 cycle count is quotable yet, including the ones above.
+- Scale: 64 cores is verified; 256 cores (4x4 x 4 tiles x 4 cores) is not yet run.
+- `CORES_PER_TILE=2` with multiple groups is still broken (even byte-enable hangs) — a separate,
+  unrelated config bug.
+
+Next: P3 (group icache mux + L2 I$ + 17->1 refill mux) is now standing on a verified group level, or
+#35/#34 first if calibrated numbers are wanted sooner.
+
 ## 2026-08-11 06:3x +0200 — fdotp bounce loop fixed (orphaned rxbar config); remaining cause is the static NoC map
 
 **Commits:** core `4007f878` "insitu: routing-decision traces that expose a geometry disagreement" ·
