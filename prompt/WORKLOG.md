@@ -36,11 +36,31 @@ If a v2 number is ever needed, the configuration to use is its default, not a re
 
 ### 256-core sweep with the mesh: running
 
-The 8-kernel 256-core sweep in the earlier entry predates P3/P4 and was taken with functional
-write-through ON, so only `fdotp_M32768` (64,501) and `load-store_M16` (200,130, 7/7) have been
-re-measured on the complete structure. The remaining six — byte-enable, cache-vector-rw,
-fdotp_M65536, cache-test-scalar, cache-test-vector, spin-lock — are running now at 4x4 groups x 4 tiles
-x 4 cores with both NoC levels and 16 channels. Results to follow.
+**8/8 KERNELS PASS AT 256 CORES ON THE COMPLETE STRUCTURE** — 4x4 groups x 4 tiles x 4 cores, both NoC
+levels, the group hub, 16 memory channels. All data-correct, all retval 0:
+
+| kernel | cycles | verdict |
+|---|---|---|
+| `fdotp_M32768` | 64,501 | prints `(32768)`, 24% util |
+| `fdotp_M65536` | **73,226** | prints `(65536)`, **43% util** |
+| `load-store_M16` | 200,130 | **7/7** partition + flush |
+| `byte-enable` | **365,578** | |
+| `cache-vector-rw` | **619,231** | |
+| `spin-lock` | **2,304,515** | 256-way atomic contention |
+| `cache-test-vector` | **2,691,387** | vcache-basic + vcache-stress integrity OK |
+| `cache-test-scalar` | **2,963,000** | cache-basic + cache-stress integrity OK |
+
+This is the new reference point for the model: every structural element of the architecture running
+together at full scale, data-correct.
+
+**Do NOT compare these against the pre-mesh 256-core sweep.** Three things changed at once between the
+two — the group L2 I$ landed (P3), functional write-through went off, and the L2 mesh went on — so the
+per-kernel differences (e.g. byte-enable 635,594 -> 365,578, cache-test-scalar 2,698,989 -> 2,963,000)
+are not attributable to any one of them. The only clean mesh A/B is the write-through-off pair in the
+entry above.
+
+fdotp utilisation improves 24% -> 43% from M32768 to M65536 at 256 cores, consistent with the earlier
+finding that the low figure is elements-per-core rather than a model limit.
 
 ## 2026-08-11 17:1x +0200 — P4 verified at 4x4 / 64 cores with the design's 16 memory channels
 
