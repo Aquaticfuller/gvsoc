@@ -6,6 +6,56 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 08:1x +0200 — #35 fixed: AMO lane occupancy must BLOCK, not stamp, on the async path
+
+**Commit:** core `7c953a3e` "insitu: hold the AMO lane in real time when the cache answers
+asynchronously"
+
+**The finding that matters beyond this bug.** The async path DISCARDS stamped latency. In
+`iss/src/lsu.cpp`'s `data_response`, the outstanding-capable branch sets `pending_latency = 0`,
+where the synchronous branch uses `req->get_latency() + 1`. So every `inc_latency()` a component
+stamps is thrown away for an async completion, and the scoreboard releases the destination register
+one cycle after the response arrives. Any occupancy or contention a component models by stamping is
+therefore invisible on the async path — this is the structural reason the async model cannot be
+calibrated as it stands, and it is the entry point for #34.
+
+**How that broke spin-lock.** B3 modelled the RMW lane occupancy as a stamp on arriving requests.
+With the stamp discarded, an RMW cost only the two cycles its sub-operations take, against the RTL's
+15-20 cycle `core_ready=0` window (`spatz_cache_amo.sv`). Measured at 1 group x 4 tiles x 4 cores:
+15 contenders issued **74,624 amoswaps during a single critical section**, one every 2.3 cycles,
+swamping the bank and starving the holder's own accesses. The holder kept the lock for **172,208
+cycles** and the test never finished — past 227M cycles, against 125,833 for the entire test on the
+synchronous path.
+
+**The protocol was never broken**, which is why this took so long to pin down: acquire, release and
+handoff were all correct, with a contender picking the lock up two cycles after each release
+(`old=0x0` at 15385, immediately after core 4's release at 15383). Both of my earlier framings were
+wrong and are corrected here: it is not a deadlock (time advances, cores make progress) and not
+"the holder never releases" (releases are visible at cycles 9595, 15383, 187593 with operand 0x0 —
+`spin_unlock` is `amoswap.w zero, zero`).
+
+**Fix.** `structural_occupancy` holds the lane for the whole window in real simulated time —
+arrivals park, and a ClockEvent releases them when the window expires — instead of stamping it. The
+tile enables it exactly when the cache is asynchronous (`inline_sync_miss` False), so the calibrated
+synchronous path keeps the stamp it was tuned against and cannot be perturbed.
+
+**Results.** async spin-lock **99,546 cycles** (was: no completion past 227M). No regression:
+- v1 cachepool 16-core exact on all four reference kernels: 49,001 / 225,001 / 154,001 / 76,628.
+- v3 async 1 group: fdotp_M8192 44,143 (was 44,055, +0.2%), load-store_M16 163,824 (was 164,129,
+  -0.2%), byte-enable 496,382 unchanged.
+
+**Tooling note.** The shim's debug budget was a fixed `static int n = 400`, unlike the rxbar/xbar
+budgets. That made the shim look like it had gone silent after cycle 3886 when it had merely stopped
+printing, and I briefly concluded from it that the release never reached the shim. `INSITU_AMO_DEBUG=N`
+is now the line count, and the RMW trace carries the initiator.
+
+**#34 (calibration) is now the clear next item, with a concrete first task**: decide, per component,
+whether it models delay structurally (real simulated time) or by stamp, and make the async path
+consistent. Today the async path is a mixture — the cache core's latency emerges from its per-cycle
+FSM, the AMO lane now blocks for real, but anything still stamping is silently ignored, and the
+requester zeroes what it receives. Until that is settled, no v3 async cycle count means anything,
+including the ones in this entry.
+
 ## 2026-08-11 07:2x +0200 — v3-P1 DONE: fdotp completes on the mesh; 6/6 kernels at the target 4x4
 
 **Commits:** core `db9e2ab6` "insitu: route off-group L1 traffic through a tunnel instead of the
