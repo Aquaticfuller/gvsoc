@@ -215,7 +215,7 @@ Maintain a **dated structure map** — `prompt/insitu_cache_structure_map_<YYYY-
 hierarchical tree of the InSitu cache (Cluster→Group→Tile→per-core cache→internals) with every node
 **badged by GVSoC model status** (✓ implemented+calibrated / ≈ approximated / ✗ not yet modeled →Phase
 / N/A out of scope), plus a status table. The latest one is
-`prompt/insitu_cache_structure_map_2026-08-11.md`.
+`prompt/insitu_cache_structure_map_2026-08-11b.md`.
 
 **Whenever the model's structure changes** (a Phase item lands, a new mechanism is modeled, a topology
 refactor, etc.), **write a NEW dated structure map** reflecting the change — do **not** overwrite the
