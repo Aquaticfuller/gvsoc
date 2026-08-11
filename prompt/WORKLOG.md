@@ -6,6 +6,56 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 10:0x +0200 — #34 step 2: the AMO window is absolute; async now within ~2.5% on 3 of 4 kernels
+
+**Commit:** core `21603980` "insitu: make the structural AMO window absolute, not additive"
+
+**The residual, explained.** Structural occupancy held the lane for `total` cycles AFTER the RMW's
+sub-operations finished, with total derived from their stamped latencies plus `rmw_write_rtt_cycles`.
+On the async path that double-charges: the sub-read and sub-write already spend real simulated time
+there — roughly 10 cycles each once `resp_latency_cycles` is calibrated — so an RMW cost about 28
+cycles against the RTL's 15-20, and spin-lock over-predicted by 19.8%.
+
+**Fix.** The window is now ABSOLUTE, measured from RMW accept: released at
+`rmw_start + amo_rmw_window_cycles`, or immediately if the sub-operations already ran past it. That is
+what `core_ready = 0` describes in `spatz_cache_amo.sv` — a span from accept, not a tail after the
+write-back. No stamp on this path either; the requester lived through the RMW in real time.
+
+**Sweep vs the calibrated synchronous path (spin-lock 125,833):**
+
+| window | cycles | delta |
+|---|---|---|
+| 15 | 122,674 | -2.5% |
+| 18 | 122,674 | -2.5% |
+| 20 | 128,181 | +1.9% |
+
+15 and 18 give the same answer because the window **does not bind** there: the RMW's emergent
+structural cost is already ~19 cycles, inside the RTL's stated 15-20 range on its own. That is a good
+sign for the model, so the default stays 18 — the cost stays emergent rather than fitted to the
+reference. `INSITU_AMO_WINDOW` sweeps it.
+
+**Async vs the calibrated synchronous path** (1 group x 4 tiles x 4 cores), after steps 1 and 2:
+
+| kernel | async | sync | delta | at session start |
+|---|---|---|---|---|
+| fdotp_M8192 | 47,464 | 47,196 | **+0.6%** | -6.5% |
+| byte-enable | 530,895 | 526,512 | **+0.8%** | -5.7% |
+| spin-lock | 122,674 | 125,833 | **-2.5%** | no completion |
+| load-store_M16 | 177,199 | 195,734 | -9.5% | -16.3% |
+
+v1 cachepool 16-core remains exact throughout: spin-lock 76,628, fdotp_M32768 49,001.
+
+**Open, in priority order:**
+1. **load-store -9.5%** — the only kernel still meaningfully off. It is partition/flush heavy, so the
+   flush path's cost (`flush_base_cycles` + per-dirty-line eviction) is the first thing to look at; on
+   the async path a flush's writebacks are issued inline while everything else is structural.
+2. **Hit vs miss cannot be separated by one constant.** The RTL's cold miss is MemLatency + 17; we
+   reach about +11. A miss-side term is the next refinement.
+3. **Dead stamps**: the xbar's `xbar_latency_cycles` and the remote xbar's `hop_latency_cycles` are
+   still stamped and therefore discarded on the async path. Convert to structural delay or delete.
+4. The reference is still the synchronous path, itself only partly RTL-calibrated (v1's load-store was
+   +52% vs RTL). No RTL numbers exist for the v3 topologies.
+
 ## 2026-08-11 09:2x +0200 — #34 step 1: the async path's per-access latency is measured and calibrated
 
 **Commits:** core `d11cf08f` "insitu: measure and calibrate the async path's per-access latency" ·
