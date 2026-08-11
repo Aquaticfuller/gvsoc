@@ -6,6 +6,54 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 13:5x +0200 — P3 COMPLETE: group L2 I$ + instruction strict priority
+
+**Commits:** core `5fe51029` "insitu: config knobs for the group L2 instruction cache" ·
+pulp `1f853c2` "cachepool v3: group L2 instruction cache + instruction priority (P3 complete)"
+
+**What landed.** The L1 I$ refill now leaves each tile on its own port instead of riding the tile AXI.
+The group aggregates the four of them round-robin through a 4->1 `InsituCacheRefillMux` into a
+**group-level L2 instruction cache** (`Cache`, the same model `Hierarchical_cache` already uses for the
+L1 I$; 8 KiB / 4-way / 64 B line by default), and that cache's refill is **input 16** of the wide mux
+with `nb_priority_inputs=1` — instruction refills win over all 16 bank ports, as specified. P3 is now
+complete: 4->1 icache demux, group L2 I$, and the 17->1 refill mux with instruction strict priority,
+data round-robin, and a requester id.
+
+**The instruction path measurably does its job.** On fdotp_M8192 the four tiles send **599** L1 I$
+refills into the group, of which only **106** miss the L2 I$ and continue to memory — an **82% hit
+rate**. Those 493 absorbed refills no longer make a 50-cycle trip to memory, which is the whole
+speedup. Verified by A/B (`CACHEPOOL_V3_L2_ICACHE`): 47,808 with the old tile-AXI path, 31,736 with the
+L2 I$. I checked this rather than assuming, because a 33% gain from adding a structure is exactly the
+shape of a discarded cost — this time it is a real cache doing real work.
+
+**Results** (1 group x 4 tiles x 4 cores, all data-correct):
+
+| kernel | P3 data half | P3 complete |
+|---|---|---|
+| fdotp_M8192 | 47,808 | **31,736** |
+| byte-enable | 531,214 | **257,573** |
+| load-store_M16 | 180,209 | **159,432** (7/7 partition + flush) |
+| spin-lock | 122,970 | **73,712** |
+| cache-test-vector | 1,970,712 | 1,976,488 (compute-bound — unchanged, as expected) |
+
+v1 cachepool 16-core untouched: load-store_M16 154,001, byte-enable 225,001.
+
+**Caveat, and it is a big one for anyone quoting these numbers.** The L2 I$ is structurally right but
+**not calibrated**: instantiated with `refill_latency=0`, its hit cost is whatever `cache.cpp` models,
+and the geometry (8 KiB, 4-way) is a placeholder until there is an RTL reference for the group
+instruction cache. The 4->1 mux does serialize instruction refills at one per cycle, but the L2 I$
+itself models no port contention. So the direction of every number above is right — an L2 I$ removes
+fetch misses — while the magnitude is not anchored. `CACHEPOOL_V3_L2_ICACHE=0` restores the previous
+path for A/B.
+
+Note also that this invalidates the #34 calibration deltas: those were measured against the
+synchronous path with instruction refills going to memory. The async-vs-sync comparison has to be
+redone now that both paths would have an L2 I$ (the flag is on the shared cache config, so the
+synchronous path gets it too).
+
+**Next:** **P4** — the L2 refill mesh and the memory channels at the perimeter. The group's wide mux
+output is already the single point that P4 attaches to, which is what P3 was for.
+
 ## 2026-08-11 13:0x +0200 — P3 data half: group refill arbiter + per-bank wide egress
 
 **Commits:** core `21e38504` "insitu: group refill mux (v3-P3, data half) + per-bank wide egress" ·
