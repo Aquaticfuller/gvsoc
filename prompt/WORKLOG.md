@@ -6,6 +6,47 @@
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
 > file + `git log`, not from memory.
 
+## 2026-08-11 14:4x +0200 — P4 started: L2 refill mesh scaffolding in, traffic not flowing yet (default OFF)
+
+**Commit:** pulp `b658f2c` "cachepool v3: L2 refill mesh scaffolding (P4, WIP — default OFF, currently
+hangs)"
+
+**Honest status: P4 is NOT working.** The structure elaborates exactly as designed but traffic does not
+get through, so `CACHEPOOL_V3_L2_NOC` defaults to **0** and the working per-group flat path stays in
+use. Committed as scaffolding because the elaboration and the two findings below are worth keeping;
+P3's numbers are unchanged with it off (fdotp_M8192 31,736, load-store_M16 159,432).
+
+**What is built.** A second FlooNoc level, mesh = (nb_x+2) x (nb_y+2), groups on the interior nodes and
+**memory channels on the boundary ring minus its four corners** — 2*(nb_x+nb_y) attach points, exactly
+**16 for a 4x4 group grid**, one per outbound edge port as specified. Confirmed in elaboration at 2x2:
+channels at (1,0) (1,3) (2,0) (2,3) (0,1) (3,1) (0,2) (3,2), group NIs at the four interior nodes. Each
+channel has its own SoC-side router carrying the existing l2/pdcp/soc decode, so the mesh only has to
+pick a channel.
+
+The channel map interleaves across the **whole** address space (base = c*granule, size = granule,
+period = n_channels*granule, 256 B granule). Full coverage is not optional — FlooNoc drops an unmatched
+burst silently — and the 256 B granule keeps a 64 B line from straddling two channels. Unlike the L1
+mesh this static map is legitimately correct: DRAM channel interleaving is fixed hardware, not the
+runtime-programmable XBAR_OFFSET.
+
+**Two things learned wiring it:**
+1. `o_WIDE_MAP` had no `period` (only `o_NARROW_MAP` did). Added, additive with default 0.
+2. **Both mesh widths must be real.** FlooNoc puts only wide WRITE DATA on the wide plane; every
+   request/address — including a refill READ — rides the narrow "req" network
+   (`!is_write || !is_wide -> req_queue`, floonoc_network_interface.cpp:415). Setting `narrow_width=0`
+   because "this is the wide plane" starved every refill read on a zero-width queue. This is worth
+   remembering generally: the narrow plane is the address channel, not "the other traffic".
+
+**Where it stands.** With both widths real, a refill still never reaches the routers. The NI logs the
+burst arriving and finds its map entry (no "No entry found" error, so coverage is right), but no router
+logs a "Handle request", so it dies inside `enqueue_router_req`. The enqueue message there is
+LEVEL_TRACE, which plain `--trace` does not emit — the same blind spot that cost a wrong reading during
+the P1 debugging.
+
+**Next step:** a temporary print in `enqueue_router_req` after `get_entry`, or a check that the
+req-network router is actually assigned to each NI's `req_queue` at these nodes (`set_router(NW_REQ,
+...)`). Tracing further is not the move; the message that matters is below the emitted level.
+
 ## 2026-08-11 13:5x +0200 — P3 COMPLETE: group L2 I$ + instruction strict priority
 
 **Commits:** core `5fe51029` "insitu: config knobs for the group L2 instruction cache" ·
