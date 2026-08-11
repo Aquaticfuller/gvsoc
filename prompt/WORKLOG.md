@@ -37,15 +37,43 @@ runtime-programmable XBAR_OFFSET.
    because "this is the wide plane" starved every refill read on a zero-width queue. This is worth
    remembering generally: the narrow plane is the address channel, not "the other traffic".
 
-**Where it stands.** With both widths real, a refill still never reaches the routers. The NI logs the
-burst arriving and finds its map entry (no "No entry found" error, so coverage is right), but no router
-logs a "Handle request", so it dies inside `enqueue_router_req`. The enqueue message there is
-LEVEL_TRACE, which plain `--trace` does not emit — the same blind spot that cost a wrong reading during
-the P1 debugging.
+**RETRACTED — two claims in the first version of this entry were wrong:**
+- *"a refill never reaches the routers / dies inside `enqueue_router_req`"* — that came from a run whose
+  config I had regenerated **without** `--trace`, so the absence of router messages proved nothing. I
+  made the same mistake twice more in this round; the config must be regenerated WITH the trace flag
+  every time, and `rm -f gvsoc_config.json` before an untraced run silently discards it.
+- *"currently hangs"* — `rc=124` was my own 400 s timeout, not a stall.
 
-**Next step:** a temporary print in `enqueue_router_req` after `get_entry`, or a check that the
-req-network router is actually assigned to each NI's `req_queue` at these nodes (`set_router(NW_REQ,
-...)`). Tracing further is not the move; the message that matters is below the emitted level.
+**What is actually true: the round trip WORKS.** With tracing genuinely enabled, at 2x2 groups: the
+group NI (1,1) injects a wide read; `req_router_1_1` resolves dest (1,0) and forwards it (X-first, and
+the (2,2) case correctly steps to (1,2)); channel NI (1,0) receives it and sends it to its target; the
+read **response rides the WIDE plane** back (`wide_router_1_0` -> `wide_router_1_1`); the requesting NI
+logs "Received response from router" then "Finished burst". Successive refills flow — 0x1000,
+0x800034c0, 0x80003840 — with ~60-cycle round trips, and **216 write bursts** complete too, so
+evictions work as well.
+
+**But the run stalls at cycle ~21,105**, reproducibly: two runs with very different trace loads (heavy
+l2_noc vs light peripheral) both stop at 21,105 / 21,111, which rules out "just slow". fdotp needs
+31,736 cycles with the mesh off, so it dies about two thirds of the way in.
+
+**The stall signature.** At 21,087 a burst finishes normally at `ni_2_1`. At **21,105** `ni_2_2` logs
+"Received request from target (base: 0x80003e00)" and then **nothing** — no "Received wide burst from
+initiator", no "Handling addr burst". That is the DENIED branch of `NetworkInterface::handle_req`:
+
+```cpp
+if (*queue || nb_pending_bursts[is_wide] >= ni_outstanding_reqs) { denied_queue->push(req); return IO_REQ_DENIED; }
+```
+
+So the NI's pending-burst slot for that class is still occupied, the request goes on the denied queue,
+and nothing ever frees the slot to retry it. Since 216 writes and many reads did complete, the
+accounting works in general — something about this particular burst (or the state around it) leaves the
+per-class slot held.
+
+**Next step:** instrument the NI's per-class pending-burst slots and its denied-queue drain — which
+burst holds `narrow/wide_{read,write}_pending_burst` at 21,105, and why `handle_response` never clears
+it. Note this is one NI per group with ONE pending burst per class, so a group's whole refill stream is
+serialised through a single slot; if that is the intended bandwidth then the design wants several NIs
+per group, and if it is not, the slot is being leaked.
 
 ## 2026-08-11 13:5x +0200 — P3 COMPLETE: group L2 I$ + instruction strict priority
 
