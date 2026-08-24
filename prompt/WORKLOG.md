@@ -1,6 +1,102 @@
 # GVSoC InSitu-Cache Model — Development Log
 
 > Newest entries at top. Convention defined in `CLAUDE.md`
+
+---
+
+## 2026-08-25 ~00:30 +0200 — L2 refill mesh re-anchored to the multi-group RTL; RLC calibration round
+
+**Motivation.** User: "check the rtl design and the latest commits in `ManyRVData_rebase`, here we
+have the multi cluster rtl, and you can compare your model against it, and calibrate target on it."
+The RTL tree gained multi-group support (`044e768`), a 4×4/2×2 FlooNoc config pair, a NoC profiling
+TB with captured logs, and a 64-core RLC baseline — i.e. exactly the anchors that were previously
+listed as the calibration blocker.
+
+**RTL surveyed** (read-only): branch `dev/rlc-next` @ `2f51034`.
+`config/floonoc_cachepool_{4,16}g.yml`, `config/cachepool_{4g,fpu_16g}.mk`, `config/config.mk`,
+`hardware/src/cachepool_pkg.sv`, `hardware/src/cachepool_group_noc_wrapper.sv`,
+`hardware/tb/cachepool_noc_profiling.sv`, `hardware/deps/floo_noc/hw/floo_router.sv`,
+`noc_profiling/session_0/`, `reports/rlc_64core_baseline_2026-08-24/`,
+`reports/amo_lrsc_fix_2026-08-24/FINDINGS.md`.
+
+**Files touched (pulp):**
+- `pulp/cachepool_v3/cachepool_v3_cluster.py` — L2 mesh rebuilt; `l2_channel_granule` 256 → 1024.
+- `pulp/cachepool_v3/cachepool_v3_system.py` — `l2_size` 0x0100_0000 → 0x2000_0000.
+
+**Files added (parent):**
+- `prompt/rtl_multigroup_comparison_2026-08-25.md` — full comparison + calibration report.
+- `prompt/insitu_cache_structure_map_2026-08-25.md` — new dated structure map.
+
+**What / why.**
+1. **L2 refill mesh was structurally wrong.** The model built a `(nb_x+2)×(nb_y+2)` grid with the
+   groups on the interior and `2*(nb_x+nb_y)` = **16** channels around the whole perimeter. The RTL
+   builds an `nb_x×nb_y` grid with the group on each node's **Eject** port, and **8** channels
+   hanging off the *unused mesh direction* of the edge routers — West of column x=0 (hbm0-3), East
+   of column x=max (hbm4-7). North of row 0 / South of row max are tied off. Now modelled as NIs
+   with **no router of their own** one column outside the group grid: `floonoc.cpp`'s
+   `get_router_neighbour()` returns the NI directly when the neighbour node has no router, so a
+   channel costs **zero** extra hops — exactly like RTL's `floo_tcdm_chimney`. (Same pattern as
+   `pulp/pulp/chips/magia/soc.py`.)
+2. **Channel granule 256 B → 1024 B.** RTL `cachepool_pkg.sv::getDramCTRLInfo` decodes
+   `addr[ConstantBits+ScrambleBits-1 : ConstantBits]` with
+   `ConstantBits = clog2(L2BankBeWidth * Interleave) = clog2(64*16) = 10` → the channel is
+   `addr[12:10]`. `scrambleAddr()` afterwards makes each channel's view contiguous — a pure address
+   rewrite with no timing consequence, so the model keeps the flat address.
+3. **DRAM 16 MiB → 512 MiB** (`dram_addr 0x8000_0000` / `dram_len 0x2000_0000` from `config.mk`).
+   The old 16 MiB window made the ELF loader **reject the RLC binaries outright** (working set at
+   0x9900_0000): `Received error during copy (addr: 0x99000000 ...)`. This is what unblocked the
+   whole calibration comparison.
+
+**Verification.**
+- Generated `gvsoc_config.json` at 4×4 groups dumped and checked: `dim 6 × 4`, **16 routers**
+  (group nodes only), 24 NIs (16 groups + 8 channels), 8 mappings, `chan0..3` at x=0 y=0..3 and
+  `chan4..7` at x=5, `base=c*0x400 size=0x400 period=0x2000` — i.e. exactly `addr[12:10]`.
+- **Per-hop latency measured from the RTL profiling logs** (format decoded from
+  `cachepool_noc_profiling.sv`; packets matched by `(addr, write, src_id)`): router **transit**
+  min = p50 = **2 cycles** across three independent router/direction pairs; router-output →
+  neighbour-input = **0 cycles** (links are combinational). **The model's 2 cyc/hop and
+  `router_input_queue_size=2` are confirmed correct against RTL**, not assumed.
+- L1 per-controller geometry confirmed identical to RTL (4-way × 256 entry/way × 64 B = 64 KiB,
+  `BankFactor=2`, 4 ctrl/tile = 256 KiB/tile).
+
+**Calibration — RLC `M1_N1350_K100`, 64 cores, 4 active cores, same binary both engines:**
+
+| | RTL | model (default) | model @ `resp_lat=0` |
+|---|---|---|---|
+| fast pair | 150,175 / 150,183 | 213,587 / 214,306 | 149,248 / 149,678 |
+| slow pair | 150,175 / 150,215 | 267,201 / 271,136 | 195,098 / 195,370 |
+| mean | 150,187 | **+60.8 %** | +14.8 % |
+| core spread | **40** | 57,549 | 46,122 |
+
+Ruled out as causes: the **L2 mesh** (mesh on vs off = 0.8 % on this kernel) and the **AMO lane**
+(`INSITU_AMO_WINDOW` 0/4/8/18 → *bit-identical* results). The dominant lever is
+`resp_latency_cycles`: ≈ **8,100 cycles of runtime per cycle of the constant** on this
+latency-bound pointer-chasing kernel, and at 0 the fast pair matches RTL to **0.6 %**.
+
+**Deliberately NOT changed:** `resp_latency_cycles` stays at 8. It is what makes the *isolated* hit
+latency come out at the RTL-measured 10 cycles, so lowering it would trade one RTL anchor for
+another. The two results together diagnose a **structural** bug: the 8 cycles are additive with
+time the closed-loop path already spends (plausibly once per cache core traversed, so a remote
+access pays it more than once). The fix is to make it a **floor on total served latency** rather
+than a tail addend at `insitu_cache_core.cpp:888`. That is now the top open item.
+
+**Second, independent defect found:** a clean **2-2 core asymmetry** (~46 k cycles) that survives
+every `resp_lat` value, where RTL's four cores agree to within 40 cycles. Excluded: the tile
+crossbar (`insitu_cache_xbar.cpp`, a pure combinational router with no arbitration) and the
+cache core's stage-0 arbiter (arrival-order FIFO). Suspect: the bounded accept queue (`in_q_cap_`)
+and `admission_stall_q_` re-admission order.
+
+**Not a regression, but noted:** `fdotp_M32768` fails its internal data check at 256 cores — and
+fails identically on the **pre-change** build (stashed + rebuilt to confirm: `Calc 613.09` before
+vs `635.41` after, `Exp 628.15`). The CachePoolTests binaries in the RTL tree were rebuilt
+2026-08-24, so previously recorded passing numbers were measured against *different binaries* and
+should not be trusted as a baseline until re-established.
+
+**Follow-ups:** `prompt/rtl_multigroup_comparison_2026-08-25.md` §6 — the `resp_latency_cycles`
+floor fix, the 2-2 asymmetry, the L1 NoC instance count (RTL runs
+`NumTilesPerGroup × NumNoCPortsPerTile` parallel meshes + a per-tile 5→x concentration xbar; the
+model runs 5), and the `NumLGPortCore` / `NumRemoteGroupPortCore` split (RTL 4g: lg=4, rg=1).
+
 > §"Development log (for weekly reports)". Append on every meaningful
 > change and **always** when committing (any submodule or the parent).
 > Weekly reports (`prompt/weekly_report_<date>.md`) are assembled from this
