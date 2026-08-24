@@ -4,6 +4,63 @@
 
 ---
 
+## 2026-08-25 ~01:15 +0200 — RLC AM downlink bring-up on GVSoC (cross-session, RTL agent) + agreed TTI convention
+
+**Context.** The RTL-side session (`ManyRVData_rebase`, branch `dev/rlc-next`) asked this session to
+bring up its new RLC **AM downlink** path on GVSoC, because GVSoC iterates ~1000x faster than their
+RTL sim. Their tree stayed read-only from here — they rebuilt their own software; nothing was
+written into `ManyRVData_rebase` by this session.
+
+**AGREED TTI CONVENTION (use this wording verbatim on both sides so it does not drift):**
+
+> One TTI = one grant opportunity per entity. Primary metric is **bytes/cycle**:
+> `(grant_bytes * grants) / kernel_cycles`. Optional wallclock-flavoured figure uses
+> **TTI = 5,000 cycles**, a 1:100 scaling of 500 us at 1 GHz.
+
+Rationale: bytes/cycle removes the ~1000x sim-speed gap from the comparison entirely and neither
+side needs a TTI loop to produce a comparable number. Defining the TTI in microseconds would force
+one side to burn 500k cycles per data point for no extra information.
+
+**Results (64 cores = 2x2 groups x 4 tiles x 4 cores, matching their `cachepool_fpu_4g`).**
+
+Round 1 — all three AM targets ran and terminated but reported `grants=0 pdus=0 segments=0`, so
+both of the kernel's self-check lines ("plan vector-vs-reference ... PASS", "transport-block check
+... PASS") were **vacuous**. Reported as such rather than as green; they confirmed that was the
+right call and it stopped them building on a false positive.
+
+Round 2 — with their counters + a stack fix (640 -> 128 B frame) in:
+
+| target | plan_calls | peek_empty | peek_max | plan_zero | grants | tosend |
+|---|---|---|---|---|---|---|
+| C2_G8192 | 1 | 0 | 2 | 0 | 0 | 101 |
+| C4_G1024 | 1 | 0 | 2 | 0 | 0 | 101 |
+| C4_G8192 | 10 | 9 | 1 | 0 | 0 | 101 |
+
+This falls through **all three** of their diagnostic branches (not dispatch — `plan_calls>0` and both
+consumer cores printed; not producers — `peek_empty=0`, queue had SDUs; not the planner refusing —
+`plan_zero=0`). So the break is between "plan returned non-zero" and "grant opened". Flagged two
+leads: `peek_max=2` against `tosend=101` (i.e. `list_peek_n` under-reads a 101-deep queue by ~50x),
+and `plan_calls=1` with 101 still queued (i.e. `rlc_am_idle()` goes true before any grant opens).
+Their stack fix did not change the outcome, so it is crossed off.
+
+**Anchor protection (our side).** Their rebuild also regenerated the legacy `_M1_N1350_K100`
+binary that this session's calibration anchor is measured against. Re-ran it: **149,248 / 149,678 /
+195,098 / 195,370 — bit-identical to the pre-rebuild run**, so the 2026-08-25 02:10 calibration
+result (fast pair within 0.6 % of RTL) is unaffected. Worth repeating this check whenever they
+rebuild, given that the 2026-08-24 rebuild is what silently invalidated the older fdotp baselines.
+
+**Caveat passed to them:** our 2-2 core asymmetry (~149k vs ~195k where their RTL's four cores agree
+within 40 cycles) means GVSoC AM cycle numbers are indicative only, and core-to-core spread from
+this model must not be read as real until that defect is closed.
+
+**Also learned from them:** the `_P2_C4` targets set `CONSUMER_CORE_NUM=4` while the data header's
+consumer list still has only 2 entries, and dispatch follows the list — so C2 and C4 currently run
+the *same* core count. No genuine C=1-vs-C>1 contrast exists yet, which is why a concurrency bug
+still cannot be separated from a planner/copy bug.
+
+
+---
+
 ## 2026-08-25 ~02:10 +0200 — calibration boundary correction: resp_latency_cycles 8 -> 0 (RLC +60.8 % -> +14.8 %)
 
 **Motivation.** Follow-up to the 00:30 entry: close the +60.8 % gap against the RTL's own 64-core
