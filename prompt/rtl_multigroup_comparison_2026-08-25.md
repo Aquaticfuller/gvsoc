@@ -165,6 +165,8 @@ The kernel is almost purely latency-bound (a dependent pointer-chasing chain): e
 `resp_latency_cycles` costs ≈ 8,100 cycles of runtime. At `resp_lat = 0` the **fast pair matches
 the RTL to within 0.6 %** (149,248 / 149,678 vs 150,175 / 150,215).
 
+**RESOLVED — see §4b.** What follows was the initial reading; the floor experiment refuted it.
+
 This exposes a real tension rather than a knob to retune. `resp_latency_cycles = 8` exists
 because it makes the **isolated** hit latency come out at 10 cycles, which is the RTL-measured
 value; setting it to 0 would trade that anchor away. The two facts together say the 8 cycles are
@@ -175,6 +177,53 @@ the total served latency, not an addend at the pipeline tail** (`insitu_cache_co
 `resp_done_cyc_.push_back(now + resp_latency_cycles_)`) — not a change of the constant. Left
 unchanged in this round: changing the default without the structural fix would break the
 isolated calibration that is itself RTL-anchored.
+
+### §4b. Resolution: the constant was calibrated at the wrong boundary
+
+The hypothesis above — that the 8 cycles are double-counted *inside* the cache core — was
+implemented and **tested, and it is wrong**. `hit_latency_floor` (new, `insitu_cache_core.cpp`)
+reformulates the constant as a floor measured from the request's arrival, so any time already
+spent queueing in `in_q_`, in stage-0/stage-1, on bank conflicts or on MSHR waits counts toward
+it instead of being added to it. If the core were the double-counting site, the floor would have
+collapsed the gap. It did not:
+
+| formulation | fast pair | slow pair |
+|---|---|---|
+| addend 8 (old default) | 213,587 / 214,306 | 267,201 / 271,136 |
+| floor 7 | 192,160 / 192,823 | 243,406 / 246,083 |
+| **floor 10** | **215,331 / 215,623** | 269,350 / 273,344 |
+| floor 14 | 247,711 / 248,765 | 308,429 / 313,128 |
+
+Floor 10 ≈ addend 8. So the core's own occupancy between arrival and completion is small, and the
+constant really is being added on top of time spent **elsewhere on the path**.
+
+That identifies the actual error: **the RTL's 10-cycle warm read-hit is what the CORE observes end
+to end, but the model's matching 10 was measured at the cache core's internal boundary.** The
+model still spends its own real time in the tile crossbar, the AMO shim and the remote crossbar on
+the way in and out — roughly 8 cycles, which is exactly what `resp_latency_cycles` was adding a
+second time. The earlier "HIT min = 10, exactly the RTL reference" calibration compared the wrong
+two quantities.
+
+**Action taken:** `resp_latency_cycles` default 8 → **0** for cachepool_v3. Result on the RLC
+anchor:
+
+| | RTL | before | after |
+|---|---|---|---|
+| fast pair | 150,175 / 150,183 | 213,587 / 214,306 | **149,248 / 149,678** |
+| slow pair | 150,175 / 150,215 | 267,201 / 271,136 | 195,098 / 195,370 |
+| mean vs RTL | — | **+60.8 %** | **+14.8 %** |
+
+The fast pair now sits within **0.6 %** of the RTL. `miss_extra_cycles` stays at 5: it was fitted
+on top of a term that has now moved, and it still lands right — in-core miss ≈ ML+8, plus the same
+~8 cycles of interconnect ≈ ML+16 against the RTL's ML+17 = 67.
+
+`hit_latency_floor` is kept (default 0 = off). It is the more faithful formulation of what a
+latency *reference* means and costs nothing when disabled, but it is not the fix and should not be
+enabled without re-fitting.
+
+Regression: `cache-line-rw-smoke` PASS on both v1 and v3, `byte-enable` 14/14 PASS on v3. v1 is
+unaffected by construction — it runs the synchronous path, where `resp_latency_cycles` was already
+0, and `hit_ready_cyc()` reduces to the previous expression when the floor is disabled.
 
 ### The second, independent defect: a 2-2 core asymmetry
 
@@ -208,18 +257,19 @@ New RTL knobs the model does not mirror: `l1d_use_folded`, `l1d_fold_way_group`,
 
 ## 6. Open items, in priority order
 
-1. **Make `resp_latency_cycles` a floor on total served latency instead of a tail addend.** This
-   is the single highest-value calibration fix: it is worth up to +46 % on the RLC kernel and it
-   is what reconciles the isolated hit = 10 anchor with the closed-loop result.
-2. **The 2-2 core asymmetry** (~46 k cycles, independent of `resp_lat`). Prime suspect: the
+1. **DONE** — `resp_latency_cycles` 8 → 0 (boundary correction, §4b): RLC mean +60.8 % → +14.8 %,
+   fast pair within 0.6 % of RTL.
+2. **The remaining +14.8 %** is now dominated by the 2-2 core asymmetry below; the fast pair is
+   already at parity, so closing the asymmetry would bring the mean close to RTL.
+3. **The 2-2 core asymmetry** (~46 k cycles, independent of `resp_lat`). Prime suspect: the
    bounded accept queue / admission-stall re-admission order in `insitu_cache_core.cpp`.
-3. **L1 NoC instance count** — RTL runs `NumTilesPerGroup × NumNoCPortsPerTile` parallel meshes
+4. **L1 NoC instance count** — RTL runs `NumTilesPerGroup × NumNoCPortsPerTile` parallel meshes
    with a 5→x concentration xbar per tile; the model runs 5 meshes, one per port class.
-4. **`NumLGPortCore` vs `NumRemoteGroupPortCore`** — the model collapses both into one
+5. **`NumLGPortCore` vs `NumRemoteGroupPortCore`** — the model collapses both into one
    `num_remote_port_core`. RTL 4g uses lg=4 / rg=1; 16g uses lg=2 / rg=1.
-5. **`fdotp_M32768` fails its internal check at 256 cores** — and fails identically on the
+6. **`fdotp_M32768` fails its internal check at 256 cores** — and fails identically on the
    pre-change build (`Calc 613.09` before, `635.41` after, `Exp 628.15`), so this is **not** a
    regression from this round. The CachePoolTests binaries in the RTL tree were rebuilt
    2026-08-24, so previously recorded passing numbers were measured against different binaries
    and should not be trusted as a baseline until re-established.
-6. Per-channel DRAM storage / DRAMSys timing — still one shared backing store.
+7. Per-channel DRAM storage / DRAMSys timing — still one shared backing store.

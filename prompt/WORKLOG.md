@@ -4,6 +4,66 @@
 
 ---
 
+## 2026-08-25 ~02:10 +0200 — calibration boundary correction: resp_latency_cycles 8 -> 0 (RLC +60.8 % -> +14.8 %)
+
+**Motivation.** Follow-up to the 00:30 entry: close the +60.8 % gap against the RTL's own 64-core
+RLC baseline, which the sweep had shown was dominated by `resp_latency_cycles`.
+
+**Files touched:**
+- core: `models/cache/insitu/insitu_cache_core.{cpp,py}`, `models/cache/insitu/insitu_cache_config.py`
+  — new `hit_latency_floor` knob (default 0 = off) + `hit_ready_cyc()`.
+- pulp: `pulp/cachepool_v3/cachepool_v3_system.py` — `resp_latency_cycles` 8 -> 0.
+- parent: `prompt/rtl_multigroup_comparison_2026-08-25.md` §4b.
+
+**Hypothesis tested and REJECTED.** The first theory was that the 8 cycles were double-counted
+*inside* the cache core — added at the pipeline tail on top of time already spent queueing in
+`in_q_`/stage-0/stage-1/bank conflicts/MSHR. Implemented `hit_latency_floor`: eligibility becomes
+`max(now, accept_cyc + floor)` instead of `now + addend`, so prior queueing counts toward the
+target rather than adding to it. If the core were the double-counting site this collapses the gap.
+It did not — floor=10 gave 215,331/215,623 vs addend=8's 213,587/214,306 (floor 7 -> 192 k,
+floor 14 -> 248 k). The core's own arrival-to-completion occupancy is therefore small.
+
+**Actual root cause.** The RTL's 10-cycle warm read-hit is what the **core observes end to end**;
+the model's matching 10 was measured at the **cache core's internal boundary**. The model still
+spends its own real time in the tile crossbar, AMO shim and remote crossbar on the way in and out
+(~8 cycles) — exactly what `resp_latency_cycles` was adding a second time. The earlier
+"HIT min = 10, exactly the RTL reference" fit compared the wrong two quantities.
+
+**Change.** `cfg.controller.resp_latency_cycles` 8 -> 0 for cachepool_v3. `miss_extra_cycles` stays
+at 5 and still lands right: in-core miss ~ML+8 plus the same ~8 of interconnect ~= ML+16 against
+the RTL's ML+17 = 67.
+
+**Verification** (RLC `M1_N1350_K100`, 64 cores, same binary both engines):
+
+| | RTL | before | after |
+|---|---|---|---|
+| fast pair | 150,175 / 150,183 | 213,587 / 214,306 | **149,248 / 149,678** |
+| slow pair | 150,175 / 150,215 | 267,201 / 271,136 | 195,098 / 195,370 |
+| mean vs RTL | — | +60.8 % | **+14.8 %** |
+
+Fast pair now within **0.6 %** of RTL. Regression: `cache-line-rw-smoke` PASS on v1 and v3,
+`byte-enable` 14/14 PASS on v3. **v1 is unaffected by construction** — it runs the synchronous path
+where `resp_latency_cycles` was already 0, and `hit_ready_cyc()` reduces to the old expression when
+the floor is disabled (default).
+
+`hit_latency_floor` is kept at 0. It is the more faithful formulation of what a latency reference
+means and is free when off, but it is not the fix and needs re-fitting before being enabled.
+
+**Open.** The residual +14.8 % is now dominated by the 2-2 core asymmetry (cores 0,1 ~149 k vs
+cores 2,3 ~195 k, where RTL's four agree to within 40 cycles). The fast pair is already at parity,
+so closing the asymmetry would bring the mean close to RTL. Suspect: bounded accept queue
+(`in_q_cap_`) / `admission_stall_q_` re-admission order.
+
+**Harness note.** These kernels do not reach `stop()` in this harness, so the core's own
+`[INSITU-CORE] served_lat_avg / HIT min / MISS min` report could not be captured this round — the
+boundary conclusion rests on the end-to-end RLC anchor and the floor A/B, not on a fresh in-core
+measurement. Stale `gvsoc_launcher` processes accumulate from such runs; kill with
+`pkill -x gvsoc_launcher` (NOT `pkill -f "gvsoc_launcher --config"`, which matches the calling
+shell's own command line).
+
+
+---
+
 ## 2026-08-25 ~00:30 +0200 — L2 refill mesh re-anchored to the multi-group RTL; RLC calibration round
 
 **Motivation.** User: "check the rtl design and the latest commits in `ManyRVData_rebase`, here we
