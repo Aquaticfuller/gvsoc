@@ -4,6 +4,57 @@
 
 ---
 
+## 2026-08-25 ~01:55 +0200 — MODEL GAP FOUND: the RVV integer-compare family is missing from our timed ISA
+
+**How it surfaced.** Bringing up the RTL session's new RLC AM downlink on GVSoC (see the ~01:15
+entry). Their vector planner reported `plan_ok=0` *and* `plan_zero=0` with `plan_calls>0`, which
+brackets the failure inside `rlc_plan_compute` — they suspected an infinite loop in their RVV code.
+It is not their bug.
+
+**Root cause — ours.** An instruction trace on the stuck core
+(`/cachepool_v3_soc/cachepool_v3_cluster/group_0_0/tile_0/pe2`) shows it is not spinning in the
+planner at all: it **traps** and lands in snRuntime's default handler `__snrt_isr` at `0x80004ec0`,
+which is `jal 0, 0` — a deliberate infinite self-loop. GVSoC's own decoder trace names the cause:
+
+```
+pc: 0x80000ba0  Got opcode (opcode: 0x7a82c057)
+Unknown instruction
+Executing illegal instruction
+Raising exception (id: 2)          <- mcause 2, Illegal Instruction
+```
+
+Their disassembly maps `0x80000ba0` to **`vmsgtu.vx v0, v8, t0`**.
+
+**Scope of the gap.** `core/models/cpu/iss/isa_gen/isa_rvv_timed.py` (the Spatz/Ara timed path)
+defines 238 vector instructions and the **entire vector integer compare family is absent**:
+`vmseq`, `vmsne`, `vmsltu`, `vmslt`, `vmsleu`, `vmsle`, `vmsgtu`, `vmsgt`. The mask-logical ops
+appear to be missing as well. Present and working: `vmin/vmax/vmul/vmacc/vmadd`, `vmerge.vvm`,
+`vmv.*`, and the full reduction set including `vredminu.vs`. So the missing piece is specifically
+**the compare that produces a mask into v0** — every other instruction in their idiom exists.
+
+**Consequences worth remembering.** Any RVV kernel using a masked-compare idiom currently dies with
+an illegal instruction on this model, and because snRuntime's default ISR is a silent spin loop,
+**it presents as a hang, not as a fault**. That is a very expensive failure mode to debug from the
+outside: the RTL session spent two rounds hypothesising infinite loops, `vsetvli` returning 0, and
+a stack overflow before the trace settled it. If a kernel ever "hangs" on this model, check
+`pe*/decoder` for `Unknown instruction` before anything else.
+
+**Method note (reusable).** The `gvsoc` wrapper swallows trace output; `install/bin/gvsoc_launcher
+--config=gvsoc_config.json` does not. `grep -a -B 60 -m 1 "<handler symbol>"` on the launcher's
+stdout gives the pre-trap instruction window cheaply, and the `pe*/decoder` + `pe*/exception`
+trace channels carry the cause code directly — no need to instrument the ISR to read `mcause`.
+
+**Status.** Reported to the RTL session with instructions to stop work on the planner and to check
+whether Spatz's *RTL* decoder accepts `vmsgtu.vx` (if it does not, they have a genuine kernel
+problem the host test cannot catch, since that compiles the C twins). **Not fixed** — adding
+instructions to the simulator's ISA is a scope decision for the user, raised and pending.
+
+**Unaffected:** this is orthogonal to the cache calibration work; no cachepool_v3 kernel in our own
+suite uses the compare family.
+
+
+---
+
 ## 2026-08-25 ~01:15 +0200 — RLC AM downlink bring-up on GVSoC (cross-session, RTL agent) + agreed TTI convention
 
 **Context.** The RTL-side session (`ManyRVData_rebase`, branch `dev/rlc-next`) asked this session to
