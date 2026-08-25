@@ -4,6 +4,73 @@
 
 ---
 
+## 2026-08-25 ~06:40 +0200 — PROCESS FAILURE: we ran 64-core binaries at 4/8/16 cores for hours
+
+**`snrt_cluster_core_num()` is baked into the ELF.** Every CachePoolTests binary is built for
+`config=cachepool_fpu_4g` = **64 cores**. Running one on a 4-, 8- or 16-core model does not give a
+4/8/16-core run — the software still believes it has 64 and partitions work accordingly. Only the
+cores that exist then execute, so the machine computes a **fraction** of the workload, correctly.
+
+**The tell was printed on every single run and neither of us read it.** fdotp's own geometry line is
+identical at every config:
+
+```
+lmul:8, elem:128, offs:8192, iter:4
+```
+
+`elem_jump_per_round = elem_per_round * num_cores`, so 8192/128 = **num_cores = 64** in runs where
+4 and 16 cores existed.
+
+**What it invalidates — the visibility bug's density curve.** `cache-basic` partitions by
+`lines_per_core = ceil(256/num_cores)` = 4, so with N cores only 4N of 256 lines are ever checked.
+Every error count was divided by 8192 as though all were:
+
+| cores | errors | lines actually checked | REAL density | previously reported |
+|---|---|---|---|---|
+| 4 | 247 | 16 | **48.2 %** | 3.0 % |
+| 8 | 701 | 32 | **68.5 %** | 8.6 % |
+| 16 | 1718 | 64 | **83.9 %** | 21.0 % |
+| 64 | 3894 | 256 | 47.5 % | 47.5 % |
+
+Only the 64-core figure was ever right — the one config where the binary's assumption matched the
+machine. **There is no low-density corner.** The "clean corner" technique, the standing rule struck
+at 05:00 (for a different and also correct reason), and the RTL session's probability model all
+rested on a curve that does not exist.
+
+**What it does NOT invalidate:**
+- The **visibility bug is still real** — `cache-basic` fails at 48 % density at the *correct* 64-core
+  config while `cache-stress` passes.
+- The **layout experiment** and the **M8/M48 contrast** both compared the same binaries at the same
+  config, so they were internally consistent and stand.
+- The **RLC/AM work**, which was always run at 64 cores.
+
+**And it dissolves most of the fdotp "failure".** Coverage is N/64:
+
+| cores | predicted coverage | observed Calc / 209.38 |
+|---|---|---|
+| 4 | 6.25 % | 19 % |
+| 16 | 25 % | **26 %** |
+| 64 | 100 % | 77 % |
+
+The 16-core match settles it: fdotp at 4 and 16 cores was **our misuse**, not a defect. Only the
+64-core point (77 %) is a real residue, and fdotp's check is separately unpassable by construction
+(`fp_check(result[0], dotp_result * measure_iter)` where the loop does not accumulate across
+iterations — verified independently by the RTL session; a one-line bug in their test).
+
+**Also established by direct trace, refuting a plausible hypothesis:** watching the `result[]` line
+(`0x800037c8`, all four entries in one 64 B line) showed the reduction is **arithmetically perfect** —
+core 0's own partial 27.818 + result[1..3] (-87.505, -8.694, 108.705) = **40.3239**, exactly the
+reported Calc. All accesses went to a single bank (`ctrl_3`), so routing is correct and cross-core
+reads of `result[]` are working. The RTL session's "stale `result[]` reads" hypothesis is refuted.
+
+**Rule to carry: verify the manipulated variable actually moved.** We varied core count for hours
+and never checked whether the software noticed. Concretely for this repo: **the CachePoolTests
+binaries are 64-core builds; do not run them at other core counts** unless rebuilt for that config,
+and check the kernel's own geometry print before trusting any core-count sweep.
+
+
+---
+
 ## 2026-08-25 ~06:05 +0200 — RESOLUTION: layout inert (ladder is not ours); RTL confirms the truncation bug WAS ours
 
 **Two symmetric results closed the "whose bug" question in both directions.**
@@ -161,7 +228,8 @@ for shared data. It is not. Those are **two different defects**:
 
 - `XLINE` counts **cross-line truncation** (02:20 entry). Zero events means that bug did not fire.
 - The **shared-data visibility bug** (03:30 entry) is a separate defect with its own density curve:
-  **3 % at 4 cores / 1 tile**, 21 % at 16, 95 % at 64. Three per cent is not zero.
+  ~~**3 % at 4 cores / 1 tile**, 21 % at 16, 95 % at 64~~ **— THESE NUMBERS ARE WRONG, see the 06:40
+  entry.** The real densities are 48 / 69 / 84 / 48 %; there is no low-density corner at all.
 
 So a 4-core run is a *lower-density* corner, never a clean one, and `XLINE: 0` says nothing about it.
 Every shared-data conclusion I drew from "clean corner" runs inherits a ~3 % corruption floor.
