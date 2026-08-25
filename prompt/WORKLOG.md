@@ -42,7 +42,17 @@ rested on a curve that does not exist.
   config while `cache-stress` passes.
 - The **layout experiment** and the **M8/M48 contrast** both compared the same binaries at the same
   config, so they were internally consistent and stand.
-- The **RLC/AM work**, which was always run at 64 cores.
+- The **RLC/AM work** — but **NOT for the reason first written here.** The original claim ("always run
+  at 64 cores") was false: the entity ladder, the TC2 runs and both layout arms were all run at
+  **4 cores**. They survive for a different and better reason, verified by grepping the kernel:
+  **the RLC kernel never calls `snrt_cluster_core_num()`.** Its only topology calls are
+  `snrt_cluster_core_idx()` (a core's own id) and `snrt_cluster_core_per_tile()` (for `l1d_part` and
+  the cross-tile guard, and 4 cores/tile in every config we ran). Dispatch is by the data header's
+  **literal** `producer_core_ids = {0,1}` / `consumer_core_ids = {2,3}` arrays, so cores 0-3 take
+  exactly their assigned roles and cores 4-63 were never assigned anything. Nothing is partitioned by
+  the baked count — structurally unlike `cache-basic` (`lines_per_core = ceil(256/num_cores)`) and
+  `fdotp` (`elem_jump_per_round = elem_per_round * num_cores`), which both silently under-cover.
+  That the runs terminated also shows `snrt_cluster_hw_barrier()` does not consult the baked count.
 
 **And it dissolves most of the fdotp "failure".** Coverage is N/64:
 
