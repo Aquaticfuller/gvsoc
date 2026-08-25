@@ -4,6 +4,54 @@
 
 ---
 
+## 2026-08-25 ~07:40 +0200 — RETRACTED: our fmatmul numbers are for a program that cannot run on the target
+
+**Scalar floating point does not execute on CachePool RTL at all.** The RTL session ran
+`fmatmul-32b_M1024_N64_K64` and got **64 illegal-instruction traps** at `flw ft3, 0(a7)` — one per
+core, every core wedged in snRuntime's unhandled-exception `while(1)`. At `M32_N32_K32`: **8 traps,
+8 active cores**. The count tracks `active_cores = min(num_cores, M/kernel_size)` exactly, so it is
+not size-dependent, not a boundary case and not a race — **every core traps on the first scalar FP
+instruction it reaches**.
+
+Cross-checked against the binaries that DO pass on RTL (`bandwidth`, the RLC payload check, legacy
+TC1): **zero `flw`, zero `fsw`, zero scalar `fadd`/`fmul` in all three.** Nothing else either of us
+has run this session contains a single scalar FP instruction, which is why this never surfaced.
+
+**Consequence for us: our `fmatmul` numbers are deleted, not caveated.** 86,610 / 69,084 were cycle
+counts for a program that cannot execute on the hardware being modelled. Struck in the 02:45 entry.
+
+**Two hypotheses raised and both refuted — worth recording because both were plausible:**
+1. *"Our ISS ignores `mstatus.FS`"* — **false.** `core/models/cpu/iss/include/isa/rvf.hpp` raises
+   `ISS_EXCEPT_ILLEGAL` when `mstatus.fs == 0`, and the `CONFIG_GVSOC_ISS_NO_MSTATUS_FS` opt-out is
+   defined only for `magia`, `magia_v2`, `siracusa` and `pulp_cores` — **not** the snitch/spatz/
+   cachepool path. Our check is live; under the same architectural state we raise the same exception.
+2. *"Their runtime leaves `mstatus.FS` Off"* — **false**, refuted by them from `snitch.sv:2829`:
+   Snitch computes `mstatus` on read and hardwires `mstatus.fs = XDirty` whenever `FP_EN`. There is
+   no stored FS bit for software to leave Off.
+
+**So the divergence is real but its mechanism is still open on their side.** `cachepool_cc.sv:64`
+declares `parameter bit RVF = 1` and `:136` `FPEn = RVF | RVD | XF16 | XF8`, and the generated config
+says `isa: "rv32imafd"` — so the hardware is *described* as supporting scalar FP while rejecting it.
+Note `cachepool_tile.sv:1484` passes `.RVF(RVF)` with **no `RVF` declared in that file**, so the value
+comes from an import; that is where the inconsistency will be.
+
+**Deliberately NOT changing our model yet.** The obvious "fix" — disable scalar FP in our Snitch to
+match — would be **matching a bug** if their configuration is simply inconsistent. Until they
+establish which behaviour is intended, our model stays as-is and the fmatmul numbers stay deleted.
+
+**Calibration cost:** `fmatmul` was the L1-resident cross-check that would have tested whether the
+`bandwidth` 14.2x lives entirely in the refill path. No fmatmul number is available from RTL at any
+shape. Substituting `byte-enable` + `cache-line-rw-smoke` — both all-shared and L1-resident — which
+answer the same question far more cheaply.
+
+**Value returned the other way:** `fmatmul-32b_M1024_N32_K32` is in *their* CI list
+(`util/auto-benchmark/configs.sh`), so either CI runs a config where scalar FP works or CI has been
+failing on it. Second real bug this session surfaced by our engine running something theirs cannot —
+the first was `vmsgtu.vx`.
+
+
+---
+
 ## 2026-08-25 ~07:10 +0200 — FIRST 64-CORE RTL CALIBRATION: `bandwidth` is 14.2x slow; MLP-of-1 is the primary but NOT the only cause
 
 **The RTL reference batch finally ran** (escalated after five deferrals). First and highest-priority
@@ -461,7 +509,7 @@ and it invalidates the naive reading of "run at 64 cores":
 |---|---|---|
 | `fmatmul-32b_M64_N64_K64` | **16** | 15,571 first / 10,355 steady |
 | `fmatmul-32b_M128_N128_K128` | **32** | 65,260 / 55,939 |
-| `fmatmul-32b_M1024_N64_K64` | **64** | 86,610 / 69,084 |
+| `fmatmul-32b_M1024_N64_K64` | **64** | ~~86,610 / 69,084~~ **RETRACTED, see 07:40** |
 | `cache-vector-rw` | **1** | 5,854 |
 | `bandwidth` | (random-load, 64 iters x 64 elems) | 29,122 total, 455/load |
 
