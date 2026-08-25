@@ -4,6 +4,49 @@
 
 ---
 
+## 2026-08-25 ~05:20 +0200 — technique: our own instrumentation is an independent channel when the model's shared-data path is untrustworthy
+
+**Problem.** The 05:00 entry established that GVSoC cannot answer cross-core shared-data questions at
+any configuration while the visibility bug is open. That appeared to disqualify the engine from the
+RLC investigation entirely, since every kernel counter is cross-core shared data.
+
+**It does not, and the reason generalises.** Counters *inside our model* — the XLINE truncation
+counters added at 02:20 — are per-cache-instance, incremented in C++, and **never read across cores
+by the kernel**. They are on the other side of the interface from the bug, so they are trustworthy
+even when everything the kernel reports is not.
+
+**Worked example.** Two runs of the RTL session's controlled pair at 4 cores:
+
+| target | entities | kernel says | XLINE |
+|---|---|---|---|
+| `M8_N1350_K24_tbchk` | 8 | grants=4, sweeps completed | **63** |
+| `M48_N1350_K24_tbchk` | 48 | grants=0, no sweep completed | **0** |
+
+A grant means a payload copy; a payload copy means unaligned accesses; unaligned accesses truncate.
+So **`XLINE: 0` confirms `grants=0` through a channel with no dependence on the corrupted reads** —
+and `XLINE: 63` confirms the contrary for the control. The kernel's own `grants` counter is
+untrustworthy here; the conclusion is not.
+
+Combined with a second bug-independent fact — the run *terminated normally* rather than being killed,
+which our harness observes directly — this yielded a solid conclusion from an engine that cannot be
+trusted about the kernel's own state: **the consumers exited without ever opening a grant**, i.e. a
+premature exit rather than a hang or slowness. That was a third possibility outside the two branches
+the RTL session had posed, and it redirected them from the sweep/gather path to the idle predicate.
+
+**Rule worth keeping.** When the model's data path is known-unreliable for a class of question, look
+for a *model-internal* counter whose value is implied by the answer. It is not a weaker substitute
+for a kernel counter — it is measured on the opposite side of the failing interface, which can make
+it stronger. Also holds in reverse: it is why the earlier `tbchk` payload verdict had to be
+discarded (231 XLINE events) while its *grant-progress* integers stayed readable.
+
+**Also recorded:** a `.s` listing next to each ELF, plus an immutable frozen-ELF directory with an
+md5 manifest, is what makes "what exactly did I run" answerable. A previous result was destroyed
+because the binary was rebuilt between the run and the verification; `md5sum -c` before a run costs
+nothing and removes the whole class of problem.
+
+
+---
+
 ## 2026-08-25 ~05:00 +0200 — CORRECTION: there is no "clean corner" for the visibility bug
 
 **Supersedes the "generalisable rule" in the 04:40 entry, which was wrong and has been struck there.**
