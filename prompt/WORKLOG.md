@@ -4,6 +4,53 @@
 
 ---
 
+## 2026-08-25 ~06:05 +0200 — RESOLUTION: layout inert (ladder is not ours); RTL confirms the truncation bug WAS ours
+
+**Two symmetric results closed the "whose bug" question in both directions.**
+
+**1. The RLC ladder is NOT our bug — the 05:45 entry's hypothesis is disproven.** A two-armed layout
+experiment on the RTL session's frozen binaries, 4 cores:
+
+| rung | baseline | +320 B shift | stride 124 -> 128 |
+|---|---|---|---|
+| M16 (failing) | grants=0 | grants=0 | grants=0 |
+| M32 (passing) | grants=3 | grants=3 | grants=3 |
+
+**A failing rung fails regardless of layout; a passing rung passes regardless of layout.** Our
+visibility bug is address-dependent, so if it were driving the ladder, perturbing every address
+would have moved at least one rung. It moved neither. The non-monotonicity (pass at 8/12/32, fail at
+16/24/48) is a real property of their kernel.
+
+I proposed that hypothesis, asked for the arm that could falsify it, and it did. Worth noting the
+first arm alone would NOT have settled it: testing only whether a *failing* config can be rescued
+does not test the claim that a *passing* config's success is fragile. Both arms were needed.
+
+Also narrowed for them from their own descriptor histogram: **M16 and M32 have identical package
+parity splits (14 even / 10 odd) and opposite outcomes**, which rules out work distribution too.
+
+**2. RTL confirms the payload corruption WAS ours.** Their `M1_N1350_K4_..._tbchk` completed on
+hardware: 1 grant, 4 PDUs, header fields + transport-block offsets + SN continuity + segment
+continuity + **byte-exact payload**, 0 mismatches, `tosend=0 sent=4`, `[EOC] retval = 0`.
+
+So `rlc_memcpy8` is correct, the unaligned `e8/m8` base works on Spatz's VLSU, and **our
+`verify_mask=0x80` payload failures were the cross-line truncation bug in full** — 231 XLINE events
+writing the answer, as the `align_ok=0x0` signature indicated. That call was made before the
+evidence existed and is now confirmed by an engine that does not share the defect.
+
+**Net position on our two defects after the night:**
+- **Cross-line truncation** — confirmed by an independent engine to be real and to have corrupted a
+  correctness verdict. Still unfixed (splitting a straddling access is an FSM change); now loud.
+- **Cross-core visibility** — still unfixed, still disqualifies shared-data questions, but its blast
+  radius is now *bounded*: it did not cause the RLC ladder. That is worth knowing, because the 05:45
+  entry assumed the opposite.
+
+**Caveat carried forward for them (not ours):** their RTL PASS has `segments=0` — four 1360 B SDUs
+fit one 8192 B grant, so SI=FIRST/MIDDLE/LAST, the SO field, the partial-SDU cursor and cross-grant
+`so_next` chaining were never exercised. The payload question is answered; segmentation is not.
+
+
+---
+
 ## 2026-08-25 ~05:45 +0200 — the RLC "entity count" result is probably our own bug; label axes by what they PHYSICALLY change
 
 **Two sweeps, and the second broke the conclusion the first suggested.**
@@ -54,6 +101,10 @@ entire ladder says nothing about their kernel.
 **Bearing on our priorities.** If the padding test comes back "layout", then a substantial part of
 this investigation was chasing an artefact of the visibility bug — which is further argument that
 fixing it is the highest-value work available, not a nice-to-have.
+
+> **RESOLVED 06:05 — it did NOT come back "layout". This entry's hypothesis is disproven; see the
+> 06:05 entry.** Layout is inert in both directions and the RLC ladder is a real property of the
+> RTL-side kernel, not our corruption.
 
 
 ---
