@@ -4,6 +4,48 @@
 
 ---
 
+## 2026-08-25 ~05:00 +0200 — CORRECTION: there is no "clean corner" for the visibility bug
+
+**Supersedes the "generalisable rule" in the 04:40 entry, which was wrong and has been struck there.**
+
+**The error.** I treated `XLINE: 0` on a 4-core / 1-tile run as evidence that the run was trustworthy
+for shared data. It is not. Those are **two different defects**:
+
+- `XLINE` counts **cross-line truncation** (02:20 entry). Zero events means that bug did not fire.
+- The **shared-data visibility bug** (03:30 entry) is a separate defect with its own density curve:
+  **3 % at 4 cores / 1 tile**, 21 % at 16, 95 % at 64. Three per cent is not zero.
+
+So a 4-core run is a *lower-density* corner, never a clean one, and `XLINE: 0` says nothing about it.
+Every shared-data conclusion I drew from "clean corner" runs inherits a ~3 % corruption floor.
+
+**Second error, pointed out by the RTL session and worth recording as a general trap:
+a deterministic simulator corrupts deterministically.** I read a byte-identical result across two
+builds as evidence the code path had not changed. Two identical traces are equally consistent with
+"nothing changed" and with "the same corruption happened twice" — **identity does not discriminate**
+in a deterministic engine with a known corruption. Compounding it, the binary I tested (mtime
+04:27:33) had already been replaced by 04:37:21 by the time I went to verify its contents, so what
+it actually contained is now unknowable.
+
+**The decisive argument, from the RTL side.** The TC2 counters are self-contradictory with the report
+having been printed at all: `rlc_am_report()` only runs after a 64-core barrier, which consumers only
+reach by exiting a loop gated on `rlc_am_idle()` (every queue empty), and `rlc_am_sweeps` increments
+before that return. So any printed report implies `completed_sweeps >= 1`, `last_entity = 47`,
+`tosend = 0`. We observed `0`, `26`, and `2..10`. **No value of any kernel variable makes those
+consistent** — it requires the cross-core reads themselves to be unreliable, which is exactly our bug.
+
+**Consequence: TC2 cannot be diagnosed on this engine at all** until the visibility bug is fixed, at
+any core count. Not "with caveats" — the instrument cannot produce a trustworthy reading of
+cross-core state. Stopped spending runs on it; the RTL `M48_N1350_K24` control is the path.
+
+**Corrected rule.** While the visibility bug is open, GVSoC cannot answer questions about
+**cross-core shared data** at any configuration. `XLINE: 0` clears truncation only. Per-core-private
+data (e.g. `cache-stress`, which passes at every scale) remains sound, and so does anything read
+from a single core's own writes. That is the real envelope, and it is narrower than what the 04:40
+entry claimed.
+
+
+---
+
 ## 2026-08-25 ~04:40 +0200 — technique: use the low-density corner to separate our bug from someone else's
 
 **Situation.** The RTL session correctly challenged a finding I had relayed from a 64-core run,
@@ -24,9 +66,12 @@ coherent shape their argument predicted trustworthy data would have — and the 
 **survived, 7 for 7**: every attempted entity returned an empty peek against a `tosend` of 2-10. A
 3 %-density corruption cannot zero out seven of seven uniformly.
 
-**Generalisable rule while the visibility bug is open:** any GVSoC result about shared data is only
+**Generalisable rule while the visibility bug is open:** ~~any GVSoC result about shared data is only
 trustworthy if it either (a) comes from a low-core-count config with `XLINE: 0` confirmed on that
-run, or (b) survives being re-run there. Do not relay 64-core shared-data observations as findings.
+run, or (b) survives being re-run there.~~ **WRONG — SUPERSEDED, see the 05:00 entry.** This
+conflated two different defects: `XLINE: 0` clears the *truncation* bug only. The shared-data
+visibility bug is still at ~3 % density at 4 cores / 1 tile, so there is no config that is clean for
+it. Do not relay shared-data observations as findings at any core count.
 
 **Also established (for the RTL session, their side):** `M8_N1350_K24` works — grants open and sweeps
 complete — at *both* 4 and 64 cores, while `M48_N800_K300` wedges at both. Same code, same
