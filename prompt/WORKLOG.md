@@ -4,6 +4,38 @@
 
 ---
 
+## 2026-08-25 ~04:40 +0200 — technique: use the low-density corner to separate our bug from someone else's
+
+**Situation.** The RTL session correctly challenged a finding I had relayed from a 64-core run,
+pointing out that the counters I was reading (`rlc_am_ent[]`, list heads) live in `.data` at
+0x8000_xxxx — **below the l1d_addr boundary, therefore shared** — i.e. exactly the class corrupted by
+the cross-core visibility bug (03:30 entry). Their control-flow argument was sound: `u0` reporting
+`plan_calls=1` while `u30`/`u32` reported 0 could not be explained by any single value of the gate
+between them, which is the signature of *partial visibility* rather than a real kernel state.
+
+**Technique that resolved it.** The visibility bug's error density is strongly config-dependent —
+3 % at 4 cores / 1 tile, 95 % at 64 cores. So **re-run the same binary in the low-density corner and
+check whether the finding survives.** Confirm the corner is genuinely clean first (`XLINE: 0` on the
+run, per the 03:30 counters), then read the result.
+
+Outcome: the 64-core dump was indeed contaminated (their challenge was right, and I withdrew it),
+but at 4 cores the counters were **self-consistent** — a contiguous attempted prefix, exactly the
+coherent shape their argument predicted trustworthy data would have — and the underlying finding
+**survived, 7 for 7**: every attempted entity returned an empty peek against a `tosend` of 2-10. A
+3 %-density corruption cannot zero out seven of seven uniformly.
+
+**Generalisable rule while the visibility bug is open:** any GVSoC result about shared data is only
+trustworthy if it either (a) comes from a low-core-count config with `XLINE: 0` confirmed on that
+run, or (b) survives being re-run there. Do not relay 64-core shared-data observations as findings.
+
+**Also established (for the RTL session, their side):** `M8_N1350_K24` works — grants open and sweeps
+complete — at *both* 4 and 64 cores, while `M48_N800_K300` wedges at both. Same code, same
+producers/consumers. So their TC2 failure is a function of **entity count**, between 8 and 48, and
+is not the AM path, not ownership, and not our simulator.
+
+
+---
+
 ## 2026-08-25 ~03:30 +0200 — cross-core shared-data visibility is broken, and it is NOT a v3 regression
 
 **What.** `cache-test-scalar` / `cache-test-vector` fail on GVSoC with mismatch counts that escalate
