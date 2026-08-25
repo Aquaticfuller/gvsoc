@@ -4,6 +4,70 @@
 
 ---
 
+## 2026-08-25 ~03:30 +0200 — cross-core shared-data visibility is broken, and it is NOT a v3 regression
+
+**What.** `cache-test-scalar` / `cache-test-vector` fail on GVSoC with mismatch counts that escalate
+with machine size. The test is a pure cross-core write-visibility check: core 0 writes 256 lines,
+barrier, every core reads back its own slice.
+
+**The test is entitled to the coherence it assumes** — verified from both sides:
+- `basic_buf` is at `0x80003f40`, i.e. cacheable shared DRAM, **below** the `L1D_ADDR` private
+  boundary (0xA000_0000);
+- neither test calls `l1d_part`, `l1d_xbar_config` or `l1d_addr`, so the reset configuration applies;
+- `cachepool_peripheral_reg.hjson`: `L1D_PRIVATE resval = 0` → **zero private banks, all shared**
+  (confirmed independently by the RTL session).
+
+In that configuration there is exactly one home bank per address cluster-wide and cross-core
+visibility is architecturally guaranteed. So this is a **model defect**.
+
+**Scale (deterministic — 247 reproduced exactly on a repeat run):**
+
+| config | mismatches | checks | density |
+|---|---|---|---|
+| 4 cores, 1 tile | 247 | 8192 | 3 % |
+| 8 cores, 2 tiles | 701 | 8192 | 8.6 % |
+| 16 cores, 4 tiles | 1,718 | 8192 | 21 % |
+| 64 cores | 3,894 | 4096 | **95 %** |
+
+`cache-stress` PASSes at every scale. Stress is per-core data; basic is shared. **The failure is
+specific to shared data.**
+
+**Elimination chain — five hypotheses tested, all refuted:**
+
+| hypothesis | test | result |
+|---|---|---|
+| cross-line truncation | uncapped XLINE counter | **0 events** → not it |
+| per-bank storage corruption | `INSITU_SHADOW=1` (per-bank last-written vs served) | **0 mismatches** while the test reported 247 in the same run → banks are internally consistent |
+| address→home routing | `BANKS_PER_TILE` = 1 / 2 / 4 | **identical 247** every time; with one bank there is no routing at all → not it |
+| async completion path | `CACHEPOOL_V3_SYNC_CACHE=1` | 240 vs 247 (4c), 1492 vs 1718 (16c) → marginal, not the cause |
+| a v3 regression | **v1 (`cachepool`) at 16 cores** | **v1 fails too: 1,266 mismatches** → predates v3 entirely |
+
+**The v1 result is the important one.** This is not something today's work introduced, not the L2
+mesh re-anchoring, and not the async conversion. It is present in the long-standing *calibrated*
+model, which means **the model has never been validated for cross-core shared-data correctness** —
+every kernel in our own regression suite either uses per-core data or is small enough to stay in the
+3 %-density corner.
+
+**Retracted:** my earlier "address→home routing gives different homes depending on the requester"
+call. It was a reasonable read of the tile/group scaling, but the `BANKS_PER_TILE=1` result refutes
+it — `route_request()` takes an address-pure branch when `num_tiles == 1`, and the failure persists
+there unchanged.
+
+**Still open — what it actually is.** Remaining candidates, all shared by v1 and v3: the cluster-wide
+peripheral barrier's ordering semantics (does it release before prior stores are globally visible?),
+a per-core write buffer somewhere upstream of the shared bank, or the ISS store path. The
+core-count scaling fits a barrier/ordering story best; the bank-count invariance rules out anything
+in bank selection.
+
+**Bearing on the calibration.** The RLC anchor runs 4 cores on one tile — the 3 %-density corner —
+so the +14.8 % result is probably lightly affected rather than invalidated. But **no full-core GVSoC
+number involving shared data should be trusted until this is understood**, and the RTL session has
+been told so, including that the AM `verify_mask=0x80` payload diagnosis may be this rather than the
+truncation bug.
+
+
+---
+
 ## 2026-08-25 ~02:45 +0200 — full-core (64-core) survey: GVSoC side established, RTL anchor requested
 
 **Motivation.** User: "can you run more calibration with full cores in use?" — a fair challenge to the
