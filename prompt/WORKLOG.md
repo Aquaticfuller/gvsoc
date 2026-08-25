@@ -4,6 +4,67 @@
 
 ---
 
+## 2026-08-25 ~02:45 +0200 — full-core (64-core) survey: GVSoC side established, RTL anchor requested
+
+**Motivation.** User: "can you run more calibration with full cores in use?" — a fair challenge to the
++14.8 % RLC result, which activates only **4 of 64 cores** and is latency-bound pointer chasing.
+
+**Blocking fact: there is no current full-core RTL reference for anything.** The only current anchor
+is `reports/rlc_64core_baseline_2026-08-24` (4 active cores). The full-core reports under
+`ManyRVData_rebase/reports/` are May-2026, branch `zexin/sync-flush-fixes`, 16-core, and most tests
+timed out — useless against today's RTL (multi-group landed later, in `044e768`). **Requested a
+64-core batch on `config=cachepool_fpu_4g` from the RTL session; they agreed** and queued it behind
+their in-flight payload-correctness runs. So this round establishes the GVSoC side only.
+
+**Occupancy is a property of the PROBLEM SIZE, not the target.** This is the main practical finding
+and it invalidates the naive reading of "run at 64 cores":
+
+| kernel | active cores | GVSoC cycles |
+|---|---|---|
+| `fmatmul-32b_M64_N64_K64` | **16** | 15,571 first / 10,355 steady |
+| `fmatmul-32b_M128_N128_K128` | **32** | 65,260 / 55,939 |
+| `fmatmul-32b_M1024_N64_K64` | **64** | 86,610 / 69,084 |
+| `cache-vector-rw` | **1** | 5,854 |
+| `bandwidth` | (random-load, 64 iters x 64 elems) | 29,122 total, 455/load |
+
+So `fmatmul-32b_M1024_N64_K64` is the genuine full-occupancy compute kernel and is the one to
+calibrate against; the smaller fmatmul sizes silently use a quarter or half the machine.
+
+**`bandwidth` exists and works.** `insitu_cache_structure_map_2026-08-11b.md` records "a memory-bound
+workload at full scale is what would actually test channel bandwidth, and the kernel set does not
+contain one". That is **wrong** — `test-cachepool-bandwidth` is exactly that kernel (random-load,
+2%o utilisation, 455 cycles/load). It is now the top request in the RTL reference batch, because it
+is what would validate the re-anchored L2 refill mesh.
+
+**Failures at 64 cores (GVSoC), none of them the truncation bug:**
+
+| kernel | result |
+|---|---|
+| `cache-test-scalar` | **FAIL** — `cache-basic: 3894 mismatches`; `cache-stress` PASSes |
+| `cache-test-vector` | **FAIL** — `vcache-basic: 3824 mismatches`; `vcache-stress` PASSes |
+| `fdotp-32b_M32768` | **Check Failed** (also fails pre-change, see the 02:10 entry) |
+| `gemv_M256_N128_K32` | **ABORT**, exitcode -6 (SIGABRT) |
+| `byte-enable`, `cache-line-rw-smoke`, `cache-vector-rw` | PASS |
+
+The basic/stress split in both cache-test kernels is suggestive — the stress phase passes while the
+basic phase mismatches by ~3900 — but not investigated this round. Not attributable to a
+regression on our side either: the CachePoolTests binaries were rebuilt in the RTL tree on
+2026-08-24, so no trustworthy pre-rebuild baseline exists for these.
+
+**XLINE contamination check: 0 events on every kernel above.** So the cross-line truncation bug
+(02:20 entry) does **not** touch the standard suite — it is specific to unaligned multi-byte
+accesses such as the RLC AM payload copy. The cache-test failures are therefore a *separate*
+defect, not a symptom of it.
+
+**Cross-session.** Relayed TC2's `steps=1 completed_sweeps=0 last_entity=38/48` (both consumers
+wedged inside their first sweep, on entities they own) which ruled out their sweep-cost hypothesis;
+they then found a plan-buffer aliasing bug by inspection (`rlc_am_plan_pool` indexed by consumer,
+so 24 TC2 entities share one `rlc_plan_t`). They also corrected one of my data points: the wq
+build's `last_entity=0` was an uninstrumented counter, not an observation.
+
+
+---
+
 ## 2026-08-25 ~02:20 +0200 — DATA-CORRUPTION BUG FOUND: cross-line accesses are silently TRUNCATED
 
 **Severity: highest defect found so far.** Higher than either ISS gap, because it silently corrupts
