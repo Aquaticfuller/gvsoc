@@ -4,6 +4,60 @@
 
 ---
 
+## 2026-08-25 ~05:45 +0200 — the RLC "entity count" result is probably our own bug; label axes by what they PHYSICALLY change
+
+**Two sweeps, and the second broke the conclusion the first suggested.**
+
+Sweep 1 — same `M48` binary, varying core count (i.e. varying our visibility bug's density from ~3 %
+to ~95 %, holding layout fixed):
+
+| cores | grants | completed_sweeps | XLINE |
+|---|---|---|---|
+| 4 / 8 / 16 / 64 | 0 | 0 | 0 |
+
+Perfectly flat. Read at the time as "core count irrelevant, entity count everything".
+
+Sweep 2 — the entity ladder at 4 cores, six builds differing only in `ACTIVE_USER_NUMBER`:
+
+| M | 8 | 12 | 16 | 24 | 32 | 48 |
+|---|---|---|---|---|---|---|
+| grants | 4 | 5 | **0** | **0** | **3** | **0** |
+| XLINE | 63 | 63 | 0 | 0 | 60 | 0 |
+
+**Non-monotonic — M32 works while M16 and M24 fail.** Not a threshold, not accumulation, no rule in
+entity count at all. (`XLINE` tracks `grants` exactly at every rung, so the pattern is corroborated
+through the bug-independent channel; it is not a misread.)
+
+**The likely explanation is ours, not the kernel's.** What the ladder physically varies is not
+"entity count" but the **`.data` layout** — the RTL session measured it growing smoothly 21.5 →
+44.7 KB, so every rung places `rlc_ctx[]`, `rlc_am_ent[]` and the list heads at different addresses.
+Our visibility bug is deterministic **and address-dependent**. A deterministic address-sensitive
+corruption sampled at six layouts produces exactly this shape: arbitrary pass/fail with no rule in
+the nominal parameter. A kernel bug genuinely keyed on entity count should be monotonic or at least
+have a comprehensible rule.
+
+That also retro-weakens sweep 1: it held layout **fixed** and varied cores, so both sweeps are
+consistent with "outcome is determined by layout, and M is what changes layout" — a hypothesis
+neither sweep was built to test.
+
+**Lesson worth carrying: we labelled the axis by the parameter we varied rather than by what it
+physically changed, and those were not the same thing.** Three hypotheses have now died on this
+thread (gather cost, stale-read density, entity count); all three died to controlled contrasts
+rather than to better theories, and this one died because the "control" was not controlling what its
+name implied.
+
+**Discriminating experiment proposed to them:** two `M16` binaries differing only in `.data` layout
+(a few hundred bytes of padding ahead of `rlc_ctx[]`). Both fail → layout is not the variable and
+M16 has a real kernel problem. One passes → the outcome is layout-determined, it is our bug, and the
+entire ladder says nothing about their kernel.
+
+**Bearing on our priorities.** If the padding test comes back "layout", then a substantial part of
+this investigation was chasing an artefact of the visibility bug — which is further argument that
+fixing it is the highest-value work available, not a nice-to-have.
+
+
+---
+
 ## 2026-08-25 ~05:20 +0200 — technique: our own instrumentation is an independent channel when the model's shared-data path is untrustworthy
 
 **Problem.** The 05:00 entry established that GVSoC cannot answer cross-core shared-data questions at
