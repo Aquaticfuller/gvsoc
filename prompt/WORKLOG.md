@@ -4,6 +4,80 @@
 
 ---
 
+## 2026-08-25 ~02:20 +0200 — DATA-CORRUPTION BUG FOUND: cross-line accesses are silently TRUNCATED
+
+**Severity: highest defect found so far.** Higher than either ISS gap, because it silently corrupts
+data on ordinary unaligned accesses and reports success.
+
+**The bug.** `core/models/cache/insitu/insitu_cache_core.cpp::exchange_line_data()`:
+
+```c
+uint32_t off = req->get_addr() & (cache_line_bytes_ - 1);
+uint32_t n   = req->get_size();
+if (off + n > cache_line_bytes_) {
+    ... warn (first 12 only) ...
+    n = cache_line_bytes_ - off;      // TRUNCATE -- tail bytes silently DROPPED
+}
+```
+
+Any access straddling a 64 B line boundary loses its tail. On a **write** the tail never reaches the
+cache; on a **read** the requester's buffer keeps stale bytes. `IO_REQ_OK` is returned either way --
+there is no error, no retry, and no split into the second line.
+
+**It fires on real code.** The RTL session's RLC AM downlink kernel:
+
+```
+[XLINE] cross-line access addr=0x2c0003f size=4 off=63 (line=64) wr -> TRUNCATED
+```
+
+`off=63, size=4` -> `n = 64-63 = 1`: **three of every four bytes discarded**. 12 events shown, but
+**12 is the warning cap, not the count** -- there is no counter for the real total.
+
+**Why it went unseen for so long.** Three compounding reasons, all worth fixing independently:
+1. the warning is capped at 12 events and there is no aggregate counter;
+2. it goes to stderr, and the `gvsoc` wrapper **swallows stderr** -- only
+   `install/bin/gvsoc_launcher --config=...` shows it;
+3. no kernel in our own regression suite issues unaligned multi-byte accesses, so nothing we run
+   routinely triggers it.
+
+**Evidence it is the cause of the observed corruption** (RLC AM payload, `verify_mask=0x80`,
+headers all correct):
+- `first_diff_byte=13`, **not 0**. The RTL session's own discriminator: truncation predicts a
+  non-zero first difference at the distance to the next 64 B boundary; a broken unaligned vector
+  base would corrupt from byte 0.
+- `align_ok=0x3` and `align_bad=0xe` **overlap at destination offset 1** -- the same alignment both
+  passes and fails, which argues against a base-address bug and for "depends where this payload
+  crosses a line".
+- The scalar-byte-copy control (`_scpy`) emits **zero** XLINE events, exactly as predicted: a 1-byte
+  access can never satisfy `off + n > 64`.
+- Identical `verify_mask` across reference planner / scan-C / vectorised / C=1 -- i.e. independent
+  of everything except the shared store path.
+
+**NOT FIXED.** Splitting a straddling access into two line lookups (each of which may independently
+hit, miss, or be pending) is a real change to the core FSM, not a one-liner -- raised with the user
+as the top defect rather than done unilaterally. **Interim mitigation worth doing regardless:** make
+the truncation loud (uncapped counter, reported at `stop()`), since today it is both wrong and
+invisible.
+
+**Also found this round (model fidelity, opposite direction).** We implement `vmerge.vvm`; Spatz's
+RTL **decodes it and no lane executes it** -- verified independently in
+`hardware/deps/spatz/hw/ip/spatz/src/`: `spatz_simd_lane.sv`, `spatz_ipu.sv` and `spatz_vfu.sv`
+contain zero references to VMERGE, VMSEQ, VMSGTU, VMSLTU. The lane implements only VADD VAND VMACC
+VMADC VMADD VMAX VMAXU VMIN VMINU VMSBC VMUL VMULH VMULHSU VMULHU VOR VSLL VSRA VSRL VSUB VXOR.
+So a kernel using `vmerge.vvm` **passes on our simulator and silently corrupts on hardware** -- a
+false green. That is a worse class of defect than the missing compares (which fail loudly), and it
+is the ISS issue to raise first.
+
+**Cross-session status.** RLC AM now runs end to end on GVSoC once the kernel stopped emitting
+`vmsgtu.vx`: `grants=3 pdus=16 published=3 sent=3`, all header fields / SN / SO / continuity
+correct, payload-only failure. TC2 (`M48_N800_K300_P2_C2`) runs and terminates (1,275,150 cyc) but
+plans almost nothing -- `u47: plan_calls=0` with 48 entities and 2 real consumers, reported to them
+as a remaining owner-partition problem. TC2 `P4_C8` still running here; theirs timed out at 5400 s
+on RTL.
+
+
+---
+
 ## 2026-08-25 ~01:55 +0200 — MODEL GAP FOUND: the RVV integer-compare family is missing from our timed ISA
 
 **How it surfaced.** Bringing up the RTL session's new RLC AM downlink on GVSoC (see the ~01:15
