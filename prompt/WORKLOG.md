@@ -4,6 +4,60 @@
 
 ---
 
+## 2026-08-25 ~08:10 +0200 — 64-CORE CALIBRATION ANCHORED: the error is confined to the refill path (the sign flips)
+
+**First full-occupancy RTL-vs-model calibration, and the headline result of the session.** Both
+kernels at 64 cores on `cachepool_fpu_4g`, in-kernel stamps (not EOC, which includes a boot sequence
+that differs between engines):
+
+| kernel | character | RTL | GVSoC | GVSoC/RTL |
+|---|---|---|---|---|
+| `bandwidth` | memory-bound, **exercises the refill path** | 2,058 cyc (32/load) | 29,122 (455/load) | **14.2x SLOW** |
+| `byte-enable` | L1-resident, all-shared, **no refills** | 289,468 | 252,494 | **0.87x — 13 % FAST** |
+
+Plus the earlier RLC anchor (4 active cores, latency-bound, L1-resident after warm-up): mean
+**+14.8 %**, fast pair within **0.6 %**.
+
+**The sign flip is the result, not the ratios.** A uniformly-slow model cannot be 14.2x slow on one
+kernel and 13 % *fast* on another. So **there is no global constant to hunt**: the entire error is
+confined to the refill path, and the L1 / cache-pipeline / crossbar / ISS modelling is in decent
+shape. That is a much stronger conclusion than parity on both would have given, and it came from a
+single L1-resident kernel because the alternative hypothesis predicted 14x for it.
+
+**Search space, now supported rather than speculative** — all three are refill-path mechanisms:
+
+| cause | evidence | vs RTL |
+|---|---|---|
+| MLP = 1 per controller | `insitu_cache_core.cpp:1098` | `spatz_max_trans=32`, `snitch_max_trans=16`, `NumAxiMaxTrans=64` |
+| 4 channels -> 1 backing store | `cachepool_v3_system.py:264` | 4 independent DRAMSys HBM2 controllers |
+| flat 50-cycle latency | `memory.Memory(latency=50)` | HBM2 with row buffers + bank-level parallelism |
+
+**Falsifiable target for the fix**, from their measured counters and independent of which mechanisms
+sum to the gap: **335 AR transactions in 2,241 kernel cycles -> effective concurrency >= 7.5 at
+L=50** (a lower bound). If MLP and channels are fixed and 32 cycles/load is still out of reach,
+there is a fourth mechanism and this diagnosis was incomplete.
+
+**Recommended order (pending user authorisation):** (1) lift the MLP gate — bounded, the MSHR already
+tracks multiple pending lines, but **re-run the correctness suite, not just timing**: MLP=1 serialises
+refill *ordering*, so lifting it enables interleavings that have never executed here; (2) give each
+channel its own backing store — a configuration change worth ~4x on its own; (3) re-measure against
+the >= 7.5 concurrency target.
+
+**Secondary observation, low priority:** the 13 % optimism on `byte-enable` is a real but small
+separate question, and the first evidence we have that any part of the model runs *fast*.
+
+**Also delivered to the RTL side, and it grew:** their CI performance suite is **4 of 4 unrunnable**
+on its own target config — `fdotp_M65536` (109 scalar-FP instructions), `gemv_M1024_N128_K32` (101),
+`fmatmul_M1024_N32_K32` (162), `fft-32b_M1024_N16` (93), with `configs.sh` pinning
+`CONFIGS="cachepool_fpu_4g"`, the config they trap on. Root cause visible in the flavour file:
+`spatz_fpu_en` / `spatz_num_fpu` enable Spatz's **vector** FPU and nothing there enables the
+**scalar** Snitch FPU. So "fpu" in that config name means vector FP only, and the suite's headline
+kernels have never been compatible with the config CI runs them against. Third real bug this session
+surfaced by our engine running what theirs cannot (after `vmsgtu.vx` and the `fmatmul` trap).
+
+
+---
+
 ## 2026-08-25 ~07:40 +0200 — RETRACTED: our fmatmul numbers are for a program that cannot run on the target
 
 **Scalar floating point does not execute on CachePool RTL at all.** The RTL session ran
