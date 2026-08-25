@@ -4,6 +4,77 @@
 
 ---
 
+## 2026-08-25 ~07:10 +0200 — FIRST 64-CORE RTL CALIBRATION: `bandwidth` is 14.2x slow; MLP-of-1 is the primary but NOT the only cause
+
+**The RTL reference batch finally ran** (escalated after five deferrals). First and highest-priority
+kernel, `bandwidth`, on `cachepool_fpu_4g` = 64 cores, `l1d_part(4)` = **all private**:
+
+| | RTL | GVSoC | ratio |
+|---|---|---|---|
+| total cycles | 2,058 | 29,122 | **14.2x** |
+| cycles/load | 32 | 455 | **14.2x** |
+
+Provenance checked before comparing (the 06:40 lesson): two independent runs of ours, both launched
+at `2 2 4 4` = 64 cores, byte-identical output. Binary assumption and machine agree. The gap is real.
+
+**Primary mechanism — memory-level parallelism of 1.** `insitu_cache_core.cpp:1098`:
+
+```c
+// one refill issue per tick, single-outstanding: gate on refill_pending_ (async in flight),
+if (!refill_pending_ && !refill_spill_valid_ && refill_ready_cycle_ < 0 && !miss_fifo_.empty()) {
+```
+
+**Each cache controller allows exactly ONE outstanding refill.** The synchronous path does the same
+explicitly (`sync_refill_busy_until_ = resp_cycle + install_tail_cycles_`). That gate was calibrated
+against the standalone `insitu_cache_calib` testbench, whose responder is **deliberately serialising**
+— correct there, carried into the full 64-core system unchanged, where the RTL has
+`spatz_max_trans = 32` / `snitch_max_trans = 16` / `NumAxiMaxTrans = 64` and overlaps many refills.
+That is how RTL reaches **32 cycles/load, below a single DRAM latency**; our model cannot go below
+one memory latency per miss per controller by construction.
+
+**But MLP=1 is NOT the whole gap — corrected after doing the arithmetic.** With `_MEM_LATENCY = 50`:
+
+```
+MLP=1 at ML=50 predicts   ~65 cycles/load  (50 + ~15 pipeline)
+observed                   455 cycles/load
+unexplained residue        ~7x
+```
+
+So there are **at least two compounding mechanisms**: the MLP-of-1 gate, and roughly another 7x of
+downstream serialisation not yet identified — candidates are the 17->1 group refill mux (1 req/cycle)
+and the single shared `memory.Memory` backing store behind all channels. Initially reported to the
+RTL session as "found it, single mechanism"; that was an over-claim and was corrected.
+
+**Independent confirmation of the mechanism, from their measured counters:** the RTL run reports
+**335 AR transactions in 2,241 kernel cycles**. Serialised at latency L the kernel could not finish
+in under 335·L, so effective concurrency is **>= 7.5 at L=50** (a lower bound — it assumes zero hit
+time and no other overlap). No MLP-of-1 model can produce 32 cycles/load against 335 DRAM round
+trips, whatever the mesh does.
+
+**Second-order consequence, and it must not be conflated: the L2 refill mesh is UNTESTED, not
+validated.** With MLP capped at 1 there is at most one line in flight per controller, so the mesh has
+never carried concurrent traffic — no contention, no arbitration pressure, no queueing. Today's mesh
+A/B deltas (+4.4 %, +7.7 %) were measured through a path that serialises to one miss at a time.
+"The mesh looked fine" and "nothing ever loaded the mesh" are different statements.
+
+**Which of our numbers this inflates:** every miss-heavy result, including the async-vs-sync
+comparisons and the mesh A/B. **Least affected: the RLC calibration (+14.8 %)**, which is L1-resident
+after warm-up and latency-bound rather than throughput-bound. That RLC lands at +14.8 % while this
+lands at +1320 % is a consistency check on the diagnosis, not a coincidence.
+
+**Not purely a calibration fix — their point, and it is right.** An MLP of 1 also *serialises refill
+ordering*, so lifting the gate enables interleavings that have **never executed** on this model and
+can expose reordering / MSHR-merge bugs. The correctness suite must be re-run, not only the timing
+comparisons.
+
+**Recommended next work (pending user decision):** lift the MLP gate ahead of the visibility bug.
+The MSHR already tracks multiple pending lines (`miss_fifo_`, per-line `mshr_[]`), so the structure
+exists and the gate is an artificial limit on top of it — a bounded change on a lower-risk surface
+than address rotation / barrier ordering. Then re-measure `bandwidth` and hunt the residual ~7x.
+
+
+---
+
 ## 2026-08-25 ~06:40 +0200 — PROCESS FAILURE: we ran 64-core binaries at 4/8/16 cores for hours
 
 **`snrt_cluster_core_num()` is baked into the ELF.** Every CachePoolTests binary is built for
