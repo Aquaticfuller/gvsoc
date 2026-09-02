@@ -4,6 +4,59 @@
 
 ---
 
+## 2026-08-25 ~08:40 +0200 — EIGHT open GVSoC bugs filed upstream against our model (with root causes and fixes)
+
+**`github.com/pulp-platform/ManyRVData/issues` has 12 open issues and 8 of them are GVSoC bugs in
+our model**, filed by an external user (`jpf-h`) who has been running it. Each carries a diagnosed
+root cause and a proposed fix. We had not looked.
+
+| # | title | status in our tree |
+|---|---|---|
+| #43 | `vmv.v` tracks a wrong dependency on `v0` | **PRESENT** — `vmv.v.x` uses `Format_OPV`, `vmv.v.i` uses `Format_OPIVI`; no `Format_VMV_X`/`_I` |
+| #42 | strided/indexed vector loads execute with **unit stride** | **PRESENT — confirmed** |
+| #40 | AMO unit busy-time includes the requester's queueing time | not checked |
+| #39 | three 64-tile scale bugs (`and.cpp` 32-bit shift; `cache_sync` init; xbar requester-side fill) | not fully checked |
+| #38 | `LR.W` returns its value in the wrong register | not checked |
+| #37 | ISS HTIF pollers generate timed fabric traffic, saturating a cache bank at high core counts | not checked |
+| #36 | only one icache for all tiles (RTL has one per tile) | not checked |
+
+**#42 confirmed in source and it is the serious one.** `isa_rvv_timed.py` tags `vlse8/16/32/64.v`,
+`vsse*`, `vluxei*`, `vsuxei*`, `vloxei*`, `vsoxei*` all as plain `vload`/`vstore`. Meanwhile
+`spatz_vlsu.cpp:168-180` registers handlers for `vload_strided`, `vstore_strided`, `vload_indexed`,
+`vstore_indexed` — **tags that no instruction carries** (`grep -c` = 0, as is `vothers`). So the
+strided and indexed handlers exist and are never invoked, and **every strided/indexed vector memory
+op executes as unit-stride**: silent data corruption, no diagnostic.
+
+**Direct consequences for today's work:**
+
+1. **It plausibly explains the `fdotp` 64-core residue** (77 % of the single-iteration value, the one
+   part not accounted for by the `measure_iter` test bug or by our 64-core-binary misuse). fdotp is a
+   strided kernel.
+2. **It undermines the `byte-enable` calibration anchor delivered at 08:10.** That kernel's sub-tests
+   are exactly `vsse16.v` (strided) and `vsuxei16.v` (indexed). It reported `[PASS]` on our model —
+   which, if both the store and the verifying load degrade to unit-stride *consistently*, is a
+   **vacuous pass**: self-consistent and wrong. The 0.87x cycle ratio may therefore be measuring
+   different work than the RTL performed. The `bandwidth` 14.2x is unaffected (no strided ops), but
+   the **sign-flip argument now rests on a suspect second point** and must be re-established.
+3. **#39's second bug is the exact fatal we hit this session** — `cache_sync` uninitialised causing
+   "Trying to decrease zero stalled counter" at high core counts. We debugged that blind.
+4. **#37 (HTIF polling saturating a shared bank, scaling with core count)** is a timed-traffic source
+   we never accounted for, and is a candidate contributor to the hangs and shared-bank contention we
+   have been attributing elsewhere.
+5. **#36 (single icache for all tiles)** matters for any instruction-fetch-sensitive measurement at
+   64 tiles.
+
+**Assessment.** These change our priority ordering. Three of them (#42, #39, #37) touch results we
+produced today, and #42 in particular is a correctness bug of the same class as the cross-line
+truncation — silent, data-corrupting, and invisible to our own regression suite. They also come with
+fixes already worked out, which makes them cheap relative to the refill-path work.
+
+**Recommended order:** #42 first (correctness, cheap, invalidates measurements), then #39 and #37
+(both explain observed failures at scale), then the refill-path MLP/channel work, then #36/#38/#40/#43.
+
+
+---
+
 ## 2026-08-25 ~08:10 +0200 — 64-CORE CALIBRATION ANCHORED: the error is confined to the refill path (the sign flips)
 
 **First full-occupancy RTL-vs-model calibration, and the headline result of the session.** Both
