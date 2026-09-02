@@ -4,6 +4,65 @@
 
 ---
 
+## 2026-08-25 ~10:05 +0200 — #38 and #43 fixed; four upstream issues closed, all latent for our suite
+
+**#38 — `LR.W` returned its value in the wrong register.** `insitu_cache_amo_shim.cpp` forwarded LR
+downstream by rewriting it to a plain `READ` **without redirecting the data pointer**. The ISS
+convention (documented in our own file at the AMO write-back, lines 353-358) is `get_data()` = rs2
+input, `get_second_data()` = rd. A plain READ writes into `get_data()`, so the loaded value landed in
+the rs2 buffer and **rd was left stale** — LR.W returns whatever was in that register, and any
+lock/CAS retry loop succeeds or fails on garbage. Fixed with
+`if (req->get_second_data()) req->set_data(req->get_second_data());` before the forward.
+
+Notable: **the AMO path in the same file had already been fixed for exactly this**, with a comment
+explaining the convention. The LR path was simply missed. A fix applied to one branch and not its
+sibling is the kind of thing a reader assumes is deliberate.
+
+**#43 — `vmv.v.x` / `vmv.v.i` tracked a false dependency on `v0`.** Both used formats
+(`Format_OPV`, `Format_OPIVI`) that declare the vs2 field (bits 24:20) as `InVReg`. That field is
+**reserved-zero** in these encodings, so the model believed every `vmv.v.x` reads `v0` and the
+dependency tracker waited for `v0` to drain — stalling forever whenever `v0` is legitimately used as
+an ordinary data register. Added `Format_VMV_X` / `Format_VMV_I`, identical to the originals with the
+vs2 entry removed and nothing else changed.
+
+**Verified safe before changing, not after:** `vmv_v_x_exec` reads `REG_GET(0)` / `REG_OUT(0)` /
+`UIM_GET(0)` and `vmv_v_i_exec` reads `SIM_GET(0)` / `REG_OUT(0)` / `UIM_GET(0)` — neither touches
+`in_regs[1]`. (`Format_OPV` also declares the rs1 field as `InVReg` for `vmv.v.x`, which is arguably
+a second false dependency, but the issue does not raise it and the handler works today, so it was
+left alone. Matching the issue exactly rather than improvising.)
+
+**Verification: behaviour unchanged everywhere.** RLC calibration anchor **bit-identical**
+(149,248 / 149,678 / 195,098 / 195,370); `byte-enable` 14/14; `cache-line-rw-smoke` PASS on v1 and
+v3; `spin-lock` runs.
+
+**Why nothing moved — checked, not assumed:** `grep -c 'lr\.w'` is **0** across `spin-lock`,
+`cache-test-scalar` and `byte-enable`. Our lock kernels use AMOs, not LR/SC, so the LR path is never
+executed here.
+
+---
+
+## Round summary: four issues fixed, zero measured change — and that is the finding
+
+| issue | fix | why nothing moved |
+|---|---|---|
+| #42 strided/indexed as unit-stride | 24 instructions retagged | only `byte-enable` uses them, trivially |
+| #39-1 `and.cpp` int shift / mod-64 mask | `1ULL`, `(rem==0)?0:...` | gate has `nb_input = 5` |
+| #39-2 `cache_sync` uninitialised | in-class initialiser | **had already fired here** as the zero-stall abort |
+| #38 `LR.W` wrong register | redirect to `get_second_data()` | no `lr.w` in any kernel we run |
+| #43 `vmv.v` false `v0` dependency | dedicated formats | `v0` not used as a data register here |
+
+**All five are real bugs and none changes a number we measure.** The consistent explanation is that
+the upstream filer runs kernels we do not: strided RLC data movement, LR/SC forward-progress tests,
+and vector code that uses `v0` as data. **That is the value of the issue list — it is coverage we do
+not have**, and it is worth treating as a standing input rather than a one-off sweep.
+
+Not applicable to `cachepool_v3`, established by evidence: #39-3 (no stream buffer in our xbar),
+#37 (`htif=False`), #36 (per-tile icaches already). Remaining open: **#40** (AMO busy-time includes
+requester queueing) — the only one likely to move a timing number, and untouched so far.
+
+
+---
+
 ## 2026-08-25 ~09:30 +0200 — #39 fixed (2 of 3 applicable); #36/#37 do NOT apply to cachepool_v3
 
 **Worked the upstream issue list. Applicability checked per issue rather than assumed** — several are
