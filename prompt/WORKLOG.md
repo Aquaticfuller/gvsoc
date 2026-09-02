@@ -4,6 +4,63 @@
 
 ---
 
+## 2026-08-25 ~08:55 +0200 — #42 FIXED (strided/indexed vector ops) — a real latent bug, but no workload we own exercised it
+
+**Fix.** `core/models/cpu/iss/isa_gen/isa_rvv_timed.py`: 24 instructions retagged —
+`vlse{8,16,32,64}.v` gain `vload_strided`, `vsse*` gain `vstore_strided`, `vluxei*`/`vloxei*` gain
+`vload_indexed`, `vsuxei*`/`vsoxei*` gain `vstore_indexed`.
+
+**Key implementation point: the specialised tag is ADDED, not substituted.** `ara.cpp:441-457`
+assigns `block_id` from the *generic* `vload`/`vstore` tags, while `spatz_vlsu.cpp::isa_init()`
+registers the generic `block_handler` first and the specialised one **after** — so dual-tagging lets
+the specialised handler win while block dispatch still works. Replacing the tag (as a naive reading
+of the issue suggests) would have broken `block_id` assignment instead.
+
+**Verified active, not assumed.** Added an env-gated diagnostic (`VLSU_TAG_DEBUG=1`) printing the
+per-tag instruction counts at `isa_init`:
+
+```
+[VLSU-TAG] vload -> 49   vstore -> 36
+[VLSU-TAG] vload_strided -> 8    vstore_strided -> 8
+[VLSU-TAG] vload_indexed -> 16   vstore_indexed -> 16
+```
+
+Previously all four specialised counts were **0** while `spatz_vlsu.cpp` registered handlers against
+them — the handlers existed and could never fire. (Counts are 2x the source instructions because the
+generated ISA defines them in two subsets; handler assignment is idempotent.) Kept the diagnostic:
+env-gated, zero cost, and it is exactly the check that distinguishes "fix applied" from "fix active".
+
+**Behaviour is byte-identical across the suite — and that is the correct outcome, not a failed fix.**
+Disassembly counts of strided/indexed instructions in the workloads we run:
+
+| kernel | vlse | vsse | vluxei | vsuxei |
+|---|---|---|---|---|
+| `byte-enable` | 0 | **4** | 0 | **4** |
+| `fdotp-32b_M32768` | 0 | 0 | 0 | 0 |
+| `cache-test-vector` | 0 | 0 | 0 | 0 |
+| `cache-line-rw-smoke` | 0 | 0 | 0 | 0 |
+| `bandwidth` | 0 | 0 | 0 | 0 |
+
+**Only `byte-enable` uses them at all**, stores only, and it passes 14/14 with an identical trace
+cycle count (252,494) before and after. So this is a **latent** bug fixed — real, and it would have
+silently corrupted any kernel using a non-trivial stride (the RLC kernels do), but invisible to our
+current suite.
+
+**Two claims from the 08:40 entry corrected in place:**
+- *"#42 plausibly explains the fdotp residue"* — **wrong.** fdotp contains zero strided instructions;
+  its geometry stride is pointer arithmetic over unit-stride `vle32.v`. The 77 % residue is still
+  unexplained.
+- *"#42 undermines the byte-enable calibration anchor"* — **overstated.** The anchor stands: the
+  0.87x ratio is byte-identical across the fix.
+
+So the 08:10 calibration conclusion — error confined to the refill path, established by the sign flip
+— is **unaffected**, which is the more important of the two corrections.
+
+**Regression:** `cache-line-rw-smoke` PASS on v1 and v3; `byte-enable` 14/14 PASS; `fdotp` unchanged.
+
+
+---
+
 ## 2026-08-25 ~08:40 +0200 — EIGHT open GVSoC bugs filed upstream against our model (with root causes and fixes)
 
 **`github.com/pulp-platform/ManyRVData/issues` has 12 open issues and 8 of them are GVSoC bugs in
@@ -29,10 +86,13 @@ op executes as unit-stride**: silent data corruption, no diagnostic.
 
 **Direct consequences for today's work:**
 
-1. **It plausibly explains the `fdotp` 64-core residue** (77 % of the single-iteration value, the one
-   part not accounted for by the `measure_iter` test bug or by our 64-core-binary misuse). fdotp is a
-   strided kernel.
-2. **It undermines the `byte-enable` calibration anchor delivered at 08:10.** That kernel's sub-tests
+1. ~~**It plausibly explains the `fdotp` 64-core residue**~~ — **WRONG, disproven 08:55.** `fdotp`'s
+   disassembly contains **zero** `vlse`/`vsse`/`vluxei`/`vsuxei` instructions. It is not a strided
+   kernel; the geometry stride is done with pointer arithmetic and unit-stride `vle32.v`. The 77 %
+   residue remains unexplained.
+2. ~~**It undermines the `byte-enable` calibration anchor delivered at 08:10.**~~ — **overstated,
+   see 08:55: the anchor STANDS.** byte-enable does use strided/indexed stores, but its results and
+   cycle count are byte-identical before and after the fix, so the 0.87x ratio is unaffected. That kernel's sub-tests
    are exactly `vsse16.v` (strided) and `vsuxei16.v` (indexed). It reported `[PASS]` on our model —
    which, if both the store and the verifying load degrade to unit-stride *consistently*, is a
    **vacuous pass**: self-consistent and wrong. The 0.87x cycle ratio may therefore be measuring
