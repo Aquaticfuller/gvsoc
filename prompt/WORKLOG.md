@@ -4,6 +4,58 @@
 
 ---
 
+## 2026-08-25 ~09:30 +0200 — #39 fixed (2 of 3 applicable); #36/#37 do NOT apply to cachepool_v3
+
+**Worked the upstream issue list. Applicability checked per issue rather than assumed** — several are
+filed against a configuration or fork that differs from ours, and fixing them blind would have been
+wasted effort or worse.
+
+| issue | applies to `cachepool_v3`? | evidence | action |
+|---|---|---|---|
+| #42 strided/indexed vector ops | **yes** (latent) | only `byte-enable` uses them, stores only | **FIXED** (08:55) |
+| #39-1 `and.cpp` 32-bit shift / mod-64 mask | **no** (latent) | `nb_input = 5` per gate, 64 gates | **FIXED anyway** |
+| #39-2 `cache_sync` uninitialised | **YES — hit this session** | the "decrease zero stalled counter" fatal | **FIXED** |
+| #39-3 xbar requester-side fill | **no** | our `insitu_cache_xbar.cpp` is a 186-line pure router, no stream buffer | N/A |
+| #37 HTIF poller fabric traffic | **no** | `cachepool_v3_tile.py:91` sets `htif=False` | N/A for v3 |
+| #36 single shared icache | **no** | v3 config shows `tile_N/l1_icache` **per tile**, 64 of them | N/A for v3 |
+
+**#39 bug 1 — `core/models/utils/common_cells/and.cpp`.** Two defects, both fixed:
+`values[byte] |= 1 << bit` is an **int** shift written into a `uint64_t`, so bit 31 sign-extends into
+bits 31-63 and any gate with >= 32 inputs spuriously reads all-true; and
+`last_value_mask = ~((1 << (nb_input % 64)) - 1)` degenerates to `~0` when `nb_input` is an **exact
+multiple of 64**, marking the whole final word as padding so the last 64 real inputs are treated as
+permanently true. Now `1ULL` throughout, with `(rem == 0) ? 0 : ~((1ULL << rem) - 1)`, and the
+all-ones tests written as `UINT64_MAX` rather than relying on `-1` conversion.
+
+Checked before claiming impact: the gate is the **icache flush-ack**, instantiated **per tile** with
+`nb_input = 5` (4 cores + 1), 64 instances. So neither defect was ever active for us. Fixed because
+it is a real bug that bites at >= 32 inputs or at 64/128/... exactly, and because a future
+single-icache or wider-tile configuration would hit it silently.
+
+**#39 bug 2 — `cache_sync`.** Declared without an initialiser and assigned only inside
+`reset(bool active)`, in all three `exec_inorder.cpp` variants. The shared icache fires its flush-ack
+at every core and can do so **before** some cores have been reset; the indeterminate value then reads
+true and decrements a stall counter that was never incremented. **This is the exact
+"Trying to decrease zero stalled counter" abort we hit and worked around blind earlier this session.**
+Fixed with an in-class initialiser (`bool cache_sync = false;`) in both headers, which covers the
+`snitch_fp_ss` variant too since it shares the declaration.
+
+**Verification.** `cache-test-scalar` 3,894 @64c / 247 @4c — **unchanged**, as expected given neither
+#39 defect was active here. `byte-enable` 14/14 PASS. `cache-line-rw-smoke` PASS on v1 and v3.
+
+**Honest summary of the round: three real bugs fixed, none of which changes any number we measure**,
+because our configuration never exercised them. That is the right outcome to report rather than to
+dress up — the value is that they are latent traps removed (#39-1 fires the moment a gate reaches 32
+inputs; #39-2 fired here already), not that they moved a metric.
+
+**Also settled: #36 and #37 are not ours to fix for v3.** #36 targets
+`pulp/snitch/snitch_cluster/snitch_cluster.py` (the `spatz` target); v3 builds its own per-tile
+icaches. #37 needs HTIF enabled; v3 disables it. Both would still be worth fixing for the targets
+that do use them, which is a separate decision.
+
+
+---
+
 ## 2026-08-25 ~08:55 +0200 — #42 FIXED (strided/indexed vector ops) — a real latent bug, but no workload we own exercised it
 
 **Fix.** `core/models/cpu/iss/isa_gen/isa_rvv_timed.py`: 24 instructions retagged —
