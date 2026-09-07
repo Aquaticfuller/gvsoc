@@ -202,9 +202,13 @@ permanently true. Now `1ULL` throughout, with `(rem == 0) ? 0 : ~((1ULL << rem) 
 all-ones tests written as `UINT64_MAX` rather than relying on `-1` conversion.
 
 Checked before claiming impact: the gate is the **icache flush-ack**, instantiated **per tile** with
-`nb_input = 5` (4 cores + 1), 64 instances. So neither defect was ever active for us. Fixed because
-it is a real bug that bites at >= 32 inputs or at 64/128/... exactly, and because a future
-single-icache or wider-tile configuration would hit it silently.
+`nb_input = 5` (4 cores + 1), 64 instances. ~~So neither defect was ever active for us.~~
+**SCOPE CORRECTION (2026-09-07): that is true for `cachepool_v3` ONLY.** On the
+`snitch_cluster.py` path — used by the **v1 `cachepool`, `spatz` and `snitch` targets** — there is a
+single *shared* icache whose gate is sized `nb_input = nb_l1_banks + nb_cores = 1 + nb_core`
+(`hierarchical_cache.py:61`). At 64 cores that is 65 inputs and at 256 cores 257, both far past the
+**>= 32 inputs** threshold where the `1 << bit` int shift sign-extends. So defect 1 **was live** on
+those targets, and the fix matters there. It is also exactly the configuration issue #36 is about.
 
 **#39 bug 2 — `cache_sync`.** Declared without an initialiser and assigned only inside
 `reset(bool active)`, in all three `exec_inorder.cpp` variants. The shared icache fires its flush-ack
