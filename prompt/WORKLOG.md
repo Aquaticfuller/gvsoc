@@ -4,6 +4,57 @@
 
 ---
 
+## 2026-09-07 — upstream issue sweep: final accounting. NOT all fixed; #40 measured and not reproduced
+
+**Re-checked `github.com/pulp-platform/ManyRVData/issues`: no new issues.** #43 is still the newest
+(sorted by created-desc; #44 returns 404). Same 7 GVSoC issues as the 2026-08-25 sweep.
+
+| # | title | status |
+|---|---|---|
+| #42 | strided/indexed vector ops ran as unit stride | **FIXED** |
+| #43 | `vmv.v` false `v0` dependency | **FIXED** |
+| #38 | `LR.W` returned its value in the wrong register | **FIXED** |
+| #39 | three 64-tile scale bugs | **2 of 3 FIXED**; bug 3 N/A (no stream buffer in our xbar) |
+| #40 | AMO busy-time includes requester queueing | **MEASURED, DOES NOT REPRODUCE** |
+| #36 | one icache for all tiles | **NOT FIXED** — N/A for v3, **real for `snitch_cluster.py`** |
+| #37 | HTIF pollers saturate a cache bank | **NOT FIXED** — N/A for v3, **real for HTIF targets** |
+
+**#40 — measured rather than patched.** The issue reports exponential doubling of AMO occupancy
+(+20/+40/+80). Reading the code did not support it, so it was measured instead: RLC
+`M1_N1350_K100` (47 atomic instructions, the only AMO-heavy kernel we have — everything else in the
+suite carries just the 2 boot/EOC atomics), 4 cores, `INSITU_AMO_DEBUG`, **3,157 RMW events**
+captured. Inter-arrival deltas on the busiest lane:
+
+```
+delta=18 -> 222 occurrences        <- rmw_window_cycles_, the configured floor
+delta=19 ->  79
+delta=33/40/45/54/85/154/...       <- genuine idle gaps between lock acquisitions
+```
+
+Back-to-back AMOs sit at the **18-cycle floor with no growth**; the doubling signature (18, 36, 72,
+144) is absent. Our `structural_occupancy_` branch — the one `cachepool_v3` uses — computes
+`rmw_busy_until_ = max(rmw_start_cyc_ + rmw_window_cycles_, now)`, i.e. **absolute from accept**, so
+requester queueing cannot accumulate into it. That was fixed earlier in this project. The calibrated
+branch chains by `total = read_lat + 1 + write_lat`, which is the shim's own scratch work, not
+requester wait.
+
+The issue states it was "discovered through AI analysis and flagged for the maintainers' awareness" —
+i.e. not verified against a run. **Not fixed because not reproduced**, and worth reporting back
+upstream with this data rather than leaving it open against our code.
+
+**Gotcha re-encountered (documented in the shim, walked into anyway):** `INSITU_AMO_DEBUG`'s *value
+is the line budget*. Passing `=1` yields exactly one line and looks like "no AMO activity". Needs
+`=200000` to cover a real run.
+
+**Honest answer to "have we fixed all the bugs?": no.** Four fixed, one not reproduced, **two still
+open** — and #36/#37 were previously recorded as "N/A for cachepool_v3", which is true but is **not**
+the same as "not our bug". Both are defects in code this repo owns
+(`pulp/snitch/snitch_cluster/snitch_cluster.py`, `models/cpu/iss/src/htif.cpp` + `lsu.cpp`) affecting
+the `spatz` / `snitch` / HTIF-enabled targets we ship. The filer is presumably running one of those.
+
+
+---
+
 ## 2026-08-25 ~10:05 +0200 — #38 and #43 fixed; four upstream issues closed, all latent for our suite
 
 **#38 — `LR.W` returned its value in the wrong register.** `insitu_cache_amo_shim.cpp` forwarded LR
