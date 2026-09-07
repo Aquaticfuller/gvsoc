@@ -4,6 +4,70 @@
 
 ---
 
+## 2026-09-07 — #37 REPRODUCED then FIXED: HTIF pollers saturated a cache bank (2.63x speedup at 256 cores)
+
+**Reproduced first, on purpose.** The target is the **v1 `cachepool`** target, not `cachepool_v3`:
+`pulp/cachepool.py:41` builds on `SnitchCluster`, and `snitch_cluster.py:223/243/247` pass
+`htif=True`. (v2 and v3 both set `htif=False`, which is why we never saw this.)
+
+**Measured with env-gated instrumentation** (`GVSOC_HTIF_STATS=1`), `cache-test-scalar`:
+
+| cores | HTIF traffic | predicted `sizeof(iss_reg_t)*N/1000` | kernel cycles | wall |
+|---|---|---|---|---|
+| 64 | **0.253 req/cyc** | 0.256 | 2,250,001 | 2.5 s |
+| 256 | **1.023 req/cyc** | 1.024 | **23,919,001** | 71.9 s |
+
+`tohost_addr = 0x80003c80` — inside the cached DRAM window, so every poll traverses the insitu
+cache and lands on **one bank**. Measurement matches the model to three decimals, and at 256 cores
+the rate **crosses the bank's 1 op/cycle capacity**: the same kernel costs **10.6x the cycles for
+4x the cores**, purely from host-interface traffic that does not exist in the modelled hardware.
+
+**Correction to the issue:** it assumes an 8-byte tohost. On our rv32 cores `sizeof(iss_reg_t)` is
+**4**, so the rate is `4N/1000`, and 256 cores is where it just crosses 1.0 — not a wide margin.
+
+**Fix (the issue's design, implemented and verified):**
+- `htif.hpp` — public `notify_tohost_store()` + `get_tohost_addr()`.
+- `htif.cpp` — **removed the `htif_event.enqueue(1000)` periodic re-arm**; `notify_tohost_store()`
+  enqueues at **+1 cycle** (so the store has landed before the handler reads it back) and is guarded
+  by `is_enqueued()` so a burst of stores collapses to one wake-up. `reset()` still arms once.
+- `lsu.cpp` — in `Lsu::data_req` (the common path for aligned and misaligned program accesses;
+  `Lsu::store` reaches it), one range-overlap comparison per **write**, all inside
+  `#ifdef CONFIG_GVSOC_ISS_HTIF` so it compiles out entirely for `cachepool_v3`.
+
+**Results:**
+
+| | before | after | change |
+|---|---|---|---|
+| 64 cores | 2,250,001 cyc | 2,248,210 | **-0.08 %** |
+| 256 cores | 23,919,001 cyc | **9,087,641** | **-62 %, 2.63x faster** |
+| wall @256c | 71.9 s | 25.6 s | |
+| handler runs | 6.1 M polls | **0** | |
+
+The 64-core result is the important control: traffic there was **below** capacity, and the fix moves
+it by 0.08 % — so it did not perturb behaviour that was already correct. The gain appears exactly
+where the rate exceeded capacity.
+
+**Correctness verified, not assumed:** `[HTIF] Simulation exiting: retval=...` still fires in every
+run, i.e. the tohost handshake — the entire purpose of the poller — still works event-driven.
+`cache-line-rw-smoke` PASS `retval=0`. **v3 RLC calibration anchor bit-identical**
+(149,248 / 149,678 / 195,098 / 195,370), as expected since the code is compiled out there.
+
+**One honest note:** v1 `cache-test-scalar` at 16 cores moved 1,266 -> 1,272 mismatches. That test is
+already failing from the open cross-core visibility bug, and its failure is timing-sensitive —
+removing 0.25 req/cyc of fabric traffic changes the interleaving. Not a new failure, but it is a
+real behaviour change and worth recording rather than glossing.
+
+**Known limitation, documented in the code:** the `CONFIG_GVSOC_ISS_MEMORY` fast path in
+`Lsu::store` writes `mem_array` directly and never reaches `data_req`, so a tohost living in that
+array would not be noticed. It would not reach the fabric either, so that configuration needs its
+own handshake regardless.
+
+**Status: #37 closed.** Remaining open from the upstream list: **#36** (single shared icache in
+`snitch_cluster.py`) and **#40** (measured, does not reproduce).
+
+
+---
+
 ## 2026-09-07 — upstream issue sweep: final accounting. NOT all fixed; #40 measured and not reproduced
 
 **Re-checked `github.com/pulp-platform/ManyRVData/issues`: no new issues.** #43 is still the newest
