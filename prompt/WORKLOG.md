@@ -4,6 +4,54 @@
 
 ---
 
+## 2026-09-08 — measured v3's icache + refill funnels at 256 cores: no pressure, but the all-clear is CONDITIONAL
+
+**Question asked:** the upstream #36/#37 bugs are both *many-to-one funnels* (N requesters into a
+single-service-rate resource). `cachepool_v3` avoids both specific issues — per-tile icaches,
+`htif=False` — but does it have the same *class* of problem? v3's funnels:
+
+```
+4 cores  -> 1 tile L1 icache                    (Hierarchical_cache, nb_cores=4)
+4 tiles  -> 4->1 icache_mux -> 1 group L2 I$    (16 cores : 1, mux forwards 1 req/cycle)
+16 banks + 1 L2 I$ -> 17->1 refill_mux          (1 req/cycle)
+```
+
+**Instrumentation added** (`INSITU_MUX_STATS=1`, `insitu_cache_refill_mux.cpp`): power-of-two
+milestones during the run, on **two** counters — queue depth *and* forward count. The second is not
+redundant: a silent queue report is ambiguous between "no pressure" and "no traffic", which are
+opposite conclusions. Milestones rather than `stop()` because most of our kernels never reach it.
+
+**Result at 256 cores (4x4 groups x 4 tiles x 4 cores):**
+
+| kernel | `refill_mux` | `icache_mux` |
+|---|---|---|
+| `cache-test-scalar` | fwd >= 1024, **max_q = 1** | < 1024 forwards, max_q < 2 |
+| `cache-mix-pressure` | < 1024 forwards | < 1024 forwards |
+
+**No queueing pressure at either mux.** The deepest queue observed anywhere was **1**.
+
+**But the refill-mux result is conditional, and that is the finding.** `max_q = 1` is exactly what
+MLP-of-1 upstream predicts: at most one refill in flight per cache controller means the 17->1 mux
+*cannot* see concurrent arrivals. **The mux is not proven adequate — it is starved by a bug.** When
+the MLP gate is lifted (the recommended refill-path work), the mux becomes the next candidate
+bottleneck and this measurement must be repeated. Measuring it now yields a false all-clear.
+
+That is a general ordering lesson: **a downstream funnel cannot be evaluated while an upstream
+serialisation starves it.**
+
+**The icache path is UNTESTED, not cleared.** Neither kernel drives >1024 instruction refills per
+group across a whole 256-core run — the per-tile L1 absorbs the working set, so the 4->1 icache mux
+and the group L2 I$ never see load. The #36 scenario (all cores missing L0 together after a barrier
+release) would need a workload with an instruction footprint that overflows the per-tile L1, and we
+do not appear to have one. Status unchanged from the structure map: group L2 I$ geometry is still a
+placeholder and the path has never been load-tested.
+
+**Verification:** with `INSITU_MUX_STATS` unset, zero diagnostic lines (gate confirmed).
+`cache-mix-pressure` PASSes at 256 cores.
+
+
+---
+
 ## 2026-09-07 — #37 REPRODUCED then FIXED: HTIF pollers saturated a cache bank (2.63x speedup at 256 cores)
 
 **Reproduced first, on purpose.** The target is the **v1 `cachepool`** target, not `cachepool_v3`:
