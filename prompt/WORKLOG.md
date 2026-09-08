@@ -4,6 +4,226 @@
 
 ---
 
+## 2026-09-08 — multi-scalar core complex (2 Snitch harts sharing one Spatz) implemented in cachepool_v3
+
+**Task.** Implement the RTL branch `origin/dev/multi-scalar` (HEAD `bc435c6`, 22 commits) in the
+GVSoC model: several scalar Snitch harts per core complex, sharing one Spatz vector unit, arbitrated
+by `cachepool_spatz_lock` + `acc_mux`.
+
+**RTL read (read-only, via `git show origin/dev/multi-scalar:<path>`, nothing checked out):**
+`hardware/src/cachepool_cc_dual.sv` (662 l), `cachepool_spatz_lock.sv` (434 l), `acc_mux.sv` (276 l),
+`cachepool_pkg.sv`, `cachepool_tile.sv`, `config/cachepool_dual_4g.mk`,
+`software/snRuntime/{include/spatz_lock.h,src/spatz_lock.c,src/team.c,src/barrier.c}`,
+`software/kernels/{fp/fdotp-32b,int/idotp-32b}/main.c`.
+
+### The architectural fact that shaped the implementation
+
+`NumCore` was renamed `NumCC` (commit `357a6db`). A **core complex** is now the unit that owns a Spatz
+and an L1 cache controller; a **hart** is not:
+
+```
+NumCC              = `NUM_CORES                 CC slots, one Spatz each
+NumCores           = NumCC * NumScalarPerCC     total harts
+NumL1CacheCtrl     = NumCC                      per CC, NOT per hart
+NrTCDMPortsPerCore = N_FU + NumScalarPerCC      4 VLSU (shared) + 1 scalar port per hart
+```
+
+So the change is a *hierarchy* change, not a parameter sweep. Everything the peripheral and the
+barrier count is per hart; everything the cache and the vector unit provide is per CC.
+
+### What was implemented
+
+**Topology** (`CACHEPOOL_V3_SCALAR_PER_CC`, default 1 = unchanged):
+
+- `cachepool_v3_{system,cluster,group,tile}.py` — `nb_cores_per_tile` now means CC slots
+  (documented in place); hart index `k = cc * nb_scalar + h`, cluster-global and contiguous, so
+  `snrt_cluster_is_primary()` (`cid % 2 == 0`) and `snrt_cluster_vpu_idx()` (`cid / 2`) are right.
+- Both harts' VLSU routers land on the **same** cache port class — there is one physical Spatz with
+  4 ports (`cachepool_cc_dual.sv`: `tcdm_req_o[p]` for `p < NrMemPortsPerSpatz`). Each hart gets its
+  **own** scalar port class (`tcdm_req_o[NrMemPortsPerSpatz + h]`).
+- `insitu_cache_tile.py` / `insitu_cache_config.py` — new `num_scalar_per_core`; the last `n_scalar`
+  port classes are scalar, and each gets its **own** AMO unit (`cachepool_tile.sv`: "only the last
+  NumScalarPerCC planes of cache_amo_req are ever driven"). Was hardcoded to one scalar lane.
+- per-hart: stack SPM, peripheral port, barrier req/ack, MSIP, external IRQ, L1 I$ port.
+
+**Arbiter** — new `pulp/pulp/cachepool_v3/cachepool_v3_spatz_lock.{cpp,py}`, one per CC. Models the
+lock FSM and acc_mux together because they are one decision:
+
+- Intercepts ACQUIRE (+0x4) / RELEASE (+0x8) on the CC's own memory path, before the peripheral,
+  exactly as the RTL module does inside `cachepool_cc_dual`.
+- Full FSM: `Free -> AcqWait -> Locked`, `Locked -> RelWait -> Free`; outcome word
+  `[1:0]` outcome / `[4:2]` reason / `[5]` owner / `[6]` locked; hits during a wait answer
+  FAIL(PENDING); Free's implicit owner is host 0 and its release is a no-op grant.
+- Issue gating: the ISS publishes a status word from `Ara` and receives a grant;
+  `vector_insn_stub_handler` returns `pc` while ungranted — the model of `acc_mux` withholding
+  `acc_qready` from a non-owner. **Unbound ports => always granted**, so single-scalar targets are
+  untouched.
+
+**ISS** (`core/models/cpu/iss/`): `Ara` gains `vector_status` (master, `wire<int>`) and
+`vector_grant` (slave); status bits are `0` in flight, `1` stalled wanting to issue, `2` vector
+load/store in flight. Published at enqueue, at `insn_end`, and at queue-slot reclaim.
+
+### The Free-mode gate — corrected mid-implementation by the RTL-side session
+
+I first modelled Free mode as "one hart at a time, but pipelined", flagged it as an approximation,
+and asked the RTL session to check my literal reading of `acc_mux.sv:98`. Their answer, with the
+source: the reading is right and my model was **optimistic**.
+
+```systemverilog
+free_req_i = (!locked_i && !waiting_i && route_fifo_empty && !lsu_busy_q) ? acc_snitch_qvalid_i : 0;
+// lsu_busy_d set by req_fire && spatz_issue_rsp_i.loadstore, cleared by spatz_mem_finished
+```
+
+and `spatz_vlsu.sv:508` asserts `spatz_mem_finished_o` only when the committing instruction is valid,
+**every** `commit_finished_q` bit is set, and its memory ops are done — i.e. **per drained op, not per
+issue slot**. So in Free mode a vector load/store blocks the next acc grant from *either* host until
+it has fully drained. Two qualifications they added that matter: only `loadstore` ops arm that gate
+(vector arithmetic still pipelines), and **Locked mode has no gate at all** — the owner is a straight
+passthrough.
+
+Modelled exactly: `free_mode_lsu_gate` (default on) withholds every Free-mode grant while any hart
+has `Ara::nb_pending_vaccess != 0`, which is decremented in `Ara::insn_end` — the model's
+`spatz_mem_finished`. **Not** modelled: `route_fifo`, which additionally holds off the next Free-mode
+grant until a WRITEBACK op's response is taken; we have no per-instruction writeback flag, so a
+writeback-heavy Free-mode stream is still optimistic. Recorded in the source and the structure map
+rather than left implicit.
+
+A design consequence worth carrying forward, from the same exchange: **none of the migrated kernels
+acquire the lock**, so they all run in Free mode and pay a serialisation that Locked mode would not
+impose. If dual-scalar FP kernels look slow on both engines, that is a real effect, not a modelling
+artefact.
+
+### Second thing the branch changes: the peripheral register map moved
+
+`dev/multi-scalar` inserts SPATZ_LOCK_ACQUIRE/RELEASE at 0x4/0x8 and pushes everything after them
+down. Three generations now exist:
+
+| register | legacy (the ELFs we run) | RTL working tree today | dev/multi-scalar |
+|---|---|---|---|
+| HW_BARRIER | 0x10 | 0x00 | 0x00 |
+| SPATZ_LOCK_ACQUIRE / RELEASE | - | - | 0x04 / 0x08 |
+| CLUSTER_BOOT_CONTROL | 0x20 | 0x10 | 0x18 |
+| CLUSTER_EOC_EXIT | 0x24 | 0x14 | 0x1c |
+| L1D block | 0x28..0x4c | 0x28..0x4c | 0x28..0x4c |
+
+Getting this wrong is **silent**: the barrier read lands on perf-counter scratch and never blocks, and
+the EOC write goes nowhere, so the run just never terminates. Since any dual-scalar ELF will use the
+third column, the model needed it or the binaries could not run at all once they arrive.
+
+Implemented as a `cachepool_map` property on `ClusterRegisters` (`legacy` | `multi_scalar`), selected
+by `_SCALAR_PER_CC` and overridable with `CACHEPOOL_V3_PERIPH_MAP` — the override is what lets a
+legacy-map ELF run on a dual-scalar topology, which is the only way to exercise the arbiter today.
+BOOT_CONTROL is now an explicit scratch word rather than relying on whichever spatz regmap register
+happens to sit at that offset (PERF_COUNTER_0 at 0x20 was a coincidence that does not repeat at 0x18).
+
+The bootrom needed it too. It computes the boot-control address as `tcdm_start + tcdm_size + 32`, one
+I-type immediate at ROM offset 0x2c (`addi t2,t2,32` = `0x02038393`). `_patch_bootrom` now rewrites it
+to `+0x18` for the multi_scalar map, asserting the expected encoding first so a future bootrom rebuild
+fails loudly instead of silently booting every core to address 0.
+
+### Two real bugs found by making the model run, not by reading it
+
+**1. I made an over-counting ISS counter load-bearing, which would latch the Free-mode gate off
+permanently.** `Ara::nb_pending_vaccess` is incremented in `IssWrapper::vector_insn_stub_handler`
+**before** the input-register dependency check that can `return pc` — so every retry increments it
+again while `insn_end` decrements once. For any vector load/store that ever stalls on a dependency the
+counter inflates and never returns to zero. That is harmless for its actual purpose (`fpu_sequencer`
+only uses it to be conservative about scalar/vector memory ordering) but unusable as an "LSU busy"
+*level*: once inflated, `lsu_busy()` is stuck true, no Free-mode grant is ever issued again, and the
+CC deadlocks. Fixed with a dedicated `nb_inflight_vlsu`, incremented in `Ara::insn_enqueue` (where
+acceptance is final) and decremented in `insn_end`, so it is paired exactly once per instruction.
+
+  **What this fix did NOT do, stated plainly because I initially assumed otherwise.** I found this
+  while chasing a 32-CC dual run whose fourth core had not reported after ten minutes, and wrote it up
+  as the cause. It is not: re-running that config after the fix produced **byte-identical** cycle
+  counts (135,094 / 137,197 / 187,717) and the same lock statistics, so the over-count never actually
+  fired in that trace. The slow core was CPU contention from my own concurrently running simulations
+  plus a genuinely long-running hart, not a hang. The fix stands on the source-level argument — the
+  increment provably precedes a retry-capable return — not on an observation, and that distinction is
+  the record.
+
+  *The underlying ISS over-count is left alone and recorded here instead.* Moving the increment past
+  the dependency loop would change `fpu_sequencer`'s stalling on the default single-scalar path, which
+  needs its own validation; it is a latent fidelity issue (the sequencer over-stalls scalar accesses
+  after a stalled vector load), not a correctness one.
+
+**2. The arbiter's "wanting to issue" bit is a latch, and using it to *retain* a grant starves the
+partner.** It is published when a hart stalls on the gate and only cleared when that hart actually
+enqueues or retires a vector instruction — so a hart that stalls, is granted, and is then diverted (a
+barrier IRQ, a branch out of the loop) keeps the bit asserted forever and pins the shared unit.
+Retention now keys on *work in flight* only; an idle holder is handed over as soon as anyone else
+asks. That is also the faithful reading: the RTL has no such latch, `acc_qvalid` is a level that
+simply deasserts.
+
+### Verification
+
+- **Single-scalar regression is bit-identical.** RLC `M1_N1350_K100` at the documented 64-core anchor
+  config: **149,248 / 149,678 / 195,098 / 195,370** — exactly the values recorded on 2026-09-07 and
+  2026-08-25. Re-checked after the peripheral-map change and again after the counter fix; unchanged
+  both times. (Absolute start/end cyclestamps move by 10 cycles from the boot-control scratch path;
+  the kernel cycle counts, which are the anchor, do not.)
+- **Dual-scalar elaborates correctly**, checked by dumping `gvsoc_config.json` rather than by
+  inspection: 8 harts per tile (`pe0..pe7`), 4 `spatz_lock` instances per tile (one per CC, 32
+  cluster-wide), 6 per-port-class crossbars (`xbar_0..xbar_5` = 4 VLSU + 2 scalar), 4 cache
+  controllers per tile (per CC, not per hart), 8 AMO units per tile (`amo_{bank}_{lane}`), and hart
+  ids contiguous 0..63 across 8 tiles with even = primary.
+- **Dual-scalar runs, and the arbiter is demonstrably doing work** — this is the part that matters,
+  because a plausible cycle count from a transparent arbiter would prove nothing. `SPATZ_LOCK_STATS=1`
+  reports per CC, at power-of-two milestones during the run (most kernels never reach `stop()`):
+  handovers, grants denied, LSU-gate blocks, and `max_concurrent_inflight`. On the 32-CC run one CC
+  logged **724 handovers, 1,024 want-denials, 1,011 LSU-gate blocks**, and
+  **`max_concurrent_inflight = 1` throughout** — i.e. the two harts genuinely alternate on one unit and
+  never both have vector work in flight, which is the invariant the whole model rests on.
+- **Same binary, 4 CC, single vs dual** (RLC anchor, legacy map, so the two differ only in whether the
+  CC's harts share a Spatz):
+
+  | | single (4 CC = 4 harts) | dual (4 CC = 8 harts) |
+  |---|---|---|
+  | producers | 117,272 / 118,564 | 106,160 / 107,649 |
+  | consumers | 152,852 / 155,000 | **163,135 / 163,208** |
+
+  The consumers are the vector-heavy pair and pay **+5.3 % / +6.7 %** for sharing; the producers get
+  faster. Read this as a smoke result, not a calibration: the binary is a single-scalar build, so every
+  hart believes it is primary and none of them takes the lock — everything runs in Free mode, which is
+  the serialised path. A real dual-scalar build would put vector work on the even harts only.
+
+### Build-system trap found and worth remembering
+
+The generated per-target model builds **do not track header dependencies**. Editing
+`cores/ara/ara.hpp` recompiled only the `.cpp` files I had also edited; every other TU kept the old
+`sizeof(Iss)` and the simulator segfaulted in `Sequencer::Sequencer` -> `BlockTrace::new_trace` during
+component construction — an ODR/layout mismatch, not a model bug. **After touching any ISS header,
+`rm -rf build/engine/CMakeFiles/gen_isa_<target>_*` before rebuilding.** This cost about half an hour
+and looked exactly like a topology bug, including reproducing on the *unmodified* single-scalar path.
+
+### Known fidelity gaps of the shared-Spatz model (documented, not silently accepted)
+
+1. Each hart keeps its own Spatz model, mutually excluded in time rather than physically shared, so
+   there are two vector register files where the RTL has one. A program that illegally relies on
+   retaining vector registers across a handoff passes here and fails on RTL.
+2. Scalar FP is not gated. With `spatz_fpu_en=1` the RTL routes it through the same acc interface and
+   the lock applies. Irrelevant for the dual config as shipped (`spatz_fpu_en ?= 0`), wrong if enabled.
+3. `route_fifo` writeback gate, above.
+4. Drain is one "Ara idle" predicate rather than the RTL's separate acc / LSU / `st_rsp_done` counters.
+
+Files: `pulp/pulp/cachepool_v3/{cachepool_v3_spatz_lock.cpp,.py,cachepool_v3_tile.py,
+cachepool_v3_group.py,cachepool_v3_cluster.py,cachepool_v3_system.py}`,
+`pulp/pulp/snitch/snitch_core.py`,
+`pulp/pulp/snitch/snitch_cluster/spatz/cluster_registers.{cpp,py}`,
+`core/models/cache/insitu/{insitu_cache_config.py,insitu_cache_tile.py}`,
+`core/models/cpu/iss/{include/cores/ara/ara.hpp,src/ara/ara.cpp,src/snitch_fast/snitch.cpp}`. Structure map: `prompt/insitu_cache_structure_map_2026-09-08.md`.
+
+**Open follow-up:** no dual-scalar ELF exists on this machine — every binary in
+`software/build/CachePoolTests/` is a single-scalar build, so `spatz_lock_try_acquire()` compiles to
+the `SNRT_NUM_SCALAR_PER_CORE != 2` stub and `snrt_cluster_is_primary()` is unconditionally 1. The
+lock *protocol* is therefore unvalidated end to end. Requested from the RTL-side session:
+`software/sync/spatz-lock-handoff`, `idotp-32b` at `num_scalar_per_core=2`, and one FP kernel from
+`2c8b4f5`. They have agreed in principle but are mid-batch on the shared build directory and need
+their user's sign-off for the branch switch.
+
+
+---
+
 ## 2026-09-08 — measured v3's icache + refill funnels at 256 cores: no pressure, but the all-clear is CONDITIONAL
 
 **Question asked:** the upstream #36/#37 bugs are both *many-to-one funnels* (N requesters into a
