@@ -48,9 +48,41 @@ nothing on the calibration and removes the corruption entirely.
 
 **The residue is the honest part.** Mismatches drop by ~85 % but not to zero: ~1 per grant survives
 with zero truncations in the run. So cross-line truncation was the DOMINANT cause of the AM payload
-failures and not the only one. What is left is a separate defect -- the open cross-core visibility bug
-is the obvious candidate, but that is a hypothesis, not a measurement. Anyone reading this should not
-treat "truncation fixed" as "AM payload correct".
+failures and not the only one. Anyone reading this should not treat "truncation fixed" as "AM payload
+correct".
+
+**RESOLVED, and it was neither of the candidates I named.** The residue was measured across five
+cells and was *exactly* 1.00 per grant in every one that had the truncation clamp on or no straddling
+writes to clamp:
+
+| binary | clamp | truncations | mismatches | grants | per grant |
+|---|---|---|---|---|---|
+| pre-barrier-fix, vector | off | 68 | 104 | 17 | 6.1 |
+| pre-barrier-fix, vector | on  | 0  | 16  | 16 | **1.00** |
+| barrier-fixed, vector   | off | 68 | 102 | 17 | 6.0 |
+| barrier-fixed, vector   | on  | 0  | 15  | 15 | **1.00** |
+| barrier-fixed, SCALAR copy | off | 0 | 15 | 15 | **1.00** |
+
+Two things fall out. The barrier fix changes nothing in either arm, so the RTL side's partial-barrier
+defect is excluded. And the scalar-copy build -- 1-byte stores, no straddle possible by construction
+-- shows the same 1.00 with the clamp OFF, an independent fourth path to the same number.
+
+**A constant 1.00 per grant across binaries with different grant counts is not a race.** The RTL
+session read that signature off my table and found it in their own verifier: `rlc_am_verify_grant()`
+advanced the expected SN by the number of PDUs, but a grant ending on a segment leaves that SDU's SN
+still in use, so the expectation was one too high on every grant that ends on a partial -- which is
+nearly all of them, grants being byte-bounded. One spurious continuity error per grant, deterministic,
+and invisible to both fixes because it never touched a payload byte. Same per-PDU SN assumption they
+had already corrected in both planners weeks ago and left in the verifier.
+
+**Correction to carry forward: the cross-core visibility bug is NOT implicated by this evidence.** I
+had it as "leading candidate on an exclusion argument". That argument assumed the residue was real
+corruption; it was a checker artefact. Refusing to call it measured was the right call and this is
+why. The visibility bug's status is unchanged from before this episode -- open, densities measured
+under the old counting barrier, still to be re-measured.
+
+**So the AM payload mismatch column was three bugs and none of them was payload corruption:** the
+VLSU straddle (mine, ~5.1/grant), the verifier SN accounting (theirs, 1.0/grant), and nothing else.
 
 **Not enabled by default**, deliberately. It is a change to vector request sizing, the anchor is only
 one workload, and the decision belongs to a review rather than to the run that discovered it. The
