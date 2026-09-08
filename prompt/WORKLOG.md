@@ -4,6 +4,72 @@
 
 ---
 
+## 2026-09-08 — AM wedge ladder: signature absent at both scales; the ORIGINAL OBSERVATION IS RETRACTED
+
+**Ran the ladder serially on an idle machine, at two scales, measuring the two channels a truncated
+run can compare: mismatch rate per grant, and cycles per grant from the RTL side's new `cyc=` stamp.**
+Completion and hang were deliberately NOT measured -- a bounded window cannot separate "slow" from
+"wedged", and a timeout presented as a hang result is the error this whole episode was about.
+
+```
+4 tiles / 16 cores                      16 tiles / 64 cores
+M8    0.00 mismatch   35,139 cyc/grant   M16   0.00 mismatch   46,954 cyc/grant
+M16   0.00            29,611             M48   0.00            31,054
+M24   0.00            26,037             M48 (K=8 control)     44,960
+M32   0.00            21,300
+```
+
+**Zero payload mismatches everywhere**, including M48 at 64 cores -- the rung the RTL side reported
+the wedge as worst.
+
+**The one number that moves sits on the wrong axis.** `cyc/grant` at fixed M16 is 1.59x worse at 16
+tiles than at 4 (46,954 vs 29,611). That is the same entity count spread over four times the cores --
+NoC hops and contention -- and it is not the wedge's signature. **Entity-count scaling is monotonic in
+the GOOD direction at both machine sizes**: 35.1k -> 21.3k across M8->M32 at 4 tiles, and M48 beating
+M16 at 16 tiles. The wedge was specifically *non-monotonic degradation as entities increase*, and that
+is absent from both channels at both scales.
+
+### The retraction, which is the part that matters
+
+The RTL session put the stronger conclusion and it is the right one: **the original wedge observation
+should be retracted as CONFOUNDED, not recorded as fixed.** Every historical M16/24/48 failure was
+measured on a stack carrying four defects, each independently capable of producing that signature:
+
+| defect | effect | owner |
+|---|---|---|
+| barrier modelled as a global counter to `nb_cores` | partial barriers release at arbitrary times, phases overlap | ours |
+| VLSU sized every unit-stride access at lane width | manufactured cross-line straddles, 5-6 mismatches/grant | ours |
+| tile mask armed at init and never restored | every full barrier narrowed to tile 0 above 1 tile; 60 of 64 cores unsynchronised | theirs |
+| verifier assumed SN-per-PDU | 1.00 spurious mismatch/grant, deterministic | theirs |
+
+So the instrument and the subject were both broken, simultaneously, in compounding ways. **We cannot
+say the wedge is fixed, because we cannot say it existed.** What we can say: the signature is absent
+in both measurable channels at both scales, and the observation that motivated the hunt was not
+measuring what it appeared to be measuring.
+
+Recorded this way deliberately. A reader six months from now needs to know the old M16/24/48 numbers
+are **void**, not superseded -- superseded implies the old measurement was of the same quantity.
+
+**Still open, and it is the last form of the question:** the hang axis. A bounded window cannot probe
+it. The right instrument is a progress-stall detector -- no `[AM] grant N ok` line for X cycles -- and
+the `cyc=` stamp already supplies its input. Deliberately NOT built at the end of this session to
+close the ticket; it should be scoped properly.
+
+### What the two-session collaboration produced
+
+- **six defects, three ours and three theirs, none found by the owner of the code**
+- the AM payload mismatch column resolved as **three separate bugs, none of them payload corruption**
+- **segmentation validated on a target for the first time** -- the `tb_used` total closes exactly on
+  4 three-byte and 5 five-byte headers, which is only consistent with protocol-correct SI/SO
+- the wedge retracted as confounded, with the instrument's limits stated rather than buried
+
+The mechanism, worth carrying: each side supplied artefacts the other could not generate -- we could
+not produce their verifier source, they could not produce our `[XLINE]` addresses. Neither was
+checking the other's reasoning; each was supplying evidence the other had no access to.
+
+
+---
+
 ## 2026-09-08 — ROOT CAUSE of the cross-line truncation: our VLSU manufactures the straddle
 
 **The truncation was never the program's fault, and the fix is not where I said it was.** The
