@@ -68,10 +68,14 @@ The following example can be launched on pulp-open:
 
 ## Running CachePool kernels (RLC and the rest of the CI suite)
 
-This fork adds a **`cachepool`** target: a cycle-approximate model of the CachePool cluster
-(Snitch+Spatz cores, the InSitu L1 data cache, SPM, peripheral) that boots and runs the
-**unmodified** CachePool test binaries — the same ELFs you build for RTL simulation. No
-recompilation of the software is needed to move a kernel from QuestaSim to GVSoC.
+This fork adds a **`cachepool_v3`** target: a cycle-approximate model of the CachePool cluster
+— Snitch+Spatz core complexes over a **shared** InSitu L1 data cache, in a multi-group mesh with
+two NoC levels — that boots and runs the **unmodified** CachePool test binaries, the same ELFs you
+build for RTL simulation. No recompilation of the software is needed to move a kernel from
+QuestaSim to GVSoC.
+
+The model's own documentation, including the cluster design and every configuration knob, is in
+[`core/models/cache/insitu/README.md`](core/models/cache/insitu/README.md).
 
 Build the binaries on the RTL side first, following
 `software/tests/multi_producer_single_consumer_double_linked_list/README.md`
@@ -84,7 +88,7 @@ in the ManyRVData repo (`make sw config=cachepool_fpu_512`, variants under
 # ETH network: pin the toolchain and provide the elfutils headers (needed since the
 # 2026-06 upstream pull; the script downloads them without sudo, idempotent).
 eval "$(scripts/setup_elfutils_headers.sh --env)"
-CXX=g++-14.2.0 CC=gcc-14.2.0 CMAKE=cmake-3.18.1 make all TARGETS="cachepool"
+CXX=g++-14.2.0 CC=gcc-14.2.0 CMAKE=cmake-3.18.1 make all TARGETS="cachepool_v3"
 source sourceme.sh     # puts install/bin on PATH; once per shell
 ~~~~~
 
@@ -94,9 +98,9 @@ The Python code needs **Python >= 3.10**. Required pip packages are listed in th
 
 ~~~~~shell
 B=<ManyRVData>/software/build/CachePoolTests
-gvsoc --target=cachepool \
+gvsoc --target=cachepool_v3 \
       --binary $B/test-cachepool-multi_producer_single_consumer_double_linked_list_M48_N800_K300 \
-      run
+      image flash run
 ~~~~~
 
 Run each simulation from its **own working directory** — GVSoC writes `gvsoc_config.json`
@@ -111,17 +115,23 @@ environment variables at run time:
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `CACHEPOOL_NB_TILE` | number of tiles | 1 |
-| `CACHEPOOL_CORES_PER_TILE` | cores per tile (keep >= 2) | 4 |
-| `CACHEPOOL_BANKS_PER_TILE` | L1 cache banks per tile (power of two) | = cores/tile |
-| `CACHEPOOL_USE_CACHE` | `0` bypasses the L1 cache (A/B the cache's effect) | 1 |
+| `CACHEPOOL_V3_NB_X_GROUPS` / `_NB_Y_GROUPS` | mesh dimensions | 1 / 1 |
+| `CACHEPOOL_V3_TILES_PER_GROUP` | tiles per group | 4 |
+| `CACHEPOOL_V3_CORES_PER_TILE` | **core complexes** per tile — not harts | 4 |
+| `CACHEPOOL_V3_SCALAR_PER_CC` | scalar harts per complex; `2` = the dual-scalar config | 1 |
+| `CACHEPOOL_V3_BANKS_PER_TILE` | L1 cache banks per tile (power of two) | = complexes/tile |
+| `CACHEPOOL_V3_MEM_LATENCY` | backing-store latency, cycles | 50 |
 
-Total cores = `NB_TILE x CORES_PER_TILE`. The standard CachePool config is 4x4 = 16 cores:
+Total cores = `NB_X x NB_Y x TILES_PER_GROUP x CORES_PER_TILE x SCALAR_PER_CC`. Defaults give
+16 cores; `2x2` groups gives 64 and `4x4` gives 256:
 
 ~~~~~shell
-CACHEPOOL_NB_TILE=4 CACHEPOOL_CORES_PER_TILE=4 \
-  gvsoc --target=cachepool --binary $B/test-cachepool-<kernel> run
+CACHEPOOL_V3_NB_X_GROUPS=2 CACHEPOOL_V3_NB_Y_GROUPS=2 \
+  gvsoc --target=cachepool_v3 --binary $B/test-cachepool-<kernel> image flash run
 ~~~~~
+
+One thing that catches people: `CORES_PER_TILE` counts **core complexes**. A complex owns one
+Spatz and one L1 cache bank; with `SCALAR_PER_CC=2` it holds two scalar harts that share them.
 
 The bootrom's core/tile counts are patched automatically to match, so any combination boots.
 Note that a *kernel* may still require a particular core count (e.g. `fft` only passes at its
@@ -164,55 +174,40 @@ K=test-cachepool-multi_producer_single_consumer_double_linked_list_M48_N800_K300
 
 for V in "" _P2_C8 _P4_C4 _P4_C8; do            # "" = the default 2P/2C build
   mkdir -p /tmp/rlc/$V && cd /tmp/rlc/$V && rm -f gvsoc_config.json
-  CACHEPOOL_NB_TILE=4 CACHEPOOL_CORES_PER_TILE=4 \
-    gvsoc --target=cachepool --binary $B/$K$V run > run.log 2>&1
+  gvsoc --target=cachepool_v3 --binary $B/$K$V image flash run > run.log 2>&1
   echo "$V: $(grep -oE 'retval=[0-9]+ cycles=[0-9]+' run.log | tail -1)" \
        "work=$(grep -oE 'total cycles = [0-9]+' run.log | head -1 | grep -oE '[0-9]+')" \
        "errs=$(grep -cE 'ERROR|Check Failed' run.log)"
 done
 ~~~~~
 
-Expected results (current model, 48 UEs / 810 B PDUs / 300 packets, pacing off):
+All four must report `retval=0` with **zero** `ERROR` / `Check Failed` lines, which is what this
+sweep is for. The shape of the scaling is that producers saturate first — going 2→4 producers is
+worth far more than adding consumers on top of 2 producers — and consumers only pay off once the
+producers keep up.
 
-| Variant | Active cores | EOC cycles | Work phase | vs 2P/2C |
-|---|---|---|---|---|
-| default `2P/2C` | 4 (+12 idle) | 954,001 | 550,721 | 1.00x |
-| `_P2_C8` | 10 (+6 idle) | 919,001 | 514,686 | 1.07x |
-| `_P4_C4` | 8 (+8 idle) | 710,001 | 306,523 | 1.80x |
-| `_P4_C8` | 12 (+4 idle) | 659,001 | 255,565 | **2.16x** |
-
-All four must report `retval=0` with **zero** `ERROR` / `Check Failed` lines. Reading the
-scaling: producers saturate first (2->4 producers is worth ~1.8x; adding consumers on top of
-2 producers only ~1.07x), and consumers pay off once producers keep up (4->8 consumers at 4
-producers: +20%). More tiles help too, via more cache banks. Full sweep incl. 1x4/2x4
-topologies and the 64/256-core large-config runs with throughput/TTI analysis:
-`prompt/multiuser_llist_sweep_2026-08-05.md` (16-core table of
-`prompt/multiuser_llist_sweep_2026-07-27.md` for the pre-J1 model state).
-
-> The work-phase figures above are the full parallel-region span — `max(end cycle) -
-> min(start cycle)` across all cores' prints. The one-liner greps the **first** core's
-> `total cycles` line instead, which reads ~0.1% lower (e.g. `_P4_C8`: 255,340 vs 255,565) —
-> either is fine for a pass/fail eyeball. Numbers are the post-J1 model state (scalar LSU
-> nb_outstanding=16); the 07-27 report's table is ~2% lower.
+> The absolute cycle counts previously tabulated here were measured on the earlier `cachepool`
+> model and are **not** valid for `cachepool_v3`, which has a different fabric. They have been
+> removed rather than relabelled; re-measure before quoting any figure from this sweep.
 
 ### 6. Cross-check against the RTL reference numbers
 
-Measured with the current model at 16 cores (4x4), against the reference figures in the RTL
-kernel README:
+Calibration is anchored at **64 cores** (`2x2` groups) against the RTL running the same ELF.
 
-| Case | RTL work phase | GVSoC work phase | Delta |
-|---|---|---|---|
-| TC2 multi-user `M48_N800_K300` (2P/2C) | 530,059 | 538,635 | **+1.6%** |
-| TC1 single-user `M1_N1350_K100` | 130,828 | 155,373 | +18.8% |
+| Kernel | Character | RTL | GVSoC | Ratio |
+|---|---|---|---|---|
+| RLC `M1_N1350_K100` (fast pair) | latency-bound, L1-resident after warm-up | 150,175 / 150,183 | 149,248 / 149,678 | **0.6% fast** |
+| `byte-enable` | L1-resident, no refills | 289,468 | 252,494 | 0.87x — 13% fast |
+| `bandwidth` | memory-bound, exercises the refill path | 2,058 | 29,122 | **14.2x slow** |
 
-Other CI kernels are within roughly 5-15% (gemv +1.0%, byte-enable -5.4%, fmatmul -9.0%);
-see `prompt/cachepool_rtl_kernel_diff_2026-07-27.md` for the full per-kernel table and the
-root cause of each remaining outlier.
+**The sign flip is the result, not the ratios.** A uniformly-slow model cannot be 14.2x slow on
+one kernel and 13% fast on another. It places the remaining error in the **refill path** and
+nowhere else: kernels that stay in L1 are close, kernels that stream through DRAM are not.
 
-> **Known model-vs-RTL divergence:** the RTL README lists TC2 with `CONSUMER_CORE_NUM >= 8`
-> as currently failing (under debug). Those variants (`P2_C8`, `P4_C8`) **pass** on this
-> model, so the model does not currently reproduce that failure — do not treat a passing
-> GVSoC run of those variants as validation of the RTL configuration.
+The two known contributors are one outstanding miss per cache controller, and — until
+`CACHEPOOL_V3_DRAMSYS=1` — a flat fixed-latency store where the hardware has per-channel DRAM.
+Neither has been measured out yet, so treat throughput-bound absolute numbers as indicative and
+latency-bound ones as calibrated.
 
 ### 7. Notes and troubleshooting
 
@@ -221,12 +216,15 @@ root cause of each remaining outlier.
 - **`--trace=<component path>`** dumps traces for a component (hierarchy path, not a file
   path), e.g. `--trace=/chip/soc/cluster_0/pe0/insn` for one core's instructions. It is very
   slow on long kernels — prefer the end-of-run counters above for performance questions.
-- **Realistic DRAM timing** is available with `CACHEPOOL_DRAMSYS=1` (DDR4 via DRAMSys, 4
-  channels); it is 10-100x slower in wall-clock. See [DRAMSys.md](./DRAMSys.md) for setup.
-  The default backing store uses a calibrated fixed latency (`CACHEPOOL_MEM_LATENCY`, default 50).
-- A full runbook with more configuration examples lives in
-  `prompt/cachepool_complete_model_run_guide_2026-06-25.md`, and the multi-user RLC scaling
-  sweep in `prompt/multiuser_llist_sweep_2026-07-27.md`.
+- **Realistic DRAM timing** is available with `CACHEPOOL_V3_DRAMSYS=1`, which gives every memory
+  channel of the refill mesh its own DRAM (HBM2 by default, `CACHEPOOL_V3_DRAM_TYPE` selects the
+  config) instead of one shared flat store. It is 10-100x slower in wall-clock and needs SystemC
+  preloaded — see [DRAMSys.md](./DRAMSys.md) and the model README. The default backing store uses a
+  calibrated fixed latency (`CACHEPOOL_V3_MEM_LATENCY`, default 50).
+- The model's own documentation — cluster design, every configuration knob, telemetry, current
+  limitations — is [`core/models/cache/insitu/README.md`](core/models/cache/insitu/README.md).
+  Development history is `prompt/WORKLOG.md`. Older runbooks under `prompt/` describe the earlier
+  `cachepool` target and its environment variables, which do not apply here.
 
 ## Citing
 
