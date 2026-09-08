@@ -4,6 +4,67 @@
 
 ---
 
+## 2026-09-08 — validated the RTL side's partial-barrier fix on the new masked barrier
+
+**What was tested.** `reports/handover/elf_frozen_2026-09-08_0752_narrowfix/` — their candidate for
+three defects we surfaced jointly: (1) the tile participation mask programmed in `rlc_init()` and
+never restored, so every later full barrier was narrowed; (2) read-barriers and write-barriers
+coexisting in one tile, where the first arrival owns the round; (3) `barrier_done_o` being an unmasked
+broadcast, so a partial barrier is safe only when nothing outside the participating set is waiting at
+a barrier ANYWHERE in the cluster — which is what forces their non-participants to spin rather than
+block.
+
+**Result: passes at 1, 4 and 16 tiles.** At 16 tiles / 64 cores:
+
+```
+[UL] barrier probe=0xffffffff wrote=0x1 readback=0x1 local_mask=0x2 MASK-OK
+[UL] check: PASS
+[EOC] Simulation exiting: retval=0 cycles=2201510
+tile_mask trajectory:   6 x 0xffff  ->  33 x 0x1  ->  3 x 0xffff
+```
+
+The trajectory is the whole verification, and it is worth noting HOW it verifies: it is read from the
+barrier's own state via `CACHEPOOL_BARRIER_STATS=1`, not from the kernel's `MASK-OK` line. Their guard
+reports what the kernel believes; the trajectory reports what the barrier did. That distinction has
+now mattered three times today — `set_eoc`'s immediate over the header, the decode path over the
+variables behind it, and here.
+
+It answers all three questions directly: the startup full barrier waits for **all sixteen tiles**
+(the leading `0xffff` completions), the consumers progress across the narrowed region (33 completions
+at `0x1`, kernel check PASS), and the mask is restored to RESVAL before the release (trailing
+`0xffff`, nothing left at `0x1`). 4 tiles gives the identical shape at `0xf`, and 1 tile is all-`0x1`
+— which is exactly why this class of bug was invisible there: with one tile the mask IS the only
+tile and narrowing is a no-op.
+
+**Independent cross-check neither side set up.** The RTL session derived the expected barrier count
+from the TC1 traffic profile: 488 SDUs per slot / 49 PDUs per 8 KB block = 11 slots, x 3 phase
+barriers = **33**. That is exactly the measured count at `tile_mask=0x1`. So the narrowed region
+contains precisely the barriers the kernel should issue and no others — nothing leaked in from a full
+barrier absorbed into a consumers-only round, and none of the consumers' barriers escaped into an
+all-cores round. Stronger than "it passed", and it fell out of measuring the mechanism rather than
+the outcome.
+
+**Contrast with the pre-fix binary on the same model and config:** `retval=0, 712,642 cycles, no UL
+output at all` — the clean empty run, because the startup barrier was already narrowed and 60 of 64
+cores sailed through it.
+
+**Labelled honestly, because the clean result does not cover everything it appears to.** The standing
+`Wait`-case invariant added earlier today was **green and did not cover this fix**: their
+non-participants are outside the barrier entirely, neither in `Global` nor in `Wait`, so nothing
+exercised the case it guards. `[BARRIER-INVARIANT]` staying silent is a weaker statement than it
+sounds for the same reason. The invariant stays in the tree for the next user of the API, not as
+evidence about this fix.
+
+**Still open at the time of writing:** the `CACHEPOOL_BARRIER_COUNTING=1` arm (two-sided by design —
+if it passes the fix does not depend on the new barrier semantics; if it fails where the masked arm
+passes, the fix REQUIRES correct masking, which is a true property worth knowing rather than a
+defect), and the AM wedge ladder M8/16/24/32 at 64 cores. Reading of the latter agreed in advance:
+"wedge disappears" is conclusive for the wedge, "wedge survives" is suggestive only, and neither
+speaks to the cross-core visibility bug until that is re-measured on the new barrier.
+
+
+---
+
 ## 2026-09-08 — the HW barrier was a global counter; it is a TWO-LEVEL MASKED barrier
 
 **Found by the RTL-side session while I was asking about something else, and it is a real defect in
