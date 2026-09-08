@@ -147,13 +147,35 @@ acceptance is final) and decremented in `insn_end`, so it is paired exactly once
   needs its own validation; it is a latent fidelity issue (the sequencer over-stalls scalar accesses
   after a stalled vector load), not a correctness one.
 
-**2. The arbiter's "wanting to issue" bit is a latch, and using it to *retain* a grant starves the
-partner.** It is published when a hart stalls on the gate and only cleared when that hart actually
-enqueues or retires a vector instruction — so a hart that stalls, is granted, and is then diverted (a
-barrier IRQ, a branch out of the loop) keeps the bit asserted forever and pins the shared unit.
-Retention now keys on *work in flight* only; an idle holder is handed over as soon as anyone else
-asks. That is also the faithful reading: the RTL has no such latch, `acc_qvalid` is a level that
-simply deasserts.
+**2. Arbitrating a level signal with edge-triggered events does not work, and it took three failures
+to accept that.** `acc_mux` is combinational: every cycle it looks at both harts' `acc_qvalid` levels
+and grants one. I first modelled the request as a bit published on a status change. Each attempt
+failed differently, and the sequence is the useful part of the record:
+
+  - **Latch.** The bit is set when a hart stalls on the gate and cleared only when it enqueues or
+    retires a vector instruction, so a hart that stalls, is granted, and is then diverted (a barrier
+    IRQ, a branch out of the loop) asserts it forever and pins the shared unit. Symptom: one hart of a
+    pair finished, the other never did, and every arbiter counter froze — no status change, so no
+    arbitration, so nothing to break the tie.
+  - **Clear the bit on grant.** Removes the latch and introduces a livelock: arbitration re-runs on
+    *any* hart's status change, so the partner's next stall steals the grant in the window before the
+    grantee re-executes its instruction. Measured: **16.7 million handovers with
+    `max_concurrent_inflight = 0`** — the unit changing hands forever with no vector work in flight at
+    any point.
+  - **Hold the grant for one cycle after issuing it** (the RTL's `rr_arb_tree` has `LockIn=1` for
+    exactly this reason). Correct in principle, but discharging the hold on the grantee's next status
+    sync waits for a message that a hart stalled for its *own* reasons — a full Ara queue, an
+    unresolved register dependency — never sends.
+
+  The structure that works is the one the hardware has: **sample levels on a clock.** The core
+  republishes its request every stalled cycle; the arbiter timestamps each assertion and treats one
+  not refreshed this cycle as expired; a `ClockEvent` re-runs arbitration every cycle while anyone is
+  asking. The holder keeps the unit while it is using it *or* still asking, which is `LockIn`, and
+  drops out one cycle after it stops refreshing, which is a level deasserting. No latch, no
+  handshake bookkeeping, no way to wait forever for a message.
+
+  Healthy behaviour after the change, on the 4-CC dual run: counters advance steadily, ~2.1 LSU-gate
+  blocks per denial, 85 handovers per 8,192 denials, `max_concurrent_inflight = 1` throughout.
 
 ### Verification
 
