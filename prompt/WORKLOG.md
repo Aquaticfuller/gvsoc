@@ -63,25 +63,64 @@ when the tile barrier fires, which is what the RTL per-port FSM does.
 sets was measuring a barrier the hardware does not have. That is most of the RLC AM/UL work. It does
 not touch the single-scalar calibration anchor (full participation) or per-core-private kernels.
 
-**The mask is real, demonstrated on the RTL side's own frozen ELFs — and it settled which map they
-use.** Same binary (`P1_C1_ul_tc1_copy`), same config, only the peripheral map differs:
+**The mask is real, demonstrated on the RTL side's own frozen ELFs.** Running `P1_C1_ul_tc1_copy`
+under each peripheral map, same binary, same config:
 
 ```
 legacy        [UL] FATAL: tile participation mask never programmed -- the phase barriers are no-ops.
-rlc_next      (no output at all -- cores boot to address 0)
-multi_scalar  [UL] barrier tile_mask=0x1 local_mask=0x2 armed=1
-              [UL] slots=11 tb_bytes=80583 segments=497 polls_ack=10 exec=copy
+rlc_next      [EOC] Simulation exiting: retval=0 cycles=508470
+multi_scalar  [UL] delivered=488/488 bytes=78080/78080 rx_next=488 dup=0 oow=0   ... and NO [EOC]
 ```
 
-So those ELFs are the **multi_scalar** map, not the `rlc_next` one the RTL session read out of their
-own header — worth their checking before they build anything else. And the `legacy` row is precisely
-the misattribution they warned about: a working kernel producing a software-sounding FATAL purely
-because the mask register sat where the model decoded L1D config. Running their ladder before this
-would have handed them a bug that does not exist.
+The `legacy` row is precisely the misattribution the RTL session warned about: a working kernel
+producing a software-sounding FATAL purely because the mask register sat where the model decoded L1D
+config. Running their ladder before implementing the mask would have handed them a bug that does not
+exist.
 
-It also retires an objection I raised earlier. I told them `armed=1` could not confirm a map, because
-on an engine with no mask semantics a scratch register returns whatever was written. True then;
-obsolete now — with the mask genuinely modelled it discriminated three maps in one run each.
+**CORRECTION — my first reading of this table was wrong, twice over, and both errors are mine.**
+I initially reported the ELFs as the `multi_scalar` map. They are `rlc_next`. Two independent
+mistakes produced that:
+
+1. **My own bug broke the map I then declared wrong.** The boot-control scratch branch in
+   `cachepool_access` carried an `offset >= 0x18` guard, added when the only boot offsets in play
+   were 0x20 and 0x18. `rlc_next` puts BOOT_CONTROL at **0x10**, so the branch was skipped, the
+   offset fell through to the scratch swallow, the bootrom read 0 and every core jumped to address 0.
+   The run produced nothing, and I read "no output" as evidence about the ELF rather than about my
+   model. With the guard removed the same ELF runs to a clean `retval=0`.
+2. **I read plausible output as success without checking for termination.** The `multi_scalar` run
+   printed a full, healthy-looking UL summary — `delivered=488/488, dup=0, oow=0` — because
+   HW_BARRIER is 0x00 in *both* maps, so the barriers work either way. What differs is EOC (0x14 vs
+   0x1c) and the mask (0x28 vs 0x30). With EOC decoded at the wrong offset the write went nowhere and
+   **the run never terminated**; there is no `[EOC]` line anywhere in it. I had grepped for the
+   kernel's own prints and not for the one line that says the program ended.
+
+  The RTL side caught both from the disassembly of the binary I was running: `set_eoc` is
+  `sw a0, 20(a1)` (0x14) and team init computes the mask pointer with `addi a1, a1, 40` (0x28) —
+  `rlc_next` on both counts, against a header whose md5 they gave.
+
+**And a retraction of a retraction.** I had objected that `armed=1` could not confirm a map, then
+withdrew the objection once the mask was modelled. The withdrawal was wrong: their guard printed a
+software copy of what it *intended* to write plus a flag set unconditionally after the write, so it
+reported healthy on exactly the run where the mask went to the wrong address. My original instinct
+was right and I talked myself out of it on a description of code rather than the code. They have
+since changed the guard to read the register back and compare, which makes it a real check.
+
+**What actually discriminated the maps was behaviour** — FATAL / no boot / no termination — not any
+printed value. That is the lesson worth keeping: on this engine the reliable map check is whether the
+program *ends*, because every wrong-map failure is silent by construction.
+
+**Confirmed by the follow-up.** The RTL side rebuilt the guard to write the mask, fence, read it back
+and compare. It still prints `MASK-OK` under the WRONG map: with the mask decoded at 0x30/0x34, their
+write to 0x28 lands in the L1D config block, which is plain RW scratch, so write-then-read-back
+succeeds at any address that is merely readable and writable. A read-back check can only catch an
+address that is unmapped or read-only, not one that is simply wrong. Told them; a check that can
+actually fail needs a value the hardware constrains (reserved bits, width truncation), and until then
+`[EOC]` remains the only signal that is not silent.
+
+**Caveat carried forward:** the 4-core table above is a 64-core ELF run at 4 cores, which the
+2026-08-25 06:40 PROCESS FAILURE entry exists to prevent. It is usable as a map indicator (boot /
+terminate / FATAL are map-determined) and NOT as behaviour. 64-core runs of both candidate maps were
+launched to replace it.
 
 **Still open on this:** the L1D config block offsets for the `rlc_next` and `multi_scalar` maps are
 assumed unchanged at 0x28..0x4c, which cannot be right for `rlc_next` since the mask registers now
