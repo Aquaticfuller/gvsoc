@@ -8,8 +8,6 @@ TARGETS ?= rv64 \
     pulp-open \
     pulp-open-nn \
     pulp-open:chip/cluster/redmule=True \
-    pulp.spatz.spatz \
-    snitch_spatz \
     occamy \
     siracusa \
     snitch \
