@@ -12,9 +12,7 @@ TARGETS ?= rv64 \
     siracusa \
     snitch \
     ara \
-    ara_v2 \
     spatz \
-    spatz_v2 \
     snitch:core_type=fast \
     pulp.snitch.snitch_cluster_single \
     chimera \
