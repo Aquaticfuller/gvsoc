@@ -4,6 +4,94 @@
 
 ---
 
+## 2026-09-08 — the HW barrier was a global counter; it is a TWO-LEVEL MASKED barrier
+
+**Found by the RTL-side session while I was asking about something else, and it is a real defect in
+our model, not a fidelity gap.** `ClusterRegisters::hw_barrier_req` counted arrivals into one
+cluster-wide counter and released everyone at `count == nb_cores`. It ignored both the value software
+writes AND whether the access was a read or a write. Those two bits are the entire semantics.
+
+**What the RTL actually does** (`cachepool_tile_barrier.sv`, `cachepool_cluster_barrier.sv`, read
+directly rather than taken on report):
+
+```systemverilog
+// tile level -- the participant mask is the ACCESS, not a register
+req_mask[i]  = in_req_i[i].q.write ? in_req_i[i].q.data[NrPorts-1:0] : {NrPorts{1'b1}};
+// first arrival in a round latches it
+if (|barrier_hit) begin core_mask_d = req_mask[first_hit_idx]; mask_state_d = MaskActive; end
+local_barrier = (is_barrier & core_mask_q) == core_mask_q;
+
+// cluster level -- one bit per TILE, from HW_BARRIER_PARTICIPATION_MASK_0/1
+all_arrived = (tile_barrier_i & mask_q) == mask_q;
+```
+
+So `snrt_cluster_hw_barrier()` is a **load** = "all cores of my tile", and
+`snrt_cluster_partial_barrier(mask)` is a **store** whose data *is* the per-core-within-tile
+participant mask. Above that sits a cluster-global, one-bit-per-tile mask register.
+
+**Why a global count is not a conservative approximation but a different barrier.** The RLC kernel
+splits cores into disjoint sets: producers and idle cores park on the full barrier, only consumers
+call the partial one. On a 64-core C3 run that is 61 cores parked while 3 loop. A global counter
+takes the parked cores' arrivals and the consumers' partial-barrier arrivals as the same event, so
+the consumers' barrier "completes" for reasons unrelated to their own arrival and the 61 parked cores
+are released mid-TTI. That predicts the shape of the multi-entity wedge the RTL side has been chasing
+— more entities, more TTI iterations, more spurious releases, degrading with scale and non-monotonic
+— without needing any other cause.
+
+**Implemented** in `cluster_registers.{cpp,py}`: per-tile arrival/mask/round state plus the
+cluster-level tile mask, `nb_tiles` plumbed from the topology (cores map to tiles as
+`core_id / (nb_cores / nb_tiles)`), and `HW_BARRIER_PARTICIPATION_MASK_0/1` decoded at the offsets
+its map generation puts it at. Cores not in the mask that happen to be waiting are still released
+when the tile barrier fires, which is what the RTL per-port FSM does.
+
+**Verification, and it has the right shape — no change where there should be none:**
+
+- RLC `M1_N1350_K100` 64-core anchor: **149,248 / 149,678 / 195,098 / 195,370**, bit-identical. That
+  kernel uses read-barriers only, so it is pure full participation.
+- AM `M1_N1350_K100_P2_C2` at 4 cores / **1 tile**, which does use partial barriers:
+  **byte-identical** (106,146 / 156,416, same per-grant mismatch sequence). Correct, and worth
+  understanding rather than being reassured by: with one tile, a consumer partial barrier latches a
+  mask over consumer lanes, fires when they arrive, and then releases every core waiting in that tile
+  — producers included. The RTL does exactly that (`if (local_barrier) state_d[i] = Global` runs for
+  every port in Wait, mask bit or not). **The two barriers can only diverge once participant sets
+  span more than one tile**, because that is when the cluster-level tile mask starts to matter.
+- `CACHEPOOL_BARRIER_COUNTING=1` restores the old global counter, so the difference between two runs
+  is exactly what this change does. Kept deliberately: every result recorded before today was
+  measured on the counting barrier.
+
+**Consequence for past results.** Any multi-tile run of a kernel with disjoint barrier participant
+sets was measuring a barrier the hardware does not have. That is most of the RLC AM/UL work. It does
+not touch the single-scalar calibration anchor (full participation) or per-core-private kernels.
+
+**The mask is real, demonstrated on the RTL side's own frozen ELFs — and it settled which map they
+use.** Same binary (`P1_C1_ul_tc1_copy`), same config, only the peripheral map differs:
+
+```
+legacy        [UL] FATAL: tile participation mask never programmed -- the phase barriers are no-ops.
+rlc_next      (no output at all -- cores boot to address 0)
+multi_scalar  [UL] barrier tile_mask=0x1 local_mask=0x2 armed=1
+              [UL] slots=11 tb_bytes=80583 segments=497 polls_ack=10 exec=copy
+```
+
+So those ELFs are the **multi_scalar** map, not the `rlc_next` one the RTL session read out of their
+own header — worth their checking before they build anything else. And the `legacy` row is precisely
+the misattribution they warned about: a working kernel producing a software-sounding FATAL purely
+because the mask register sat where the model decoded L1D config. Running their ladder before this
+would have handed them a bug that does not exist.
+
+It also retires an objection I raised earlier. I told them `armed=1` could not confirm a map, because
+on an engine with no mask semantics a scratch register returns whatever was written. True then;
+obsolete now — with the mask genuinely modelled it discriminated three maps in one run each.
+
+**Still open on this:** the L1D config block offsets for the `rlc_next` and `multi_scalar` maps are
+assumed unchanged at 0x28..0x4c, which cannot be right for `rlc_next` since the mask registers now
+occupy 0x28/0x2c there. Requested the full tables from the RTL side rather than guessing. Also, this
+is modelled at the cluster peripheral rather than as per-tile components, so the tile barrier's
+`Wait -> Global -> Take` handshake timing is collapsed into the existing 11-cycle stall.
+
+
+---
+
 ## 2026-09-08 — multi-scalar core complex (2 Snitch harts sharing one Spatz) implemented in cachepool_v3
 
 **Task.** Implement the RTL branch `origin/dev/multi-scalar` (HEAD `bc435c6`, 22 commits) in the
