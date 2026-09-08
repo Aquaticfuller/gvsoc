@@ -186,10 +186,6 @@ sweep is for. The shape of the scaling is that producers saturate first — goin
 worth far more than adding consumers on top of 2 producers — and consumers only pay off once the
 producers keep up.
 
-> The absolute cycle counts previously tabulated here were measured on the earlier `cachepool`
-> model and are **not** valid for `cachepool_v3`, which has a different fabric. They have been
-> removed rather than relabelled; re-measure before quoting any figure from this sweep.
-
 ### 6. Cross-check against the RTL reference numbers
 
 Calibration is anchored at **64 cores** (`2x2` groups) against the RTL running the same ELF.
