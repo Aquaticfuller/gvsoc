@@ -117,6 +117,37 @@ address that is unmapped or read-only, not one that is simply wrong. Told them; 
 actually fail needs a value the hardware constrains (reserved bits, width truncation), and until then
 `[EOC]` remains the only signal that is not silent.
 
+**The masked barrier is RTL-confirmed, and it immediately found a real software defect.** At 64
+cores under the CORRECT map the RTL side's UL binary terminates cleanly with `retval=0` and prints
+**nothing** from the UL path; under the wrong map it prints a complete, healthy UL summary and never
+terminates. Exactly inverted, and the inversion is the interesting part.
+
+I put three candidate explanations to them rather than guessing, explicitly including "my model is
+wrong" first. Their answer, from `cachepool_cluster_barrier.sv`: `mask_d = barrier_mask_i` is re-read
+from the register at every round start, there is **no full-versus-partial distinction at the cluster
+level at all** (the read/write distinction exists only in the tile barrier, for the per-core mask),
+and the cluster mask is persistent and gates every round. **That is exactly what this model does.**
+
+The defect is theirs: `rlc_ul_init()` / `rlc_am_init()` program the tile mask to "tile 0 only" and
+nothing ever restores it, so from that point every `snrt_cluster_hw_barrier()` in the program --
+including the startup resync and the final one before the report -- waits only for tile 0. At 64
+cores the startup barrier releases as soon as tile 0's four cores arrive and the other 60 sail
+through unsynchronised, which is the clean empty run. It is invisible at 1 tile, because there the
+mask is 0x1 = the only tile and narrowing to it is a no-op, and it silently breaks every full barrier
+at 4+ tiles. They also found a documentation contradiction underneath it: `snrt.h` prescribes using
+`snrt_cluster_hw_barrier()` as a resync point after programming the mask, but that barrier is itself
+already narrowed, so the documented usage cannot work at more than one tile.
+
+**Two things worth keeping from this.**
+
+*A correct model can look worse.* Under the right map the run terminates with no output; under the
+wrong one it produces a full plausible summary. "Termination is the only non-silent map signal" needs
+the rider that **here termination was signalling their bug, not my map** -- the map was right and the
+program ended early because the barrier finally worked.
+
+*Asking beat running.* Running their ladder at this point would have measured their unrestored mask
+through my new barrier and told neither side anything clean. The cost of asking was one message.
+
 **Caveat carried forward:** the 4-core table above is a 64-core ELF run at 4 cores, which the
 2026-08-25 06:40 PROCESS FAILURE entry exists to prevent. It is usable as a map indicator (boot /
 terminate / FATAL are map-determined) and NOT as behaviour. 64-core runs of both candidate maps were
