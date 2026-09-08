@@ -4,6 +4,61 @@
 
 ---
 
+## 2026-09-08 — ROOT CAUSE of the cross-line truncation: our VLSU manufactures the straddle
+
+**The truncation was never the program's fault, and the fix is not where I said it was.** The
+"straddling access" the insitu cache core has been silently truncating since 2026-08-25 is created by
+`spatz_vlsu.cpp`, not requested by software.
+
+```cpp
+// spatz_vlsu.cpp:322, the unit-stride path
+size = std::min((iss_addr_t)_this->width, _this->pending_size);
+```
+
+A unit-stride vector access is emitted at the **lane width (4 B) regardless of element size**, with no
+line-boundary check, and `pending_addr` advances by `size`. So a byte-element `vse8.v` on a base that
+is not lane-aligned becomes 4-byte chunks at arbitrary offsets, which can straddle a 64-byte line that
+**no element of the original instruction ever crossed**. The cache core then drops the tail and
+returns `IO_REQ_OK`.
+
+**How it was found, and it was not by me.** The RTL-side session looked at the truncation log I had
+sent as a warning and noticed the accesses were `size=4` at line offset **63** — misaligned, which a
+compiler-emitted `sw` never is, and which their kernel cannot ask for (`vle8`/`vse8` payload, `sb`
+headers). Their conclusion, offered as a pointer rather than a diagnosis: the straddle is manufactured
+inside my model. It is. I verified first that our address rotation cannot move line-offset bits
+(`insitu_cache_config.py`: "rotation must not move line-offset bits"), so the printed offset is the
+real one.
+
+**Consequence for the fix.** I had told them the fix was to split straddling accesses inside the cache
+core -- a change to the calibrated FSM that the RLC anchor and every other number rest on, which I
+declined to make unreviewed. That was the wrong target. Clamping the request to the line remainder AT
+THE SOURCE only alters requests that are currently being corrupted, so the blast radius is exactly the
+buggy cases. Implemented as `SPATZ_VLSU_LINE_SPLIT`, **default OFF**, plus a `vu/line_bytes` property.
+
+**Measured (AM `M1_N1350_K100_P2_C2`, 4 cores / 1 tile):**
+
+| | XLINE truncations | payload mismatches | grants | per grant |
+|---|---|---|---|---|
+| guard OFF | 68 | 104 | 17 | 6.1 |
+| guard ON  | **0** | **16** | 16 | **1.0** |
+
+and the 64-core RLC anchor is **bit-identical with the guard ON** -- 149,248 / 149,678 / 195,098 /
+195,370 -- because that kernel's vector accesses are aligned and never straddle. So the fix costs
+nothing on the calibration and removes the corruption entirely.
+
+**The residue is the honest part.** Mismatches drop by ~85 % but not to zero: ~1 per grant survives
+with zero truncations in the run. So cross-line truncation was the DOMINANT cause of the AM payload
+failures and not the only one. What is left is a separate defect -- the open cross-core visibility bug
+is the obvious candidate, but that is a hypothesis, not a measurement. Anyone reading this should not
+treat "truncation fixed" as "AM payload correct".
+
+**Not enabled by default**, deliberately. It is a change to vector request sizing, the anchor is only
+one workload, and the decision belongs to a review rather than to the run that discovered it. The
+evidence above is what that review needs.
+
+
+---
+
 ## 2026-09-08 — validated the RTL side's partial-barrier fix on the new masked barrier
 
 **What was tested.** `reports/handover/elf_frozen_2026-09-08_0752_narrowfix/` — their candidate for
